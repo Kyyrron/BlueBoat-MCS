@@ -1,0 +1,6 @@
+# GUI + numerics. ROS2 (rclpy, mavros_msgs, blueboat_interfaces) comes from
+# the sourced ROS2 workspace, NOT from pip.
+PySide6>=6.5
+numpy>=1.24
+PyYAML>=6.0
+scipy>=1.10
