@@ -8,5 +8,5 @@ colcon build
 
 source env.sh
 
-cd src/BlueBoat-SideScanSonar/blueboat_mcs
+cd src/BlueBoat-SideScanSonar/BlueBoat-MCS
 python3 run.py
