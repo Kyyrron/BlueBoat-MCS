@@ -3,11 +3,14 @@
 ## 1. Install and start (2 min)
 
 ```bash
-source /opt/ros/<distro>/setup.bash
-source ~/blueboat_ws/install/setup.bash
-pip install --user -r requirements.txt      # first time only
+cd ~/ros2_ws && source env.sh               # basestation workspace
+cd src/BlueBoat-SideScanSonar/BlueBoat-MCS
+pip install -r requirements.txt             # first time only
 python3 run.py
 ```
+
+(`~/ros2_ws` is the basestation's workspace. `/blueboat_ws` is the **boat's** —
+different machine, different venv. See `06_installation.md`.)
 
 The window opens; the status bar should read **ROS: connected**. Every row in
 "ROS DIAGNOSTICS" is grey until the boat's nodes exist — normal.
@@ -21,7 +24,9 @@ will not move; every node still runs). Pick controller `LoS`, trajectory
 Watch: the toolbar LED turns orange, launch output scrolls on the console
 line, diagnostics rows turn green one by one, "Mission state" in the left
 panel counts up to *operational*, and the LED turns green. The boat glyph
-appears on the map; the green mission path is drawn shortly after.
+appears on the map. The green mission path is drawn only once the map's
+georeference is heading-aligned (the `N↑` badge) — which needs a few metres of
+motion, so on a stationary boat the map stays empty. That is expected.
 
 ## 3. Read the map (1 min)
 
@@ -61,5 +66,31 @@ Boat powered and on the network; station started with the workspace sourced;
 launch once with motors **disabled** and verify every diagnostics row is
 green; verify the pinger panel updates when the USBL is wet; only then
 relaunch with **ENABLE MOTORS** checked (the station asks you to confirm
-twice). Where everything is explained: `04_user_guide.md`. What every topic
-means: `03_ros_integration.md`.
+twice).
+
+### After launching a GPS-anchored mission — drive a few metres
+
+A mission saved with a GPS reference (labelled **“(GPS)”** in the launch
+dialog) is placed on its real-world coordinates, which the station can only do
+once it knows how the boat's world frame is rotated against north. **That
+rotation cannot be measured while the boat is stationary** — it comes from
+comparing the GPS track against the odometry track, and a boat sitting still
+produces neither.
+
+So, right after launching one:
+
+1. The boat **holds position** and the map shows no mission path. This is
+   expected. It is not a hang, and nothing is wrong with the mission file.
+2. **Drive the boat forward a few metres**, in whatever mode you normally use.
+3. Watch the map for the `N↑` badge (and "georef" in the status bar). When it
+   appears, the georeference is heading-aligned.
+4. The mission deploys itself at that moment, and the green mission path
+   appears on its true coordinates. No further operator action.
+
+The same waiting period explains an empty map on *any* mission: the mission
+path is deliberately not drawn before the `N↑` badge, because it cannot be
+placed geographically until then. Satellite tiles are different — they need
+only a GPS fix, so they usually appear first.
+
+Where everything is explained: `04_user_guide.md`. What every topic means:
+`03_ros_integration.md`.

@@ -24,7 +24,6 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
-import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy

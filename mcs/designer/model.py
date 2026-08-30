@@ -16,8 +16,8 @@ forgotten inverse operations.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator, Union
 
 from PySide6.QtCore import QObject, Signal
 
@@ -38,7 +38,7 @@ class SegmentSpec:
                 "speed": self.speed}
 
     @classmethod
-    def from_dict(cls, d: dict) -> "SegmentSpec":
+    def from_dict(cls, d: dict) -> SegmentSpec:
         return cls(kind=d.get("kind", "straight"),
                    params=dict(d.get("params", {})),
                    speed=float(d.get("speed", 0.0)))
@@ -59,7 +59,7 @@ class Waypoint:
                 "seg_out": self.seg_out.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Waypoint":
+    def from_dict(cls, d: dict) -> Waypoint:
         return cls(uid=d["uid"], name=d.get("name", ""), x=float(d["x"]),
                    y=float(d["y"]), locked=bool(d.get("locked", False)),
                    seg_out=SegmentSpec.from_dict(d.get("seg_out", {})))
@@ -81,7 +81,7 @@ class PatternGroup:
                 "children": [w.to_dict() for w in self.children]}
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PatternGroup":
+    def from_dict(cls, d: dict) -> PatternGroup:
         return cls(uid=d["uid"], name=d.get("name", ""),
                    pattern=d.get("pattern", "group"),
                    params=dict(d.get("params", {})),
@@ -89,7 +89,7 @@ class PatternGroup:
                    children=[Waypoint.from_dict(c) for c in d.get("children", [])])
 
 
-MissionItem = Union[Waypoint, PatternGroup]
+MissionItem = Waypoint | PatternGroup
 
 
 class MissionModel(QObject):
@@ -139,9 +139,9 @@ class MissionModel(QObject):
 
     def container_of(self, uid: int) -> PatternGroup | None:
         for item in self.items:
-            if isinstance(item, PatternGroup):
-                if any(w.uid == uid for w in item.children):
-                    return item
+            if isinstance(item, PatternGroup) and any(
+                    w.uid == uid for w in item.children):
+                return item
         return None
 
     def effective_locked(self, wp: Waypoint) -> bool:

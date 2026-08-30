@@ -18,8 +18,13 @@ import numpy as np
 from PySide6.QtCore import QLineF, QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsLineItem,
-    QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsSimpleTextItem,
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsItemGroup,
+    QGraphicsLineItem,
+    QGraphicsPathItem,
+    QGraphicsPolygonItem,
+    QGraphicsSimpleTextItem,
 )
 
 from mcs.gui import theme
@@ -124,6 +129,13 @@ class MarkerItem(QGraphicsItemGroup):
     def set_world_pos(self, x: float, y: float) -> None:
         self._dot.setPos(x, y)
 
+    def scene_pos(self) -> tuple[float, float]:
+        """Current scene position. The group itself never moves — the
+        position is carried by the child item — so this is the only way to
+        read back where the marker was placed."""
+        p = self._dot.pos()
+        return p.x(), p.y()
+
     def set_label(self, text: str) -> None:
         self._text.setText(text)
 
@@ -147,6 +159,12 @@ class CrosshairItem(QGraphicsItemGroup):
 
     def set_world_pos(self, x: float, y: float) -> None:
         self._group.setPos(x, y)
+
+    def scene_pos(self) -> tuple[float, float]:
+        """Current scene position (carried by the child group, see
+        :meth:`MarkerItem.scene_pos`)."""
+        p = self._group.pos()
+        return p.x(), p.y()
 
 
 class TargetLineItem(QGraphicsLineItem):

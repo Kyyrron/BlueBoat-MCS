@@ -14,8 +14,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QSplitter, QStatusBar,
-    QVBoxLayout, QWidget,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QSplitter,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from mcs.config.settings import AppConfig

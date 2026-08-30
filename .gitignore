@@ -5,3 +5,9 @@ data/
 metadata.yaml
 acados_ocp.json
 c_generated_code/
+.ruff_cache/
+.claude/specs/
+.claude/tools/
+.claude/settings.json
+requirements-dev.txt
+ruff.toml

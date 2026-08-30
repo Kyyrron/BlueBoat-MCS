@@ -22,15 +22,19 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QScrollArea, QSplitter, QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QVBoxLayout,
     QWidget,
 )
 
 from mcs.config.settings import AppConfig
-from mcs.gui import theme
 from mcs.gui.console import LaunchConsole
 from mcs.gui.plot.distance_plot import DistancePlot
-from mcs.gui.widgets import CollapsibleSection, InfoGrid, RangeSlider
+from mcs.gui.widgets import CollapsibleSection, RangeSlider
 from mcs.models.store import DataStore, TargetMode
 
 

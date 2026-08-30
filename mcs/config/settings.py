@@ -107,10 +107,6 @@ class LaunchConfig:
     # duration_s overrides it automatically.
     path_preview_total_time_s: float = 120.0
     path_preview_dt_s: float = 0.5
-    # Nodes considered "required" before mission controls are enabled.
-    readiness_topics: list[str] = field(default_factory=lambda: [
-        "/mavros/state", "/blueboat/odom",
-    ])
 
 
 @dataclass
@@ -169,6 +165,12 @@ class DesignerConfig:
     default_speed_mps: float = 0.5    # time-parameterization cruise speed
     preview_arrow_every_m: float = 8.0
     undo_depth: int = 100
+    # "Does the mission already start at the boat, moving forward?" — the
+    # world frame is zeroed at launch, so an aligned mission starts at (0,0)
+    # along +x. Shared by the designer's Align to Start and by the launch
+    # dialog's badge, so the two can never disagree about the same file.
+    start_align_tol_m: float = 0.05
+    start_align_tol_deg: float = 2.0
 
 
 @dataclass
@@ -187,7 +189,7 @@ class AppConfig:
 
     # ------------------------------------------------------------------ I/O
     @classmethod
-    def load(cls, path: Path | None = None) -> "AppConfig":
+    def load(cls, path: Path | None = None) -> AppConfig:
         """Load the configuration, merging a JSON override file if present."""
         cfg = cls()
         path = path or DEFAULT_CONFIG_FILE

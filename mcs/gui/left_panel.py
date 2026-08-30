@@ -18,7 +18,11 @@ import time
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout,
+    QCheckBox,
+    QGridLayout,
+    QLabel,
+    QScrollArea,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -191,7 +195,7 @@ class LeftPanel(QWidget):
         for topic in sorted(stats):
             if topic not in self._diag_rows:
                 self._add_diag_row(topic)
-            led, name_label, value_label = self._diag_rows[topic]
+            led, _name_label, value_label = self._diag_rows[topic]
             st = stats[topic]
             led.set_status(st["status"])
             rate = st["rate"]

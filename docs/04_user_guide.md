@@ -15,8 +15,9 @@ inspection, georeference quality, ROS connection state.
 **Layers** — checkboxes toggling every map layer: satellite imagery, robot
 trajectory, published mission path, pinger position and trajectory, the thin
 robot→target line, the heading arrow and the metric grid. The satellite box
-unlocks automatically once the odom↔GPS georeference is established (GPS fix
-plus a few metres of motion; watch "georef" in the status bar).
+unlocks as soon as there is a **GPS fix** — the georeference places the tiles
+from its first, translation-only fit; watch "georef" in the status bar. (North
+alignment is a separate, later stage — see the map section below.)
 
 **Robot** — world coordinates, GPS (when fixed), heading, speed, active
 controller, mission state (an aggregated readiness count over FCU connection,
@@ -45,7 +46,10 @@ georeference is heading-aligned the scene becomes geographic (an `N↑` badge
 appears) and the robot glyph points at its true heading; before that a
 "world-up" notice is shown and the glyph points at its raw launch-frame
 heading (which is why hardcoded paths draw horizontal until then). Only the
-vehicle icon rotates, exactly like QGroundControl. **Clear Paths** in MAP TOOLS wipes the robot
+vehicle icon rotates, exactly like QGroundControl. The published mission path
+is deliberately **not drawn until the georeference is heading-aligned**, since
+it cannot be placed geographically before then — so an empty map early in a run
+is expected, not a fault. **Clear Paths** in MAP TOOLS wipes the robot
 and pinger trails without touching live data. A simple click
 anywhere shows, in the status bar: world coordinates, GPS coordinates (once
 georeferenced) and the live distance from the robot to that point; the point
@@ -63,9 +67,7 @@ cancels arming and publishes nothing. While a target is active, a
 **Continue Original Mission** button is shown: it does exactly one thing —
 publish `[0.0, 0.0]`, which hands control back to the mission — and the
 target highlight is cleared. When the boat arrives (≤ 1 m), a "Manual
-Target Reached" banner appears at the top of the map. (Note: the resume
-requires the one-line robot-side fix documented in `03_ros_integration.md`
-§Observations 1.)
+Target Reached" banner appears at the top of the map.
 
 **Measure** (toolbar button): first click sets point A, the line and distance
 follow the cursor, second click freezes the measurement; the status bar shows
@@ -172,9 +174,11 @@ reference remembers it: reopening the mission restores the origin (and the
 satellite layer), every waypoint is linked to real-world GPS coordinates,
 and the launch dialog labels it “(GPS)”. Launching such a mission uses
 deferred deployment: the boat holds position while you drive it a few
-metres to establish the run's georeference (status messages guide you),
-then the path deploys automatically onto its true GPS coordinates —
-independent of where the robot was powered on. At the end of any custom
+metres to establish the run's georeference — the map's `N↑` badge is the
+signal that it has converged — then the path deploys automatically onto its
+true GPS coordinates, independent of where the robot was powered on. The
+hold is physics, not a fault: the rotation cannot be measured from a
+stationary boat. `07_getting_started.md` has this as a field checklist. At the end of any custom
 path the target clamps at the final pose forever, so the boat
 station-keeps there; the same holds on a reached manual target.
 

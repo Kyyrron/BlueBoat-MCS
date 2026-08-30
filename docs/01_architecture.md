@@ -65,23 +65,48 @@ range restores live following.
 
 ### Map
 
-A `QGraphicsView` whose scene coordinates are ROS world metres with a y-flip
-(north-ish up). Constant-pixel-size glyphs (`ItemIgnoresTransformations`) for
-the boat and markers, cosmetic pens for lines, an adaptive 1/2/5-decade metric
-grid painted in `drawBackground`, and a satellite `TileLayer` at z = −100.
-Interaction modes (`NORMAL` / `MANUAL_TARGET` / `MEASURE`) are a small state
-machine inside the view; the view emits intents (`target_clicked`,
-`point_inspected`) and never publishes anything itself.
+A `QGraphicsView` in metres with a y-flip. **The view never rotates**: north-up
+is achieved by choosing what frame the scene is in, not by rotating the camera —
+rotating the view would spin the satellite tiles with it. There are two scene
+regimes, switched exactly once:
+
+* **Before heading alignment** — the scene is the raw robot world frame
+  (world-up), and a `world-up (north unknown)` notice is shown.
+* **After heading alignment** — the scene is **local east/north (ENU)**. Every
+  world-frame quantity (glyph, trails, pinger, targets, mission path, tiles) is
+  converted with `GeoFit.world_to_enu()` at placement, so north is up with the
+  view unrotated, and an `N` + arrow badge appears.
+
+Only the robot glyph rotates, and its heading comes from an absolute source
+(see `HEADING_AND_MAP_ALIGNMENT.md`). `MapView._to_world()` is the exact
+inverse of `_to_scene()` under the same regime test, and every mouse position
+read back out of the view goes through it.
+
+Constant-pixel-size glyphs (`ItemIgnoresTransformations`) for the boat and
+markers, cosmetic pens for lines, an adaptive 1/2/5-decade metric grid painted
+in `drawBackground`, and a satellite `TileLayer` at z = −100. Interaction modes
+(`NORMAL` / `MANUAL_TARGET` / `MEASURE`) are a small state machine inside the
+view; the view emits intents (`target_clicked`, `point_inspected`) and never
+publishes anything itself.
 
 ### Georeferencing
 
 The world frame is defined inside `robot_interface.py` by an origin and yaw
 offset that are never published. The station estimates the identical
-similarity transform online: it pairs odometry positions with GPS fixes
-projected to local east/north metres, and Kabsch-fits rotation + translation
-(scale fixed to 1) over a sliding window once the boat has moved a few metres.
-The fit quality (RMS residual) is shown in the status bar; GPS read-outs and
-the satellite layer only activate when the fit is trustworthy.
+similarity transform online, in **two stages**:
+
+* **Translation-only**, emitted from the *first* GPS fix. `is_valid` becomes
+  true immediately, which is what lets the satellite layer turn on at the first
+  sign of GPS; `theta` is a placeholder `0` and `heading_aligned` is `False`.
+* **Rotated Kabsch fit** (scale fixed to 1) over a sliding window, once enough
+  motion (`min_spread_m`) makes rotation observable. `heading_aligned` becomes
+  `True` and `theta` is trustworthy.
+
+Rotation is simply not observable from a stationary boat, so the second stage
+cannot be hurried. **Consumers that need rotation must check `heading_aligned`,
+not just `is_valid`** — the ENU scene switch, the mission-path preview and
+GPS-anchored mission deployment all gate on it. The fit quality (RMS residual)
+is shown in the status bar.
 
 ### Mission lifecycle
 
@@ -104,6 +129,7 @@ never killed before the emergency command is transmitted.
 | `core/geo.py` | odom↔GPS fit, mercator helpers | numpy |
 | `core/los_predictor.py` | display-only LoS path sketch | — |
 | `models/store.py` | states, histories, derived stats | core |
+| `designer/` | Survey Pattern Designer (Qt-free model + Qt UI) | core, PyYAML |
 | `ros/ros_manager.py` | rclpy lifecycle | rclpy |
 | `ros/bridge_node.py` | subs, pubs, path service, topic stats | rclpy, msgs |
 | `ros/launch_manager.py` | ros2 launch subprocess | Qt Core |

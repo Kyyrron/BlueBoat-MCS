@@ -11,7 +11,13 @@ from __future__ import annotations
 from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QSizePolicy,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from mcs.gui import theme

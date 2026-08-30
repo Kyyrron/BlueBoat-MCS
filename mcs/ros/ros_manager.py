@@ -84,7 +84,7 @@ class RosManager:
             self.node = None
         try:
             rclpy.shutdown()
-        except Exception:  # noqa: BLE001 - already shut down
+        except Exception:  # noqa: BLE001, S110 - already shut down; never fatal
             pass
         if self._thread:
             self._thread.join(timeout=3.0)

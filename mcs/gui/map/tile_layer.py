@@ -22,7 +22,14 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 from PySide6.QtWidgets import QGraphicsItemGroup, QGraphicsPixmapItem, QGraphicsScene
 
 from mcs.config.settings import MapConfig
-from mcs.core.geo import GeoFit, latlon_to_local_en, local_en_to_latlon, latlon_to_tile_xy, metres_per_pixel, tile_xy_to_latlon
+from mcs.core.geo import (
+    GeoFit,
+    latlon_to_local_en,
+    latlon_to_tile_xy,
+    local_en_to_latlon,
+    metres_per_pixel,
+    tile_xy_to_latlon,
+)
 
 _LOG = logging.getLogger(__name__)
 _TILE_PX = 256

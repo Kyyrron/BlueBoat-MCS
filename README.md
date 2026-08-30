@@ -8,10 +8,16 @@ QGroundControl / Mission Planner, built on the lab's existing ROS2 stack
 control computation and duplicates no logic already available on a topic.
 
 ```
-source /opt/ros/<distro>/setup.bash && source ~/blueboat_ws/install/setup.bash
-pip install --user -r requirements.txt
+cd ~/ros2_ws && source env.sh          # basestation workspace (ROS2 + overlay)
+cd src/BlueBoat-SideScanSonar/BlueBoat-MCS
+pip install -r requirements.txt        # first time only; env.sh activates .venv
 python3 run.py
 ```
+
+The station runs on the **basestation**, whose workspace is `~/ros2_ws`. The
+boat has a separate workspace, `/blueboat_ws` (with its own `.venv`), where
+`BlueBoat-Control` is built and run — the two are easy to confuse and are not
+interchangeable.
 
 ## Highlights
 
@@ -41,8 +47,11 @@ python3 run.py
 | `docs/05_handover.md` | extension points and cautions |
 | `docs/06_installation.md` | setup and troubleshooting |
 | `docs/07_getting_started.md` | zero-to-operating in five minutes |
+| `docs/08_trajectory_format.md` | the `blueboat_trajectory/1` YAML contract |
+| `docs/HEADING_AND_MAP_ALIGNMENT.md` | heading sources and map frames (reusable note) |
 
-Verified headless via `python3 smoke_test.py` (no ROS, no display required).
+Verified headless via `QT_QPA_PLATFORM=offscreen python3 smoke_test.py`
+(no ROS, no display required).
 
 Dependencies: PySide6, numpy, scipy (pip) + rclpy / mavros_msgs /
 blueboat_interfaces from the sourced ROS2 workspace.

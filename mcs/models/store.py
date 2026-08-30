@@ -209,12 +209,13 @@ class DataStore:
     def on_monitoring(self, t: float, data) -> None:
         # [t_ctrl, x, y, psi, x_d, y_d, psi_d, u1, u2]
         # x_d/y_d/psi_d are WORLD-frame for every controller branch —
-        # guaranteed by the patched integration/master_control.py, which
-        # captures the world target before its inRobotFrame() conversion.
-        # (Do NOT re-add a robot->world fixup here: with the patched
-        # controller it would double-convert. If running an UNPATCHED
-        # master_control, LoS-path/manual/pinger targets arrive robot-frame
-        # and will display off-path — deploy the patched file instead.)
+        # guaranteed by BlueBoat-Control/blueboat_control/src/master_control.py,
+        # which captures the world target before its inRobotFrame() conversion
+        # (the '--- world-frame monitoring target ---' markers, all branches).
+        # (Do NOT re-add a robot->world fixup here: it would double-convert.
+        # If the boat is running a STALE build that predates that capture,
+        # LoS-path/manual/pinger targets arrive robot-frame and will display
+        # off-path — rebuild the boat workspace, do not compensate here.)
         if len(data) >= 7:
             self.mission.path_target = (float(data[4]), float(data[5]))
         self._record_target_distance(t)

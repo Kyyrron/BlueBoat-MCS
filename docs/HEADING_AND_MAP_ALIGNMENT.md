@@ -21,6 +21,23 @@ by `theta`: the glyph heading is wrong and world coordinates don't line up
 with the map. It looks like "a heading bug" but it is a **frame-alignment**
 problem — the heading is just its most visible symptom.
 
+## Two things are being solved, and they are not the same
+
+Separate them or you will conflate them:
+
+* **Where to *place* things** — every world-frame coordinate must be converted
+  into the map frame. This needs `theta`, so it needs the georeference, so it
+  needs motion. There is no way around it.
+* **Where the vehicle is *pointing*** — this needs an absolute heading, and an
+  absolute heading may be available from a **sensor**, with no georeference at
+  all.
+
+The second is the one people get wrong, because the obvious source (odometry
+`yaw`) is the wrong one and the georeference route works, so it becomes the
+only route anyone implements. If the platform publishes a compass, that
+outranks it. **Precedence: an absolute heading source beats the georeference
+offset.** Use `yaw + theta` as the *fallback*, not the primary.
+
 ## Why you cannot know `theta` at startup
 
 `theta` is only observable once the vehicle **moves**: you compare how the
@@ -30,7 +47,8 @@ one stationary fix you know the *origin* (a translation) but not the
 
 - **Translation-only (immediately):** from the first GPS fix you can place
   the map origin and show tiles. `theta = 0` is a placeholder — **do not
-  trust heading yet.**
+  derive heading from it.** (A compass, if you have one, is unaffected: it
+  never went through `theta`.)
 - **Rotation-aligned (after a few metres):** fit a rigid transform
   (Kabsch/Umeyama, scale = 1) between paired `(odom_xy, gps_en)` samples.
   Now `theta` is real and heading can be trusted.
@@ -48,11 +66,23 @@ In the georeferencer (`mcs/core/geo.py`):
   - `world_heading_offset` → `theta` (add to a world-frame yaw).
   - `world_yaw_to_true(world_yaw)` → `world_yaw + theta`, normalised.
 
-In the state store (`mcs/models/store.py`):
+In the state store (`mcs/models/store.py`), `robot_true_heading()` returns the
+north-referenced heading (CCW from east), applying the precedence above:
 
-- `robot_true_heading()` returns the north-referenced heading
-  (`world_yaw_to_true(yaw)`) once `heading_aligned`, else `None` so callers
-  fall back to raw `yaw`.
+1. **The compass, if present.** On this platform that is
+   `/mavros/global_position/compass_hdg` (`std_msgs/Float64`), in **degrees
+   clockwise from north** — 0 = N, 90 = E. Convert once, at the subscription,
+   into the app-wide convention: `radians(90 - hdg)`. It is absolute and
+   available immediately, which matters because odom `yaw` is launch-zeroed:
+   without it the glyph points screen-right at every mission start regardless
+   of where the boat is actually facing.
+2. **Otherwise the georeference**, `world_yaw_to_true(yaw)` = `yaw + theta`,
+   but only once `heading_aligned`.
+3. **Otherwise `None`**, so callers fall back to raw `yaw` and the map says so.
+
+The compass path needs no motion, so on a platform that has one the glyph is
+correct from the first message. The georeference is still required for
+*placement* (stage 2 below) — solving heading does not remove that.
 
 In the map (`mcs/gui/map/map_view.py`) — QGroundControl model,
 implemented:
@@ -63,20 +93,25 @@ implemented:
   only the **vehicle glyph rotates**.
 - Two scene regimes, switched once by `heading_aligned`:
   - **Before alignment** — the scene is the raw robot world frame
-    (world-up). The glyph is at raw `/blueboat/odom`, pointing at raw yaw.
-    A "world-up (north unknown)" notice is shown.
+    (world-up). The glyph is at raw `/blueboat/odom`. A "world-up (north
+    unknown)" notice is shown.
   - **After alignment** — the scene is **local east/north (ENU)**. Every
     world-frame quantity (glyph position, trails, pinger, targets, mission
     paths, and the satellite tiles) is converted with
     `GeoFit.world_to_enu()` at placement, so north points up with no view
-    rotation. The glyph is rotated to its **true heading**
-    (`GeoFit.world_yaw_to_true(yaw) = yaw + theta`); an `N↑` badge appears.
+    rotation; an `N↑` badge appears.
+
+  Note this switch governs **placement only**. The glyph's *heading* comes
+  from `robot_true_heading()` and its precedence, which is independent of the
+  scene regime: with a compass the arrow is already correct while the scene is
+  still world-up.
 - The glyph ignores view transforms (constant pixel size); its device-space
-  rotation is `-degrees(heading)` where `heading` is already the scene-frame
-  heading (true heading in ENU, raw yaw before). There is **no separate
-  view-rotation term** — a single conversion at the source keeps the glyph
-  and everything under it consistent, which is what fixes the "arrow always
-  faces right / points nowhere" symptom.
+  rotation is `-degrees(heading)` where `heading` is whatever
+  `robot_true_heading()` resolved to, falling back to raw `yaw` when it
+  returns `None`. There is **no separate view-rotation term** — a single
+  conversion at the source keeps the glyph and everything under it
+  consistent, which is what fixes the "arrow always faces right / points
+  nowhere" symptom.
 - "Hardcoded paths always draw horizontal" is the same story: those paths
   are world-frame, whose `+x` **is** the robot's launch heading, so before
   alignment horizontal is *correct*; after alignment the ENU conversion
@@ -84,8 +119,9 @@ implemented:
 
 The rule of thumb:
 
-> Compute heading **after** you have both robot world info (odom `yaw`) **and**
-> the odom↔GPS georeference — never from `yaw` alone.
+> Never draw heading from odometry `yaw` alone. Take it from an absolute
+> source if the platform has one (a compass); otherwise wait for the
+> odom↔GPS georeference and use `yaw + theta`.
 
 ## Guard rails
 
@@ -103,7 +139,14 @@ Keep two fit stages. Turn tiles on as soon as you have any GPS fix
 solved yet. Keep the map north-up and fixed at all times. Before rotation is
 solved, draw the glyph from raw yaw in the raw world frame and label it
 "north not yet aligned". After, convert every point to east/north with the
-one offset `theta` and rotate ONLY the vehicle icon to `yaw + theta` — never
-rotate the view, or the satellite tiles rotate with it (the exact bug this
-note exists to prevent). Solve `theta` by fitting odom-vs-GPS tracks after a
-few metres of motion.
+one offset `theta` and rotate ONLY the vehicle icon — never rotate the view, or
+the satellite tiles rotate with it (the exact bug this note exists to
+prevent). Solve `theta` by fitting odom-vs-GPS tracks after a few metres of
+motion.
+
+For the icon's heading specifically, check for an absolute heading source
+first — a compass topic, an AHRS, anything north-referenced — and use it when
+present, converting its convention to yours at the subscription. Fall back to
+`yaw + theta` only when there is none. Placement always needs `theta`;
+heading often does not, and treating them as one problem makes the glyph wait
+on motion it never needed.

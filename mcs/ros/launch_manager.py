@@ -79,9 +79,9 @@ class LaunchParameters:
                 f"trajectory:={self.trajectory}",
                 f"use_pinger:={b(self.use_pinger)}",
             ]
-            if not self.controller_type == "":
+            if self.controller_type != "":
                 args += [f"controller_type:={self.controller_type}"]
-            if not self.note == "":
+            if self.note != "":
                 args += [f"note:={self.note}"]
         args += [f"{k}:={v}" for k, v in self.extra_args.items()]
         return args
@@ -143,7 +143,14 @@ class LaunchManager(QObject):
         return True
 
     def notify_running(self) -> None:
-        """Called by the readiness watcher once required nodes are up."""
+        """Promote 'starting' -> 'running' once telemetry says the graph is up.
+
+        Called from ``MainWindow._on_tick`` — there is no separate watcher.
+        The condition is odometry flowing plus, on the real-robot graph only,
+        an FCU-connected MAVROS state; ``Sim_launch.py`` has no MAVROS and is
+        exempted there.  Promotion is a status indication: it does not gate
+        the Launch/Stop controls, which are driven by the state itself.
+        """
         if self.running and self._state == "starting":
             self._set_state("running")
 

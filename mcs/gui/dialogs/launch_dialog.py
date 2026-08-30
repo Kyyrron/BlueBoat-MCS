@@ -20,9 +20,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
-    QLineEdit, QVBoxLayout,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
 )
 
 from mcs.config.settings import AppConfig
@@ -83,9 +90,12 @@ class LaunchDialog(QDialog):
             self._trajectory.addItem("── custom paths ──")
             self._trajectory.model().item(header).setEnabled(False)
             for name, path in customs:
-                anchored = io_yaml.read_geo_anchor(path) is not None
-                label = f"custom: {name}" + (" (GPS)" if anchored else "")
-                self._trajectory.addItem(label, str(path))
+                badge, tip = self._custom_badge(cfg, path)
+                self._trajectory.addItem(f"custom: {name}{badge}", str(path))
+                if tip:
+                    self._trajectory.setItemData(
+                        self._trajectory.count() - 1, tip,
+                        Qt.ItemDataRole.ToolTipRole)
         form.addRow("Trajectory", self._trajectory)
 
         # ---- Real-robot-only fields ----------------------------------------------
@@ -186,6 +196,35 @@ class LaunchDialog(QDialog):
             f"The station runs: ros2 launch {self._cfg.launch.package} "
             f"{launch_file} …\n{extra}")
         self.adjustSize()
+
+    @staticmethod
+    def _custom_badge(cfg: AppConfig, path: Path) -> tuple[str, str]:
+        """Suffix + tooltip for one custom-path entry.
+
+        A GPS-anchored mission is geographically fixed and is never
+        realigned (the boat turns toward it instead), so it is exempt from
+        the start-alignment check -- the same exemption
+        DesignerWindow._maybe_offer_alignment makes. Everything else is
+        checked against its own samples, because the world frame is zeroed
+        at launch and a mission that does not start at (0,0) along +x makes
+        the boat cut across to its start first.
+
+        Informational only: the launch path never rewrites a mission file.
+        """
+        if io_yaml.read_geo_anchor(path) is not None:
+            return (" (GPS)",
+                    ("GPS-anchored: relocated into this run's world frame at "
+                     "launch."))
+        if io_yaml.read_start_misalignment(
+                path, cfg.designer.start_align_tol_m,
+                cfg.designer.start_align_tol_deg) is not None:
+            return (" (not start-aligned)",
+                    ("This mission does not start at (0,0) along +x. The world "
+                     "frame is zeroed at the boat every launch, so the boat "
+                     "will first cut across to the mission start.\n"
+                     "Fix it with Edit \u25b8 Align to Start in the Survey "
+                     "Pattern Designer."))
+        return ("", "")
 
     def _on_pinger_toggled(self, on: bool) -> None:
         # BlueBoat_launch.py only starts path_generation when use_pinger is False.

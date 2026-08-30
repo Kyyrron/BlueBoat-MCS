@@ -12,42 +12,62 @@
 
 ## Steps
 
-1. Get the code onto the basestation:
+1. Get the code onto the basestation. The station is a submodule of the
+   `BlueBoat-SideScanSonar` superproject, checked out inside the basestation
+   ROS2 workspace `~/ros2_ws`:
 
    ```bash
-   git clone <your-repo-url> blueboat_mcs        # or copy the folder
-   cd blueboat_mcs
+   cd ~/ros2_ws/src
+   git clone --recurse-submodules <superproject-url> BlueBoat-SideScanSonar
+   cd BlueBoat-SideScanSonar/BlueBoat-MCS
    ```
 
-2. Install the Python dependencies. Either system-wide/user:
+   (`--recurse-submodules` matters: without it the module directories are
+   empty. On an existing clone, `git submodule update --init --recursive`.)
+
+2. Source the basestation workspace **before** anything else (this is what
+   makes `rclpy`, `mavros_msgs`, `blueboat_interfaces` and the `ros2 launch`
+   executable available to the station). `~/ros2_ws/env.sh` does both halves —
+   it activates the workspace virtual environment and sources
+   `install/setup.bash`:
 
    ```bash
-   pip install --user -r requirements.txt
+   cd ~/ros2_ws && source env.sh
    ```
 
-   or in a virtual environment — in that case create it with access to the
-   ROS site-packages, since `rclpy` comes from ROS, not pip:
-
-   ```bash
-   python3 -m venv --system-site-packages .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-3. Source ROS2 and your workspace **before** starting the station (this is
-   what makes `rclpy`, `mavros_msgs`, `blueboat_interfaces` and the
-   `ros2 launch` executable available to it):
+   The equivalent by hand, if you are not using `env.sh`:
 
    ```bash
    source /opt/ros/<distro>/setup.bash
-   source ~/blueboat_ws/install/setup.bash
+   source ~/ros2_ws/install/setup.bash
    ```
 
-4. Run:
+   **Which workspace:** `~/ros2_ws` is the **basestation's** — the station and
+   the SSS applications run from it. `/blueboat_ws`, with its own `.venv`, is
+   the **boat's**, where `BlueBoat-Control` is built and launched. They are not
+   interchangeable, and this is the most common setup mistake.
+
+3. Install the Python dependencies into that environment (first time only):
 
    ```bash
+   pip install -r requirements.txt
+   ```
+
+   Do **not** add `--user` while the workspace `.venv` is active — pip refuses
+   it. If you are running against a bare system Python with no venv,
+   `pip install --user -r requirements.txt` is the right form. Either way
+   `rclpy` comes from ROS, never from pip; a hand-made venv must therefore be
+   created with `python3 -m venv --system-site-packages`.
+
+4. Run, from the module root:
+
+   ```bash
+   cd ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-MCS
    python3 run.py
    ```
+
+   `build.sh` does the whole sequence (a `colcon build` in `~/ros2_ws`, then
+   `source env.sh`, then `run.py`).
 
 ## Configuration (optional)
 
@@ -67,8 +87,8 @@ or pass a file explicitly: `python3 run.py --config my_config.json`.
 
 ## Verifying the installation
 
-Without the boat: `python3 smoke_test.py` must print `SMOKE TEST PASSED`
-(runs headless, no ROS needed). With ROS sourced but no boat, start the
+Without the boat: `QT_QPA_PLATFORM=offscreen python3 smoke_test.py` must
+print `SMOKE TEST PASSED` (runs headless; works with or without ROS sourced). With ROS sourced but no boat, start the
 station: the status bar shows "ROS: connected" and the diagnostics panel shows
 every topic grey ("never") — that is the expected idle state.
 
@@ -78,9 +98,14 @@ every topic grey ("never") — that is the expected idle state.
   the shell that started the station.
 * *"'ros2' not found" when launching a mission* — same cause; the launch
   subprocess inherits the station's environment.
-* *Satellite checkbox stays disabled* — no GPS fix yet, or the boat hasn't
-  moved the few metres needed for the georeference (watch "georef" in the
-  status bar), or no internet route to the tile server.
+* *Satellite checkbox stays disabled* — no GPS fix yet, or no internet route
+  to the tile server. The tiles need only the **first** GPS fix: the
+  georeference emits a translation-only fit immediately, which is enough to
+  place them. (Motion is needed for something else — see the next entry.)
+* *Tiles are up but the mission path never draws, and the `N↑` badge does not
+  appear* — the georeference is not heading-aligned yet. Rotation is
+  unobservable while the boat is stationary; drive a few metres and it
+  resolves. Expected early in a run, not a fault.
 * *mavros_msgs / blueboat_interfaces warnings at startup* — those packages are
   missing from the sourced workspace; the corresponding features (FCU state,
   mission-path display) disable themselves and everything else keeps working.

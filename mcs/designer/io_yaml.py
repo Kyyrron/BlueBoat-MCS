@@ -4,9 +4,9 @@ Two files per mission, in ``designer.trajectories_dir``:
 
 * ``<name>.yaml`` — the **runtime** trajectory: only what execution needs
   (format tag, speed, loop, time-stamped ``[t, x, y, yaw]`` samples plus
-  informative length/duration). Consumed by
-  ``integration/yaml_trajectory.py`` on the robot side; documented in
-  ``docs/08_trajectory_format.md``.
+  informative length/duration). Consumed on the robot side by
+  ``BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py``;
+  documented in ``docs/08_trajectory_format.md``.
 * ``<name>.meta.yaml`` — **editor** metadata: the full designer model
   (groups, locks, segment interpolation settings, comments). The runtime
   never reads it; without it a runtime file can still be re-imported as
@@ -18,12 +18,15 @@ from __future__ import annotations
 import datetime
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import yaml
 
-from mcs.designer.model import MissionModel
-from mcs.designer.sampling import SampledMission
+from mcs.designer.sampling import SampledMission, start_misalignment
+
+if TYPE_CHECKING:  # annotation only -- see mcs/designer/sampling.py
+    from mcs.designer.model import MissionModel
 
 FORMAT = "blueboat_trajectory/1"
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
@@ -65,7 +68,9 @@ def save_mission(directory: Path, name: str, model: MissionModel,
         "format": FORMAT,
         "name": name,
         "generator": "mission-pattern-designer/1.0",
-        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        # Local wall-clock is deliberate: operators read this field.
+        "created": datetime.datetime.now().isoformat(  # noqa: DTZ005
+            timespec="seconds"),
         "frame": "world",
         "speed": float(model.speed),
         "loop": bool(model.loop),
@@ -97,6 +102,31 @@ def read_geo_anchor(yaml_path: Path) -> dict | None:
     if isinstance(anchor, dict) and "lat0" in anchor and "lon0" in anchor:
         return anchor
     return None
+
+
+def read_start_misalignment(yaml_path: Path, tol_m: float, tol_deg: float
+                            ) -> tuple[tuple[float, float], float] | None:
+    """Start misalignment of a runtime file, read from its own samples.
+
+    The launch dialog only has the runtime ``<name>.yaml`` on disk, not the
+    designer model. ``points`` IS the sampled polyline save_mission wrote,
+    so the first two rows carry exactly the geometry the designer checks;
+    the shared predicate lives in :func:`sampling.start_misalignment`.
+
+    Never raises: an unreadable, non-YAML or malformed file answers "no
+    misalignment to report" so it cannot break the launch dialog.
+    """
+    try:
+        data = yaml.safe_load(yaml_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    try:
+        pts = np.asarray(data.get("points", []), dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] < 3:
+        return None
+    return start_misalignment(pts[:, 1:3], tol_m, tol_deg)
 
 
 def deploy_mission(src: Path, current_fit, dst: Path) -> Path:

@@ -84,31 +84,65 @@ is, which keeps every series mutually consistent even if a node restarts.
 
 ## Testing
 
-`smoke_test.py` at the repo root exercises: series windowing/decimation,
-georeference recovery of a known transform (asserts the 30° rotation and the
-translation to sub-mm), LoS predictor convergence, full window construction
-without ROS, synthetic telemetry through the bus, statistics, timeline and
-manual-target state transitions. Run with `python3 smoke_test.py` — no ROS,
-no display required. Extend it whenever you add store or core logic.
+`smoke_test.py` at the repo root is a **linear script, not a test
+framework**: it aborts on the first failed assertion, so anything after a
+failure never runs. It prints fourteen checkpoints and ends with
+`SMOKE TEST PASSED`. Run it with:
 
-## Known robot-side issues the station works around
+```bash
+QT_QPA_PLATFORM=offscreen python3 smoke_test.py
+```
 
-See `03_ros_integration.md` §"Observations" — three defects were found while
-reading the stack (manual-target resume comparison, target published on the
-thruster topic in pinger mode, unpublished corrected pinger). The station is
-written against the stack *as it is*; each observation lists the one-line
-robot-side fix if you choose to apply it.
+It runs identically with or without `rclpy` importable. Four of the §3
+non-negotiables in `CLAUDE.md` are asserted there (pinger anchoring, the
+`[0,0]` sentinel, the deploy guard, and safe-shutdown *ordering*); `CLAUDE.md`
+§7 has the checkpoint list and the current coverage gaps. Extend it whenever
+you add store, core or designer logic.
+
+A green run is not field readiness: it is offscreen and synthetic, so it
+cannot catch QoS mismatches, real message-type drift or launch-file argument
+errors.
+
+### Lint
+
+`ruff` is the second gate, configured in `ruff.toml` at the repo root. It needs
+neither ROS nor the venv — it resolves no imports — so it runs from any shell:
+
+```bash
+pip install -r requirements-dev.txt   # first time only
+ruff check .
+```
+
+`requirements-dev.txt` is separate from `requirements.txt` on purpose: the
+basestation installs runtime dependencies only. The version is pinned exactly,
+because the gate is ruff's default rule selection rather than an explicit
+`select` list, so an unpinned upgrade would change what it enforces.
+
+The broad `except Exception` clauses in the ROS-facing and logging paths are
+deliberate and carry inline `# noqa: BLE001` with a reason — a ROS callback must
+never take down the GUI thread. Keep that pattern; do not narrow them to satisfy
+the linter. `CLAUDE.md` §7 has the two configured rule suppressions and the
+reason no type-checker is configured.
+
+## Robot-side behaviours the station does not compensate for
+
+The station supervises; it does not paper over the stack. When something looks
+wrong on screen, the first question is whether the producing node is right.
+`03_ros_integration.md` §"Observations" is the running list, verified against
+`BlueBoat-Control` — some entries there are now fixed and recorded as such, and
+the ones that remain are flagged, not worked around. `CLAUDE.md` §6 owns the
+two limitations that are carried deliberately.
 
 
-## Mission Pattern Designer (mcs/designer/)
+## Survey Pattern Designer (mcs/designer/)
 
 Layering mirrors the station: `model.py` (mission data + mutations +
 snapshot undo), `interpolation.py` and `patterns.py` (pure registries),
 `sampling.py` (mission → time-stamped samples), `io_yaml.py` (runtime +
 metadata files, library ops) are Qt-widget-free and covered by the smoke
 test; `designer_map.py`, `panels.py`, `designer_window.py` are
-presentation. Robot-side, `integration/yaml_trajectory.py` is the only
-runtime dependency.
+presentation. Robot-side, the only runtime dependency is
+`BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py`.
 
 How to extend:
 

@@ -23,9 +23,12 @@ from enum import Enum, auto
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QTransform
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QGraphicsLineItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
+    QGraphicsLineItem,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
     QLabel,
 )
 
@@ -33,8 +36,15 @@ from mcs.config.settings import AppConfig
 from mcs.core.los_predictor import predict_los_path
 from mcs.gui import theme
 from mcs.gui.map.map_items import (
-    CrosshairItem, MarkerItem, MissionPathItem, PolylineItem, RobotItem,
-    TargetLineItem, draw_grid, draw_north_indicator, draw_scale_bar,
+    CrosshairItem,
+    MarkerItem,
+    MissionPathItem,
+    PolylineItem,
+    RobotItem,
+    TargetLineItem,
+    draw_grid,
+    draw_north_indicator,
+    draw_scale_bar,
 )
 from mcs.gui.map.tile_layer import TileLayer
 from mcs.models.store import DataStore
@@ -167,7 +177,9 @@ class MapView(QGraphicsView):
         self._reached_announced = False
 
     def show_manual_target(self, x: float, y: float) -> None:
-        self.manual_marker.set_world_pos(x, y)
+        """``x, y`` are WORLD metres (what was published); refresh() keeps the
+        crosshair placed across a scene-regime switch."""
+        self.manual_marker.set_world_pos(*self._to_scene(x, y))
         self.manual_marker.setVisible(True)
         self.predicted_path.setVisible(True)
         self._reached_announced = False
@@ -213,7 +225,22 @@ class MapView(QGraphicsView):
             return fit.world_to_enu(wx, wy)
         return wx, wy
 
-    def _scene_points(self, xy) -> "np.ndarray":
+    def _to_world(self, sx: float, sy: float) -> tuple[float, float]:
+        """Scene coordinates -> world frame: the exact inverse of
+        :meth:`_to_scene`, under the identical regime test.
+
+        Every mouse position arrives in scene coordinates, and in the ENU
+        scene those are NOT world metres. Anything read back out of the view
+        — the published manual target above all, but also the inspector,
+        the measure read-out and GPS conversion — must come back through
+        here, or it is wrong by the georeference rotation ``theta``.
+        A no-op in the world-up scene, where scene *is* world."""
+        fit = self._store.geo.fit
+        if self._enu_scene and fit is not None:
+            return fit.enu_to_world(sx, sy)
+        return sx, sy
+
+    def _scene_points(self, xy) -> np.ndarray:
         if not (self._enu_scene and self._store.geo.fit is not None) or len(xy) == 0:
             return xy
         fit = self._store.geo.fit
@@ -262,6 +289,12 @@ class MapView(QGraphicsView):
         if centre_world is not None:
             sx, sy = self._to_scene(*centre_world)
             self.centerOn(sx, sy)
+        # Anything holding a bare scene coordinate is stale the moment the
+        # regime changes: an in-progress measurement and the inspector dot
+        # are the two that are placed once and never refreshed.
+        if self._measure_start is not None:
+            self._clear_measurement()
+        self.click_marker.setVisible(False)
         self.viewport().update()
 
     # ================================================================ refresh
@@ -327,6 +360,10 @@ class MapView(QGraphicsView):
         if mt is None or not store.robot.has_odom:
             self.predicted_path.setPath(self.predicted_path.path().__class__())
             return
+        # Re-placed every tick, not only at click time: the manual target is
+        # the one item whose position would otherwise be stranded in the old
+        # frame if the scene switches to ENU while it is active.
+        self.manual_marker.set_world_pos(*self._to_scene(*mt))
         pts = predict_los_path(
             (store.robot.x, store.robot.y, store.robot.yaw), mt, self._cfg.los)
         self.predicted_path.set_points(self._scene_points(np.asarray(pts))
@@ -398,7 +435,8 @@ class MapView(QGraphicsView):
         one-shot performed on the very first odometry sample.)
         """
         if self._store.robot.has_odom:
-            self.centerOn(self._store.robot.x, self._store.robot.y)
+            self.centerOn(*self._to_scene(self._store.robot.x,
+                                          self._store.robot.y))
             # A deliberate center also satisfies (and consumes) the startup
             # one-shot, so no automatic recenter can ever move the camera
             # after the operator has positioned it.
@@ -413,28 +451,33 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            world = self.mapToScene(event.position().toPoint())
+            scene_pt = self.mapToScene(event.position().toPoint())
             if self._mode is MapMode.MANUAL_TARGET:
-                self.target_clicked.emit(world.x(), world.y())
+                # target_clicked carries WORLD: /blueboat/manual_target is a
+                # world-frame topic and master_control does its own frame
+                # conversion, so the scene point is inverted here, once, at
+                # the view boundary.
+                self.target_clicked.emit(*self._to_world(scene_pt.x(), scene_pt.y()))
                 return
             if self._mode is MapMode.MEASURE:
-                self._handle_measure_click(world)
+                self._handle_measure_click(scene_pt)
                 return
-            self._inspect_point(world)
+            self._inspect_point(scene_pt)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         if self._mode is MapMode.MEASURE and self._measure_start is not None:
-            world = self.mapToScene(event.position().toPoint())
-            self._update_measure(world, final=False)
+            scene_pt = self.mapToScene(event.position().toPoint())
+            self._update_measure(scene_pt, final=False)
         super().mouseMoveEvent(event)
 
     # ------------------------------------------------------------- inspector
-    def _inspect_point(self, world: QPointF) -> None:
+    def _inspect_point(self, scene_pt: QPointF) -> None:
+        """Marker placement is scene-space; every number reported is world."""
         store = self._store
-        x, y = world.x(), world.y()
-        self.click_marker.set_world_pos(x, y)
+        self.click_marker.set_world_pos(scene_pt.x(), scene_pt.y())
         self.click_marker.setVisible(True)
+        x, y = self._to_world(scene_pt.x(), scene_pt.y())
         parts = [f"world ({x:+.2f}, {y:+.2f}) m"]
         if store.geo.is_valid and store.geo.fit is not None:
             lat, lon = store.geo.fit.world_to_latlon(x, y)
@@ -447,23 +490,29 @@ class MapView(QGraphicsView):
         self.point_inspected.emit("   |   ".join(parts))
 
     # ---------------------------------------------------------- measure tool
-    def _handle_measure_click(self, world: QPointF) -> None:
+    def _handle_measure_click(self, scene_pt: QPointF) -> None:
         if self._measure_start is None:
-            self._measure_start = world
+            self._measure_start = scene_pt
             self._measure_line.setVisible(True)
             self._measure_text.setVisible(True)
-            self._update_measure(world, final=False)
+            self._update_measure(scene_pt, final=False)
         else:
-            self._update_measure(world, final=True)
+            self._update_measure(scene_pt, final=True)
             self._measure_start = None
 
-    def _update_measure(self, world: QPointF, final: bool) -> None:
+    def _update_measure(self, scene_pt: QPointF, final: bool) -> None:
+        """The line and its label live in scene coordinates; the reported
+        endpoints are world. The distance stays a scene-space computation on
+        purpose — world<->scene is a rigid transform, so it is identical
+        either way, and computing it here cannot drift from what is drawn."""
         assert self._measure_start is not None
-        a, b = self._measure_start, world
+        a, b = self._measure_start, scene_pt
         self._measure_line.setLine(a.x(), a.y(), b.x(), b.y())
         d = math.hypot(b.x() - a.x(), b.y() - a.y())
         self._measure_text.setText(f"{d:.2f} m")
         self._measure_text.setPos((a.x() + b.x()) / 2, (a.y() + b.y()) / 2)
-        text = (f"measure: {d:.2f} m   |   A ({a.x():+.2f}, {a.y():+.2f})"
-                f"   B ({b.x():+.2f}, {b.y():+.2f})")
+        ax, ay = self._to_world(a.x(), a.y())
+        bx, by = self._to_world(b.x(), b.y())
+        text = (f"measure: {d:.2f} m   |   A ({ax:+.2f}, {ay:+.2f})"
+                f"   B ({bx:+.2f}, {by:+.2f})")
         self.point_inspected.emit(text)

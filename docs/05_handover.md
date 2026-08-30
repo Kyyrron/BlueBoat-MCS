@@ -45,19 +45,21 @@ File-menu actions.
 parametrise it with a `TimeSeries` getter and add speed / thrust plots as new
 `CollapsibleSection`s. `thrust_hist` and `speed_hist` are already recorded.
 
-**Robot-side improvements worth adopting** (details and one-line patches in
-`03_ros_integration.md` §Observations): fix the manual-target resume
-comparison (required for "Continue Original Mission" to behave), publish the
-world-frame pinger, fix the target-on-thruster-topic slip in pinger mode. If
-the world-frame pinger is published, point `TopicsConfig` at it and delete
-`DataStore._update_pinger_world`.
+**Robot-side improvement still worth adopting** (details in
+`03_ros_integration.md` §Observations 3): publish the world-frame pinger. If it
+is published, point `TopicsConfig` at it and delete
+`DataStore._update_pinger_world`. The other items that used to sit here — the
+manual-target resume comparison and the target-on-thruster-topic slip in pinger
+mode — have since been fixed in `BlueBoat-Control`; do not re-apply them. Any
+robot-side change is made, committed and built in that submodule, never here
+(`CLAUDE.md` §6, §3 N9).
 
 **Waypoint mission editing.** The map's click plumbing (modes, markers,
 publishers) generalises directly to click-to-build waypoint lists; the missing
 piece is a robot-side consumer, since `path_generation` currently serves
 analytic trajectories only.
 
-**Mission Pattern Designer — future work.** Cubic Bézier segments are
+**Survey Pattern Designer — future work.** Cubic Bézier segments are
 implemented; the following were assessed and deliberately deferred as they
 change the product's scope rather than extend a registry: **Dubins paths**
 (turn-radius-constrained segments — natural fit as one more
@@ -89,7 +91,7 @@ sufficient as its output target: an adaptive planner can write
 ## Maintenance
 
 Dependencies are PySide6, numpy, scipy (pip) and the ROS2 workspace
-(rclpy, mavros_msgs, blueboat_interfaces). `smoke_test.py` runs without ROS or
-a display and should stay green on every change; extend it with any new store
-or core logic. The tile cache (`~/.config/blueboat_mcs/tile_cache`) can be
+(rclpy, mavros_msgs, blueboat_interfaces). `QT_QPA_PLATFORM=offscreen python3
+smoke_test.py` runs without ROS or a display and should stay green on every
+change; extend it with any new store, core or designer logic. The tile cache (`~/.config/blueboat_mcs/tile_cache`) can be
 deleted at any time.

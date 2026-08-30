@@ -27,16 +27,25 @@ import numpy as np
 from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (
-    QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsScene,
-    QGraphicsSimpleTextItem, QGraphicsView,
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsItemGroup,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
 )
 
 from mcs.config.settings import AppConfig
-from mcs.designer.model import MissionModel, Waypoint
+from mcs.designer.model import MissionModel
 from mcs.designer.sampling import SampledMission
 from mcs.gui import theme
 from mcs.gui.map.map_items import (
-    MarkerItem, PolylineItem, RobotItem, draw_grid, draw_scale_bar)
+    MarkerItem,
+    PolylineItem,
+    RobotItem,
+    draw_grid,
+    draw_scale_bar,
+)
 from mcs.gui.map.tile_layer import TileLayer
 
 C_WAYPOINT = QColor("#e3b341")
@@ -55,7 +64,7 @@ class WaypointItem(QGraphicsEllipseItem):
 
     R = 7.0
 
-    def __init__(self, uid: int, host: "DesignerMapView") -> None:
+    def __init__(self, uid: int, host: DesignerMapView) -> None:
         super().__init__(-self.R, -self.R, 2 * self.R, 2 * self.R)
         self.uid = uid
         self._host = host

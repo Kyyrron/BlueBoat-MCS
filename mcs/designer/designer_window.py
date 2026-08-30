@@ -23,9 +23,23 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPushButton, QScrollArea, QSplitter, QToolBar, QVBoxLayout,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -35,10 +49,13 @@ from mcs.designer import io_yaml, patterns
 from mcs.designer.designer_map import DesignerMapView, EditMode
 from mcs.designer.model import MissionModel, PatternGroup, Waypoint
 from mcs.designer.panels import (
-    MissionTree, PatternLibrary, PropertiesPanel, SchemaDialog, parse_latlon,
+    MissionTree,
+    PatternLibrary,
+    PropertiesPanel,
+    SchemaDialog,
+    parse_latlon,
 )
-from mcs.designer.sampling import sample_mission
-from mcs.gui import theme
+from mcs.designer.sampling import sample_mission, start_misalignment
 from mcs.gui.widgets import CollapsibleSection
 
 _LOG = logging.getLogger(__name__)
@@ -225,17 +242,15 @@ class DesignerWindow(QMainWindow):
     # ---------------------------------------------------- start alignment
     def _start_misalignment(self) -> tuple[tuple[float, float], float] | None:
         """(origin, initial tangent angle) if the mission does not start at
-        (0,0) heading +x within tolerance, else None."""
+        (0,0) heading +x within tolerance, else None.
+
+        Shares its threshold and its maths with the launch dialog's badge
+        (see :func:`mcs.designer.sampling.start_misalignment`), so the two
+        can never disagree about the same mission."""
         samples = sample_mission(self.model, self._cfg.designer.sample_ds_m)
-        if samples.empty or len(samples.xy) < 2:
-            return None
-        import math as _math
-        p0 = (float(samples.xy[0][0]), float(samples.xy[0][1]))
-        d = samples.xy[1] - samples.xy[0]
-        angle = _math.atan2(float(d[1]), float(d[0]))
-        if _math.hypot(*p0) <= 0.05 and abs(angle) <= _math.radians(2.0):
-            return None
-        return p0, angle
+        return start_misalignment(samples.xy,
+                                  self._cfg.designer.start_align_tol_m,
+                                  self._cfg.designer.start_align_tol_deg)
 
     def _align_to_start(self) -> None:
         mis = self._start_misalignment()
@@ -324,7 +339,7 @@ class DesignerWindow(QMainWindow):
         self.props.show_selection(uids)
 
     # ============================================================== actions
-    def _on_action(self, verb: str, payload) -> None:  # noqa: C901 - router
+    def _on_action(self, verb: str, payload) -> None:  # action router
         selection = self._selection()
         if verb == "move" and selection:
             self._push_undo()
