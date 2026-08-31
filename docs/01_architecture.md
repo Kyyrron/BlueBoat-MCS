@@ -67,20 +67,20 @@ range restores live following.
 
 A `QGraphicsView` in metres with a y-flip. **The view never rotates**: north-up
 is achieved by choosing what frame the scene is in, not by rotating the camera —
-rotating the view would spin the satellite tiles with it. There are two scene
-regimes, switched exactly once:
-
-* **Before heading alignment** — the scene is the raw robot world frame
-  (world-up), and a `world-up (north unknown)` notice is shown.
-* **After heading alignment** — the scene is **local east/north (ENU)**. Every
-  world-frame quantity (glyph, trails, pinger, targets, mission path, tiles) is
-  converted with `GeoFit.world_to_enu()` at placement, so north is up with the
-  view unrotated, and an `N` + arrow badge appears.
+rotating the view would spin the satellite tiles with it. There is exactly
+**one scene frame**: local east/north metres about the latched GPS origin
+`(lat0, lon0)`. Every world-frame quantity (glyph, trails, pinger, targets,
+mission path) is placed through the pure translation `GeoFit.world_to_enu()`
+(`EN = world + t`); satellite tiles are axis-aligned from the origin. Nothing
+is drawn — and manual-target clicks are refused — until the anchor exists
+(`store.map_frame_ready()`): a "waiting for GPS fix" notice shows instead. In
+simulation the anchor is the identity and drawing starts immediately, tiles
+off.
 
 Only the robot glyph rotates, and its heading comes from an absolute source
-(see `HEADING_AND_MAP_ALIGNMENT.md`). `MapView._to_world()` is the exact
-inverse of `_to_scene()` under the same regime test, and every mouse position
-read back out of the view goes through it.
+(compass, else the absolute ENU odom yaw — see `GPS_MAP_ARCHITECTURE.md` at
+the repo root). `MapView._to_world()` is the exact inverse of `_to_scene()`,
+and every mouse position read back out of the view goes through it.
 
 Constant-pixel-size glyphs (`ItemIgnoresTransformations`) for the boat and
 markers, cosmetic pens for lines, an adaptive 1/2/5-decade metric grid painted
@@ -91,22 +91,19 @@ publishes anything itself.
 
 ### Georeferencing
 
-The world frame is defined inside `robot_interface.py` by an origin and yaw
-offset that are never published. The station estimates the identical
-similarity transform online, in **two stages**:
-
-* **Translation-only**, emitted from the *first* GPS fix. `is_valid` becomes
-  true immediately, which is what lets the satellite layer turn on at the first
-  sign of GPS; `theta` is a placeholder `0` and `heading_aligned` is `False`.
-* **Rotated Kabsch fit** (scale fixed to 1) over a sliding window, once enough
-  motion (`min_spread_m`) makes rotation observable. `heading_aligned` becomes
-  `True` and `theta` is trustworthy.
-
-Rotation is simply not observable from a stationary boat, so the second stage
-cannot be hurried. **Consumers that need rotation must check `heading_aligned`,
-not just `is_valid`** — the ENU scene switch, the mission-path preview and
-GPS-anchored mission deployment all gate on it. The fit quality (RMS residual)
-is shown in the status bar.
+`/blueboat/odom` is **local ENU** (origin = launch point, axes East/North,
+yaw absolute), so the only unknown between the world frame and GPS is a
+**translation** `t = EN(world origin)` — never published by the robot, but
+trivially estimable. `GeoReferencer` pairs each GPS fix with the concurrent
+odom pose (GPS rate, odom-freshness guard), takes the per-axis **median**
+over a rolling window, and reports a MAD-robust residual as the health
+figure. `is_valid` needs only `min_pairs` (~1 s of GPS) under the residual
+threshold — **no vehicle motion**, so a station-keeping boat anchors too
+(what makes deferred GPS-anchored deployment work). There is deliberately no
+rotation estimation: with an ENU odom frame the true rotation is zero by
+construction — the old two-stage Kabsch model is deleted (see
+`GPS_MAP_ARCHITECTURE.md` §7 for why it could never work). The fit quality
+(robust RMS + pair count) is shown in the status bar.
 
 ### Mission lifecycle
 

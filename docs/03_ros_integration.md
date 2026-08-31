@@ -8,9 +8,9 @@ defaults below match the stack as provided.
 
 | Topic | Type | Producer | Used for |
 |---|---|---|---|
-| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | World pose (origin-relative, yaw-only quaternion), heading, speed, trajectory, travelled distance, georeference input |
+| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | World pose in **local ENU** (origin = launch point, axes East/North, yaw **absolute** ENU — 0 = East, CCW+), heading fallback, speed, trajectory, travelled distance, georeference input |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS | Robot GPS read-out, georeference input (BEST_EFFORT QoS) |
-| `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **Robot glyph heading** — degrees clockwise from north (0=N, 90=E), converted to the app convention (radians CCW from east) as `radians(90 - hdg)`. Absolute and available immediately, unlike launch-zeroed odom yaw. BEST_EFFORT QoS |
+| `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **Robot glyph heading (preferred source)** — degrees clockwise from north (0=N, 90=E), converted to the app convention (radians CCW from east) as `radians(90 - hdg)`. The fallback is the odom yaw directly, which is absolute ENU too. BEST_EFFORT QoS |
 | `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU connected / armed / mode. Only subscribed when `mavros_msgs` imports; absent in simulation |
 | `/blueboat/pinger_coordinates` | `Float32MultiArray[3]` | `robot_interface.py` | Pinger in **robot/body frame** (sensor-fused); distance; world position computed once per message, with the pose concurrent with it, and held fixed in between (§3 N4) |
 | `/uw_gps_data` | `Float32MultiArray[19]` | `uwgps_log.py` | Timestamp of the last raw USBL packet ("Last update" field) |
@@ -47,10 +47,11 @@ mission-path layer. It is requested for a launch with a non-empty controller
 and `use_pinger:=False` (the launch file only starts `path_generation` in that
 case), and for the simulation.
 
-The request is **held until the georeference is heading-aligned**
+The request is **held until the map frame is anchored**
 (`MainWindow._on_tick` keeps it in `_pending_preview_trajectory` until
-`store.world_frame_ready()`), because the mission path cannot be placed in the
-ENU scene before then — an empty map early in a run is expected, not a fault.
+`store.map_frame_ready()`): a few GPS fixes on real water (no motion needed),
+immediately in simulation. A briefly empty map right after a real-water
+launch is expected, not a fault.
 The horizon is `launch.path_preview_total_time_s` (120 s by default); a
 designer trajectory's own `duration_s` replaces it automatically.
 
@@ -114,9 +115,24 @@ Node termination is never initiated before steps 1–4 complete.
 
 ## Observations on the existing stack (flagged, not silently patched)
 
-Verified against `BlueBoat-Control` on 2026-08-28. Robot-side code lives in the
-`BlueBoat-Control` submodule and is built there — nothing is copied from this
-repo (`CLAUDE.md` §6, §3 N9).
+Verified against `BlueBoat-Control` on 2026-08-28; frame item 00 added
+2026-08-31. Robot-side code lives in the `BlueBoat-Control` submodule and is
+built there — nothing is copied from this repo (`CLAUDE.md` §6, §3 N9).
+
+00. **`/blueboat/odom` frame — fixed to local ENU (2026-08-31).**
+   `robot_interface.odom_callback` used to translate the MAVROS position to
+   the launch point but ALSO re-zero yaw (`yaw − yaw0`) without rotating the
+   position axes — a hybrid frame (ENU axes, launch-relative heading) that
+   was self-consistent only when the boat launched facing East. This was the
+   root cause of the field symptoms "trajectory following only works starting
+   East", wrong manual-target behaviour and broken GPS anchoring. The fix
+   (committed in `BlueBoat-Control`) drops the yaw re-zeroing: the frame is
+   now **local ENU** — origin = launch point, +x = East, yaw absolute — the
+   same frame kind the simulator publishes. The station's rotation-estimation
+   machinery (Kabsch fit, `heading_aligned`, two scene regimes) was removed
+   with it; see `GPS_MAP_ARCHITECTURE.md`. **A boat running a stale build
+   reintroduces the hybrid frame silently** — rebuild `/blueboat_ws` before
+   trusting the map.
 
 0. **Monitoring target frame — uniform WORLD in every branch.**
    `master_control.py` captures the world target *before* its

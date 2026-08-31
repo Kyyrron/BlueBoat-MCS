@@ -12,21 +12,30 @@ cannot be settled without going on the water.
 
 ## A. Field verification (blocking real confidence)
 
-### A1 — Confirm the robot glyph heading is finally correct on the water
+### A1 — Confirm the GPS-only map architecture on the water (2026-08-31 rework)
 **NOT VERIFIABLE HERE** (needs a running MAVROS link and a field session).
 
-Reported wrong three times across sessions. Two successive fixes were made and
-both are present in the code, but **neither has been confirmed in the field**:
-1. north-up via an ENU scene instead of a rotating view;
-2. glyph heading taken from `/mavros/global_position/compass_hdg` rather than
-   the launch-zeroed odom yaw.
+The glyph heading was reported wrong three times across sessions; the root
+cause is now identified and fixed at the source (`/blueboat/odom` published a
+hybrid frame — ENU axes, launch-relative yaw; `BlueBoat-Control` now publishes
+local ENU with absolute yaw), and the station's map was rebuilt GPS-only on
+top of it (one ENU scene, translation-only anchor, no Kabsch/`theta` — see
+`GPS_MAP_ARCHITECTURE.md`). **None of it is field-confirmed yet.**
 
-Check: point the boat at a known bearing (e.g. along a quay wall visible in the
-satellite layer), compare the on-screen arrow against
-`ros2 topic echo /mavros/global_position/compass_hdg`, and confirm the map does
-not rotate as the boat turns. Do this **before** trusting any heading-dependent
-display in a real campaign. The manual-target frame bug that shared this code
-path is fixed, so the test is now worth running.
+Check, in order, after rebuilding BOTH the boat's `/blueboat_ws` and the
+basestation workspace (A3 first — a stale boat build reintroduces the hybrid
+frame silently):
+1. glyph heading: point the boat at a known bearing (e.g. along a quay wall
+   visible in the satellite layer), compare the arrow against
+   `ros2 topic echo /mavros/global_position/compass_hdg`, and confirm the map
+   never rotates as the boat turns;
+2. map anchoring: the map stays empty with the "waiting for GPS fix" notice,
+   then appears within seconds with tiles/glyph/trail aligned;
+3. manual target: click a feature visible in the imagery, confirm the boat
+   drives to that feature — from a NON-East initial heading;
+4. trajectory following from a non-East launch heading (the old failure);
+5. GPS-anchored mission: deploys within seconds while station-keeping, path
+   lands on its real-world coordinates.
 
 ### A2 — Confirm the compass topic is actually published in your setup
 **NOT VERIFIABLE HERE** (needs MAVROS).
@@ -52,6 +61,13 @@ after the last update. Running against a stale build silently sends robot-frame
 targets on `/monitoring_data` (target line points at nothing, no-pinger CSV
 `target_*` columns corrupted) while the boat still tracks its path correctly —
 so the symptom looks cosmetic.
+
+**Raised stakes since 2026-08-31:** the local-ENU odom fix
+(`robot_interface.odom_callback` no longer re-zeroes yaw) also lives in
+`BlueBoat-Control`. A boat running the pre-fix build publishes the old hybrid
+frame, which silently breaks the GPS-only map, manual targets and non-East
+trajectory following — there is no wire-level version handshake. Rebuild
+`/blueboat_ws` before any A1 field check.
 
 ---
 

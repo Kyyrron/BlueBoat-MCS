@@ -41,15 +41,16 @@ visible within one second.
 
 Drag to pan, mouse-wheel to zoom (anchored under the cursor). The grid's
 scale bar in the bottom-left corner shows the current cell size in metres.
-The map is always **north-up and fixed** — it never rotates. Once the
-georeference is heading-aligned the scene becomes geographic (an `N↑` badge
-appears) and the robot glyph points at its true heading; before that a
-"world-up" notice is shown and the glyph points at its raw launch-frame
-heading (which is why hardcoded paths draw horizontal until then). Only the
-vehicle icon rotates, exactly like QGroundControl. The published mission path
-is deliberately **not drawn until the georeference is heading-aligned**, since
-it cannot be placed geographically before then — so an empty map early in a run
-is expected, not a fault. **Clear Paths** in MAP TOOLS wipes the robot
+The map is always **north-up and fixed** — it never rotates, and it is
+**GPS-frame-only**: on real water nothing is drawn until the first GPS fixes
+anchor the frame (a "Waiting for GPS fix" notice shows — typically a few
+seconds, no driving needed), then tiles, glyph and overlays appear together,
+geographically placed, with the glyph at its true heading. In simulation the
+map draws immediately (no tiles — there is no GPS). Only the
+vehicle icon rotates, exactly like QGroundControl. A briefly empty map right
+after a real-water launch is expected, not a fault; manual-target clicks
+during that window are refused rather than sent somewhere wrong.
+**Clear Paths** in MAP TOOLS wipes the robot
 and pinger trails without touching live data. A simple click
 anywhere shows, in the status bar: world coordinates, GPS coordinates (once
 georeferenced) and the live distance from the robot to that point; the point

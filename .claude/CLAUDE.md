@@ -77,9 +77,9 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 
 | Topic | Type | Produced by | Used for | Notes |
 |---|---|---|---|---|
-| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | pose, yaw, speed, trail | **Re-zeroed at that node's first callback** — position *and* yaw. World origin = boat position at launch; world **+x = boat heading at launch**; yaw starts at 0. Not the MAVROS power-on frame. |
+| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | pose, yaw, speed, trail | **Local ENU**: position translated at that node's first callback (world origin = boat position at launch), axes East/North, yaw **absolute ENU** (0 = East, CCW+; NOT re-zeroed). Same frame kind as the simulator's Gazebo-bridged odom — only the origin differs. The pre-2026-08-31 hybrid (translated position, launch-relative yaw) is gone; see `docs/03_ros_integration.md` item 00. |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS | georeference, GPS read-out | BEST_EFFORT QoS. `lat==0 and lon==0` means no fix and is discarded. |
-| `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **robot glyph heading** | Degrees **clockwise from north** (0=N, 90=E). Converted to the app-wide convention (radians CCW from east) as `radians(90 - hdg)`. Absolute and available immediately. Subscribed **BEST_EFFORT** — this and the GPS fix are the only two; every other subscription uses the default reliable depth-10 profile. |
+| `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **robot glyph heading (preferred)** | Degrees **clockwise from north** (0=N, 90=E). Converted to the app-wide convention (radians CCW from east) as `radians(90 - hdg)`. Fallback: the odom yaw directly (absolute ENU). Subscribed **BEST_EFFORT** — this and the GPS fix are the only two; every other subscription uses the default reliable depth-10 profile. |
 | `/mavros/state` | `mavros_msgs/State` | MAVROS | armed / connected / flight mode | Only subscribed when `mavros_msgs` imports; absent in simulation. |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface.py` | USBL pinger marker | **ROBOT/BODY frame.** With `fixed_pinger=False` (the default) it is seeded from the Waterlinked *filtered* (`filaco`) position and dead-reckoned at odom rate between USBL updates. |
 | `/uw_gps_data` | `std_msgs/Float32MultiArray` | `uwgps_log.py` | raw USBL freshness | 19 values: date(7), aco xyz, ant xyz, lat/lon/dep, filaco xyz. |
@@ -107,9 +107,9 @@ names there, never inline. Peer module for all of these is `blueboat_control`
   `solve_LoS()` and passes the pinger vector straight through, so **both are
   robot-frame at the solver** — that part is consistent by design.
 - Yaw everywhere in the app: radians, CCW-positive about +z, y-up world.
-- Odometry yaw is launch-relative, so it is *not* an absolute heading. Absolute
-  heading comes from the compass (see `DataStore.robot_true_heading()`, which
-  prefers the compass and falls back to `yaw + georef theta`).
+- Odometry yaw is **absolute ENU** (0 = East). `DataStore.robot_true_heading()`
+  prefers the compass and falls back to the odom yaw directly — there is no
+  rotation correction anywhere (see `GPS_MAP_ARCHITECTURE.md`).
 
 ---
 
@@ -146,20 +146,24 @@ the marker drag along behind the robot.
 the ENU frame, not by rotating the view; rotating the view rotates the satellite
 tiles with it. Only the robot glyph rotates.
 
-**N6 — The robot glyph's heading must come from an absolute source.** Raw
-`/blueboat/odom` yaw is launch-zeroed and makes the arrow point screen-right at
-every mission start regardless of true heading.
+**N6 — The robot glyph's heading must come from an absolute source.** The
+compass is preferred; the odom yaw is an acceptable fallback because it is
+absolute ENU (0 = East, not launch-zeroed). Never re-apply a rotation
+correction to either — the old `theta` machinery is gone and re-adding one
+would rotate a correct heading wrong.
 
 **N7 — Mission-path preview uses the `/path_request` service directly, never
 `path_publisher`.** `path_publisher.py` is only started by `Sim_launch.py`, so
 depending on it breaks every real-robot run.
 
-**N8 — A GPS-anchored mission is never deployed with a non-heading-aligned
-georeference.** `io_yaml.deploy_mission()` raises in that case; the placeholder
-`theta = 0` would rotate the whole mission. Deferred deployment is real-robot
-only — `_start_gps_deployment` returns immediately in simulation, because the
-georeference can never converge without GPS and the boat would hold position at
-(0,0) forever.
+**N8 — A GPS-anchored mission is never deployed without a valid translation
+anchor.** `io_yaml.deploy_mission()` raises when `current_fit` is None; the
+watcher polls `geo.is_valid`, which converges from the first few GPS fixes
+with **no vehicle motion** (the world frame is local ENU, so only a
+translation is estimated — the old heading-alignment requirement and its
+station-keeping deadlock are gone). Deferred deployment is real-robot only —
+`_start_gps_deployment` returns immediately in simulation, where no GPS
+exists and the design-frame points are executed directly.
 
 **N9 — Keep `mcs/` free of robot-side code.** Robot-side changes belong in the
 `BlueBoat-Control` submodule (§6); nothing under `mcs/` imports robot-side
@@ -174,40 +178,45 @@ seriously, and simulation-derived results are stated as model-conditional.
 
 ## 4. Map & georeferencing (current model)
 
-Two scene regimes, switched once, in `mcs/gui/map/map_view.py`:
+**One scene regime, GPS-frame-only** (`mcs/gui/map/map_view.py`; full
+rationale and the portable recipe in the root `GPS_MAP_ARCHITECTURE.md`):
 
-- **Before heading alignment** — scene is the raw robot world frame (world-up).
-  A `world-up (north unknown)` notice is shown.
-- **After heading alignment** — scene is **local east/north (ENU)**. Every
-  world-frame quantity (glyph, trails, pinger, targets, mission path, tiles) is
-  converted with `GeoFit.world_to_enu()` at placement, so north is up with the
-  view unrotated. An `N` + arrow badge appears.
+- The scene is **local east/north metres about the latched GPS origin**
+  `(lat0, lon0)` — the first accepted fix. North-up, east-right, view never
+  rotates; only the glyph rotates, to its true heading. There is no second
+  regime and no switch.
+- The only estimated quantity is a **translation** `t = EN(world origin)`:
+  `EN = world + t`, `world = EN − t` (`core/geo.py::GeoFit`, defined once).
+  `GeoReferencer` pairs each GPS fix with the concurrent odom pose (paired in
+  `store.on_gps`, at GPS rate, with a < 0.5 s odom-freshness guard), takes
+  the per-axis **median** over a rolling window, and reports a MAD-robust
+  residual as `rms_m`. `is_valid` = `n_pairs ≥ min_pairs` (5) and
+  `rms_m ≤ max_residual_m` — true within ~1 s of GPS, **no motion needed**.
+  There is no rotation estimation: with an ENU odom frame the true rotation
+  is zero by construction (the old Kabsch fit / `heading_aligned` /
+  `world_yaw_to_true` machinery is deleted).
+- **Nothing is drawn before `store.map_frame_ready()`** — `mission.simulation
+  or geo.is_valid`. Until then `refresh()` hides every item and shows a
+  "waiting for GPS fix" notice, and manual-target clicks are **refused**. In
+  simulation the anchor is the identity (fit stays None), drawing starts
+  immediately, tiles stay off.
+- Satellite tiles are placed **axis-aligned** from `(lat0, lon0)`
+  (`tile_layer._place_tile`): NW corner at its east/north metres, per-tile
+  metres-per-pixel scale, no rotation ever.
 
-`core/geo.py::GeoReferencer` has two fit stages:
-- **Translation-only**, emitted from the *first* GPS fix — `is_valid` becomes
-  true immediately so satellite tiles work right away; `theta` is a placeholder
-  `0` and `heading_aligned` is `False`.
-- **Rotated Kabsch fit**, once enough motion (`min_spread_m`) makes rotation
-  observable — `heading_aligned` becomes `True` and `theta` is trustworthy.
+`MapView._to_world()` is the exact inverse of `_to_scene()` (a pure
+translation both ways), and every mouse position read back out of the view
+goes through it: the published manual target, the click inspector (read-out,
+GPS and distance to robot), the measure endpoints. `center_on_robot()` is the
+mirror case and converts world→scene before `centerOn`. Item *placement*
+stays in scene coordinates throughout, and the measure distance is computed
+there because world↔scene is rigid. The manual-target crosshair is re-placed
+from the stored world target on every refresh tick.
 
-Consumers must check `heading_aligned`, not just `is_valid`, before trusting
-rotation.
-
-`MapView._to_world()` is the exact inverse of `_to_scene()`, under the same
-regime test, and every mouse position read back out of the view goes through
-it: the published manual target, the click inspector (read-out, GPS and
-distance to robot), the measure endpoints. `center_on_robot()` is the mirror
-case and converts world→scene before `centerOn`. Item *placement* stays in
-scene coordinates throughout, and the measure distance is computed there
-because world↔scene is rigid. Anything holding a bare scene coordinate across
-the one-time switch to ENU — an in-progress measurement, the inspector dot —
-is dropped by `_update_scene_mode()`; the manual-target crosshair is re-placed
-from the stored world target on every refresh tick instead.
-
-**The mission path is not drawn until the fit is heading-aligned.**
-`MapView.refresh()` gates the mission-path item on `store.world_frame_ready()`,
-and `MainWindow._on_tick` holds the pending `/path_request` preview until the
-same flag turns true. An empty map early in a run is expected, not a fault.
+`MainWindow._on_tick` holds the pending `/path_request` preview until
+`store.map_frame_ready()` — immediate in simulation, a few seconds on real
+water. `_on_launch_state("idle")` clears `store.mission_path` so a finished
+run's path never re-anchors onto the next run's frame.
 
 ---
 
@@ -274,7 +283,7 @@ there, and `colcon build`.
 |---|---|
 | `src/_custom_libraries/path_generation.py` | The `from_yaml` branch + a file **watcher** that reloads when the file appears/changes, holding a station-keeping pose until it does (this is what makes deferred GPS deployment possible). `generate_path()` and every hardcoded trajectory are unchanged. |
 | `src/_custom_libraries/yaml_trajectory.py` | Loads `blueboat_trajectory/1` and evaluates at time `t`. Depends only on PyYAML + numpy. |
-| `src/master_control.py` | Captures the **world-frame** target before the `inRobotFrame()` conversion so `/monitoring_data` is uniform across branches (`# --- world-frame monitoring target ---`, five capture sites: manual, the MPC / PID / LoS path branches, and the pinger branch). 20 Hz loop — `self.dt = dbl('control_dt', 0.05)` (`master_control.py:263`), a **declared ROS parameter** in the working tree, so the rate the station's `DiagnosticsConfig.expected_hz` assumes is settable per launch there (see the ⚠ below). `/controller_target` unchanged. |
+| `src/master_control.py` | Captures the **world-frame** target before the `inRobotFrame()` conversion so `/monitoring_data` is uniform across branches (`# --- world-frame monitoring target ---`, five capture sites: manual, the MPC / PID / LoS path branches, and the pinger branch). 20 Hz loop — `self.dt = dbl('control_dt', 0.05)` (`master_control.py:264`), a committed **declared ROS parameter**, so the rate the station's `DiagnosticsConfig.expected_hz` assumes is settable per launch (see the ⚠ below). `/controller_target` unchanged. |
 | `src/robot_interaction/robot_interface.py` | CSV logging: important columns first (names unchanged), rows filled **by column name**, `[right, left]` thruster order, and the no-pinger target logged from `/monitoring_data`. Also the producer of `/blueboat/odom`, `/blueboat/pinger_coordinates` and `/blueboat/controller_ready`. |
 | `src/_custom_libraries/robot_log_schema.py` | The position-CSV column layouts themselves (`COLUMNS_PINGER` / `COLUMNS_NO_PINGER`, selected by `columns_for(use_UWgps)`). ROS-free data module — read this, not the node, to learn the CSV format offline analysis consumes. |
 
@@ -293,15 +302,16 @@ the robot. Neither is corrected in `mcs/` — see
 `.claude/specs/robot-side-limitations-watchlist.SPEC.md`.
 
 **⚠ Line numbers into `BlueBoat-Control` are volatile, and which version the
-boat runs cannot be settled from this repository.** Every citation above is
-against `BlueBoat-Control`'s **working tree**, which carries uncommitted
-modifications to `master_control.py`, `robot_interface.py` and
-`path_generation.py`. At the commit the superproject records for that submodule
-the same code reads differently — `self.dt` is a hardcoded `0.05` at `:106` and
-`safety_distance` a hardcoded `-1.` at `:208`, neither a declared parameter — so
-`control_dt` and `safety_distance` are launch-settable only on the working-tree
-version. Anchor on the symbol name, not the line, and treat the deployment
-question as `TODO.md` A3 (needs the boat's workspace).
+boat runs cannot be settled from this repository.** `control_dt`
+(`self.dt = dbl('control_dt', 0.05)`, `master_control.py:264`) and
+`safety_distance` (`:319`) are **committed** declared parameters now — the
+old working-tree-only caveat no longer applies — but the boat's own
+`/blueboat_ws` build may still be older. That matters doubly since the
+2026-08-31 local-ENU odom fix (`docs/03_ros_integration.md` item 00): a
+stale boat build publishes the old hybrid frame (launch-relative yaw over
+ENU axes) and silently breaks the GPS map and trajectory following from
+non-East headings. Anchor on the symbol name, not the line, and treat the
+deployment question as `TODO.md` A3 (needs the boat's workspace).
 
 ### CSV logs (written by `robot_interface.py` on the robot)
 Two layouts. With pinger: date, `relative_*`, `corrected_pinger_*`, GPS, pinger
@@ -387,15 +397,23 @@ Four of the §3 non-negotiables are asserted there: `pinger anchor ok` (N4)
 holds the pinger world position fixed across odom updates, `sentinel ok` (N2)
 proves an origin click is nudged to `1e-3` and that only
 `_on_continue_mission()` emits `[0, 0]`, `deploy guard ok` (N8) proves
-`io_yaml.deploy_mission` raises — and writes nothing — against a
-non-heading-aligned fit, and `safe shutdown ok` (N1) asserts the
-`command_center` *ordering*: publish before any terminate, on the echo path,
-the timeout path with its single T/2 republish, all three operator doors and
-the no-ROS degraded path. `map frame ok` drives a real `QMouseEvent` through
-`MapView` under a synthetic rotated `GeoFit` and asserts the scene↔world round
-trip at every input site. `designer ok` covers the Qt-free designer layer —
-sampling invariants, the save/load/resample round trip, every stock pattern and
-interpolation from its own `schema` defaults, and both extension registries.
+`io_yaml.deploy_mission` raises — and writes nothing — with no fit or no
+`geo_anchor`, deploys correctly through a plain translation fit (including a
+legacy `theta_deg ≠ 0` anchor, rotated inline), and `safe shutdown ok` (N1)
+asserts the `command_center` *ordering*: publish before any terminate, on the
+echo path, the timeout path with its single T/2 republish, all three operator
+doors and the no-ROS degraded path. `map frame ok` drives a real
+`QMouseEvent` through `MapView` under a synthetic translation `GeoFit`
+(`|t| ≈ 44 m`, non-vacuous) and asserts the scene↔world round trip at every
+input site, the pre-anchor gate (nothing drawn, clicks refused), the
+simulation identity anchor (drawing and clicks immediate) and the glyph
+heading source (compass first, else absolute odom yaw). The `GeoReferencer`
+block additionally asserts stationary anchoring at `min_pairs`, glitch
+robustness of the median/MAD estimate, and that a sustained odom/GPS
+inconsistency flips `is_valid` off. `designer ok` covers the Qt-free designer
+layer — sampling invariants, the save/load/resample round trip, every stock
+pattern and interpolation from its own `schema` defaults, and both extension
+registries.
 
 Still uncovered: the designer UI (`designer_map.py`, `panels.py`,
 `designer_window.py`, including the `_push_undo` contract). And because the
@@ -410,14 +428,17 @@ Simulation runs (`Sim_launch.py`) have no MAVROS, no `robot_interface`, no
 
 ## 8. Documentation set
 
-`README.md` and `docs/01`–`08` + `HEADING_AND_MAP_ALIGNMENT.md` were audited
-against the tree and are current: the two scene regimes of §4, the compass
-heading source of §2, the 20 Hz `master_control` loop, and the robot-side file
-locations of §6. `docs/03_ros_integration.md` §Observations is the running list
-of robot-side findings, each marked open or fixed against
-`BlueBoat-Control`; §6 above owns the two limitations carried deliberately.
-`docs/HEADING_AND_MAP_ALIGNMENT.md` is written to stand on its own for reuse in
-the other application.
+The root **`GPS_MAP_ARCHITECTURE.md`** is the authoritative, self-contained
+description of the GPS-only map model (§4) — written for reuse in any other
+application that draws a GPS vehicle on a real-world map.
+`docs/HEADING_AND_MAP_ALIGNMENT.md` is a stub pointing at it (the rotation
+model it used to describe is deleted; its history section explains why).
+`README.md` and `docs/01`–`08` cover the rest: the compass heading source of
+§2, the 20 Hz `master_control` loop, and the robot-side file locations of §6.
+`docs/03_ros_integration.md` §Observations is the running list of robot-side
+findings, each marked open or fixed against `BlueBoat-Control` — item 00 is
+the 2026-08-31 local-ENU frame fix; §6 above owns the limitations carried
+deliberately.
 
 Line citations into `BlueBoat-Control` have been re-anchored against its
 current working tree and verified to land on the code they describe. They drift
