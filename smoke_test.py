@@ -102,6 +102,34 @@ assert _g3.fit is not None and not _g3.is_valid, f"rms {_g3.fit.rms_m}"
 print(f"GeoReferencer ok (t=({geo.fit.tx:.2f}, {geo.fit.ty:.2f}) m, "
       f"rms={geo.fit.rms_m:.3f} m)")
 
+# --- Simulated GPS receiver: pure world -> lat/lon translation model ---
+# The exact inverse of what GeoReferencer estimates back from the fixes.
+from mcs.core.geo import latlon_to_local_en
+from mcs.core.sim_gps import SimGpsModel
+
+_sg = SimGpsModel(43.15, 5.95, 0.0)
+_lt, _ln = _sg.fix_for(123.4, -56.7)      # first call latches the origin...
+assert _lt == 43.15 and _ln == 5.95
+for _dx, _dy in ((3.0, 4.0), (-20.5, 12.25), (0.0, -7.0)):
+    _lt, _ln = _sg.fix_for(123.4 + _dx, -56.7 + _dy)
+    _want = local_en_to_latlon(_dx, _dy, 43.15, 5.95)
+    assert abs(_lt - _want[0]) < 1e-12 and abs(_ln - _want[1]) < 1e-12
+# ...at first CALL, not at construction.
+_sg2 = SimGpsModel(43.15, 5.95, 0.0)
+assert _sg2.fix_for(1000.0, 1000.0) == (43.15, 5.95)
+# Seeded noise: reproducible per seed, differs across seeds, sane magnitude.
+_na = SimGpsModel(43.15, 5.95, 0.4, seed=42)
+_nb = SimGpsModel(43.15, 5.95, 0.4, seed=42)
+_nc = SimGpsModel(43.15, 5.95, 0.4, seed=43)
+_seq_a = [_na.fix_for(0.1 * _i, 0.05 * _i) for _i in range(20)]
+_seq_b = [_nb.fix_for(0.1 * _i, 0.05 * _i) for _i in range(20)]
+_seq_c = [_nc.fix_for(0.1 * _i, 0.05 * _i) for _i in range(20)]
+assert _seq_a == _seq_b and _seq_a != _seq_c
+for _i, (_lt, _ln) in enumerate(_seq_a):
+    _e, _n = latlon_to_local_en(_lt, _ln, 43.15, 5.95)
+    assert math.hypot(_e - 0.1 * _i, _n - 0.05 * _i) < 5 * 0.4 * math.sqrt(2)
+print("sim gps model ok")
+
 # --- LoS predictor converges to target ---
 pts = predict_los_path((0, 0, 0), (20, 10), cfg.los)
 end = pts[-1]
@@ -400,6 +428,62 @@ finally:
     shutil.rmtree(_dep_dir, ignore_errors=True)
 print("deploy guard ok")
 
+# --- Launch dialog: sim + GPS-anchored path arms the simulated-GPS flow ---
+# In simulation an anchored mission takes the SAME deferred-deploy branch as
+# on real water, plus gps_simulated and a random spawn heading; non-anchored
+# paths change nothing.
+from mcs.gui.dialogs.launch_dialog import LaunchDialog
+
+_ld_dir = Path(tempfile.mkdtemp())
+try:
+    _cfg2 = AppConfig()
+    _cfg2.designer.trajectories_dir = str(_ld_dir)
+    _ld_m = MissionModel()
+    _ld_m.from_dict({"name": "m", "speed": 0.5, "loop": False, "items": []})
+    for _x, _y in ((0.0, 0.0), (8.0, 0.0)):
+        _ld_m.add_waypoint(_x, _y)
+    _ld_s = sample_mission(_ld_m, cfg.designer.sample_ds_m)
+    _ld_anch = io_yaml.save_mission(
+        _ld_dir, "anchored_sim", _ld_m, _ld_s,
+        geo_anchor={"lat0": 43.2, "lon0": 5.8, "theta_deg": 0.0})
+    _ld_plain = io_yaml.save_mission(_ld_dir, "plain_sim", _ld_m, _ld_s)
+
+    _dlg = LaunchDialog(_cfg2, None)
+    _dlg._mode.setCurrentText("Gazebo simulation")
+    _i = _dlg._trajectory.findData(str(_ld_anch))
+    assert _i >= 0, "anchored mission not listed"
+    _dlg._trajectory.setCurrentIndex(_i)
+    _p = _dlg.parameters()
+    assert _p.simulation and _p.gps_simulated
+    assert _p.gps_anchored_source == str(_ld_anch)
+    assert _p.trajectory == \
+        f"from_yaml:{io_yaml.deployed_path(_ld_dir, 'anchored_sim')}"
+    assert _p.spawn_yaw_rad is not None
+    assert -math.pi <= _p.spawn_yaw_rad <= math.pi
+    _cli = " ".join(_p.to_cli())
+    assert "spawn_yaw:=" in _cli and "robot_file:=" in _cli \
+        and "controller_type:=" in _cli, _cli
+
+    _i = _dlg._trajectory.findData(str(_ld_plain))
+    _dlg._trajectory.setCurrentIndex(_i)
+    _p2 = _dlg.parameters()
+    assert not _p2.gps_simulated and _p2.spawn_yaw_rad is None
+    assert _p2.gps_anchored_source == ""
+    assert _p2.trajectory == f"from_yaml:{_ld_plain}"
+    assert "spawn_yaw:=" not in " ".join(_p2.to_cli())
+
+    _dlg._mode.setCurrentText("Real robot")
+    _i = _dlg._trajectory.findData(str(_ld_anch))
+    _dlg._trajectory.setCurrentIndex(_i)
+    _p3 = _dlg.parameters()
+    assert not _p3.simulation and not _p3.gps_simulated
+    assert _p3.spawn_yaw_rad is None
+    assert _p3.gps_anchored_source == str(_ld_anch)   # real branch unchanged
+    _dlg.deleteLater()
+finally:
+    shutil.rmtree(_ld_dir, ignore_errors=True)
+print("launch dialog sim-gps ok")
+
 # --- Full window in offscreen mode, synthetic telemetry ---
 from mcs.gui.main_window import MainWindow
 
@@ -556,7 +640,36 @@ try:
     _pub.clear()
     _scene = _click(_px, _py)
     assert _pub and _pub[-1] == (_scene.x(), _scene.y()), (_pub, _scene)
+
+    # 0c. GPS-simulated run: the full anchor gate applies even in simulation
+    w.store.mission.gps_simulated = True
+    w.store.geo = GeoReferencer(cfg.geo)
+    assert not w.store.map_frame_ready(), "gps-sim must wait for the anchor"
+    _mv.refresh()
+    assert not _mv._waiting_label.isHidden()
+    _mv.set_mode(MapMode.MANUAL_TARGET)
+    _pub.clear()
+    _click(_px, _py)
+    assert not _pub, "click must be refused before the simulated anchor"
+    # Simulated fixes anchor the frame — no motion required.
+    _t0c = time.monotonic() + 500.0
+    for _i in range(cfg.geo.min_pairs + 1):
+        _t0c += 0.2
+        w.bus.odom_received.emit(_t0c, [0.2 * _i, 0.1 * _i, 0, 0, 0, 0],
+                                 [0, 0, 0, 0, 0, 0])
+        w.bus.gps_received.emit(
+            _t0c, *local_en_to_latlon(0.2 * _i, 0.1 * _i, 43.25, 5.85))
+    assert w.store.geo.is_valid and w.store.map_frame_ready()
+    _mv.refresh()
+    assert _mv._waiting_label.isHidden() and _mv.robot_item.isVisible()
+    _mv.set_mode(MapMode.MANUAL_TARGET)
+    _pub.clear()
+    _scene = _click(_px, _py)
+    assert _pub, "anchored gps-sim click must publish"
+    _bk = _mv._to_scene(*_pub[-1])
+    assert math.hypot(_bk[0] - _scene.x(), _bk[1] - _scene.y()) < 1e-6
     w.store.mission.simulation = False
+    w.store.mission.gps_simulated = False
 
     # -- anchored fit (t = (37, -23)): the scene is EN about (lat0, lon0)
     w.store.geo = geo
@@ -637,6 +750,8 @@ finally:
     w.commands.publish_manual_target = _saved_publish
     _mv.point_inspected.disconnect(_seen.append)
     _mv.set_mode(MapMode.NORMAL)
+    w.store.mission.simulation = False
+    w.store.mission.gps_simulated = False
     w.store.geo = _saved_geo
     _mv.refresh()
 print("map frame ok")
@@ -685,6 +800,33 @@ try:
 finally:
     w.ros.node = _saved_node
 print("sentinel ok")
+
+# --- Per-launch georeference reset (+ sim-GPS mission flag lifecycle) ---
+# Every launch restarts the robot side with a NEW world origin, so the
+# anchor must start fresh — inheriting the previous run's pair window would
+# blend two frames (the latent stale-anchor bug).
+from mcs.core.geo import GeoReferencer as _GR
+from mcs.ros.launch_manager import LaunchParameters as _LP
+
+for _round in range(2):
+    _t4 = time.monotonic() + 1000.0 + 100.0 * _round
+    for _i in range(cfg.geo.min_pairs + 1):
+        _t4 += 0.2
+        w.bus.odom_received.emit(_t4, [1.0 * _i, 0.5 * _i, 0, 0, 0, 0],
+                                 [0, 0, 0, 0, 0, 0])
+        w.bus.gps_received.emit(
+            _t4, *local_en_to_latlon(1.0 * _i, 0.5 * _i, 43.3, 5.7))
+    assert w.store.geo.is_valid, "setup: anchor should be valid pre-launch"
+    w._on_mission_launched(_LP(simulation=True, controller_type="MPC",
+                               trajectory="circle"))
+    assert w.store.geo.fit is None, "launch must reset the georeference"
+    assert isinstance(w.store.geo, _GR)
+    assert not w.store.mission.gps_simulated
+w.store.mission.gps_simulated = True
+w._on_launch_state("idle")
+assert not w.store.mission.gps_simulated
+assert not w.store.mission.launch_running
+print("georef reset ok")
 
 # --- N1 / root CM-15: 'default' is published and confirmed BEFORE any kill ---
 # Terminating the launch first can leave the motors in override. The sequence

@@ -106,6 +106,28 @@ def read_geo_anchor(yaml_path: Path) -> dict | None:
     return None
 
 
+def read_first_point(yaml_path: Path) -> tuple[float, float] | None:
+    """(x, y) of the first sample of a runtime file, or None.
+
+    Used to place the simulated GPS receiver relative to the mission start.
+    Never raises: an unreadable, non-YAML or malformed file answers None.
+    """
+    try:
+        data = yaml.safe_load(yaml_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    points = data.get("points") or []
+    if not points:
+        return None
+    first = points[0]
+    try:
+        if len(first) < 3:
+            return None
+        return float(first[1]), float(first[2])
+    except (TypeError, ValueError):
+        return None
+
+
 def read_start_misalignment(yaml_path: Path, tol_m: float, tol_deg: float
                             ) -> tuple[tuple[float, float], float] | None:
     """Start misalignment of a runtime file, read from its own samples.

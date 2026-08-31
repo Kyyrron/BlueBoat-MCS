@@ -9,6 +9,7 @@ is what keeps the UI smooth and flicker-free during long experiments).
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -235,9 +236,18 @@ class MainWindow(QMainWindow):
         m.controller_type = params.controller_type
         m.use_pinger = params.use_pinger
         m.simulation = params.simulation
+        m.gps_simulated = params.gps_simulated
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
         self.store.reset_experiment()
+        # Every launch restarts the robot side, which latches a NEW world
+        # origin — the previous run's odom<->GPS pairs are wrong by
+        # construction, so the anchor must start fresh (real and sim alike).
+        self.store.reset_georeference()
+        if params.gps_simulated:
+            self._arm_sim_gps(params)
+        else:
+            self.commands.disarm_sim_gps()
         # Mission-path preview: the station asks the path_generation SERVICE
         # (/path_request) for the whole path — the same call path_publisher
         # makes, but direct, so it works identically on the real robot and
@@ -251,6 +261,46 @@ class MainWindow(QMainWindow):
         self._pending_preview_trajectory = params.trajectory
         self._start_gps_deployment(params)
 
+    # ========================================================= simulated GPS
+    def _arm_sim_gps(self, params: LaunchParameters) -> None:
+        """Simulated GPS for a Gazebo run of a GPS-anchored mission.
+
+        Receiver origin = the mission's first point + ``offset_north_m``
+        NORTH, in the anchor's EN frame (a legacy ``theta_deg`` anchor is
+        rotated into EN with exactly ``io_yaml.deploy_mission``'s
+        convention). Arms the bridge's NavSatFix timer; the fixes then flow
+        through the identical real-water pipeline (own subscription ->
+        diagnostics -> store -> anchor -> deferred deploy)."""
+        from mcs.core.geo import local_en_to_latlon
+        from mcs.core.sim_gps import SimGpsModel
+        from mcs.designer import io_yaml
+
+        src = Path(params.gps_anchored_source)
+        anchor = io_yaml.read_geo_anchor(src)
+        first = io_yaml.read_first_point(src)
+        if anchor is None or first is None:
+            _LOG.error("sim GPS not armed: %s has no geo_anchor/points", src)
+            self._status.showMessage(
+                f"Sim GPS NOT armed — {src.name} unreadable; the map will "
+                "wait for a fix forever.", 10000)
+            return
+        theta = math.radians(float(anchor.get("theta_deg", 0.0)))
+        c, s = math.cos(theta), math.sin(theta)
+        e0 = c * first[0] + s * first[1]     # design -> EN, same rotation
+        n0 = -s * first[0] + c * first[1]    # deploy_mission applies
+        lat, lon = local_en_to_latlon(
+            e0, n0 + self.cfg.sim_gps.offset_north_m,
+            float(anchor["lat0"]), float(anchor["lon0"]))
+        self.commands.arm_sim_gps(
+            SimGpsModel(lat, lon, self.cfg.sim_gps.noise_sigma_m))
+        yaw_deg = math.degrees(params.spawn_yaw_rad or 0.0)
+        self._status.showMessage(
+            f"Sim GPS armed: first fix at {lat:.6f}, {lon:.6f} "
+            f"({self.cfg.sim_gps.offset_north_m:.0f} m N of the path start); "
+            f"spawn heading {yaw_deg:+.0f}°.", 12000)
+        _LOG.info("sim GPS armed: origin=(%.6f, %.6f), spawn_yaw=%.1f deg",
+                  lat, lon, yaw_deg)
+
     # ======================================================== GPS deployment
     def _start_gps_deployment(self, params: LaunchParameters) -> None:
         """GPS-anchored mission: path_generation was pointed at a deployed
@@ -263,9 +313,12 @@ class MainWindow(QMainWindow):
         path_generation reloads it on its next path request and the boat
         transitions onto the true-GPS path. Every waypoint therefore lands
         on its real-world GPS coordinates regardless of where the robot was
-        switched on."""
+        switched on. Runs on real water and in GPS-simulated Gazebo runs
+        alike — only a sim without simulated GPS (non-anchored mission)
+        skips it."""
         self._stop_gps_deployment()
-        if not params.gps_anchored_source or params.simulation:
+        if not params.gps_anchored_source or (
+                params.simulation and not params.gps_simulated):
             return
         from mcs.designer import io_yaml  # lazy: PyYAML machinery
         self._gps_src = Path(params.gps_anchored_source)
@@ -343,6 +396,8 @@ class MainWindow(QMainWindow):
             self.store.mission.launch_running = False
             self.store.mission.manual_target = None
             self.store.mission.simulation = False
+            self.store.mission.gps_simulated = False
+            self.commands.disarm_sim_gps()
             # A finished run's path must not survive onto the next mission's
             # map (it would silently re-anchor with the next run's frame).
             self.store.mission_path = None

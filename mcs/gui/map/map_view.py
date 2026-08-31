@@ -11,10 +11,13 @@ out of the view goes through the exact inverse.  ``/blueboat/odom`` is local
 ENU on both the real boat and the simulator, so no rotation exists anywhere in
 this pipeline — see ``GPS_MAP_ARCHITECTURE.md``.
 
-**Nothing is drawn before the frame is anchored**: on real water the map stays
-empty (with a notice) until the first GPS fixes establish the translation; in
-simulation the anchor is the identity and drawing starts immediately (tiles
-stay off — there is no GPS to place them with).
+**Nothing is drawn before the frame is anchored**: on real water — and in a
+Gazebo run of a GPS-anchored mission, where the station synthesises the GPS
+feed itself (``mission.gps_simulated``) — the map stays empty (with a notice)
+until the first fixes establish the translation, then behaves fully
+geographically, satellite tiles included. Only a sim WITHOUT simulated GPS
+(non-anchored mission) uses the identity anchor and draws immediately, tiles
+off — there is no GPS to place them with.
 
 Provides:
 
@@ -256,9 +259,9 @@ class MapView(QGraphicsView):
     def _to_scene(self, wx: float, wy: float) -> tuple[float, float]:
         """World-frame point -> scene (local east/north metres).
 
-        Pure translation ``EN = world + t``. In simulation there is no GPS
-        and no fit: the sim world is already ENU, so the identity is the
-        correct (and exact) anchor."""
+        Pure translation ``EN = world + t``. In a non-GPS sim there is no
+        fit: the sim world is already ENU, so the identity is the correct
+        (and exact) anchor. With simulated GPS a real fit exists."""
         fit = self._store.geo.fit
         if fit is not None:
             return fit.world_to_enu(wx, wy)
@@ -300,9 +303,10 @@ class MapView(QGraphicsView):
         """Called at the UI tick (10 Hz): pull the store, update items.
 
         The single gate: nothing is drawn until the map frame is anchored
-        (``store.map_frame_ready()`` — GPS translation on real water,
-        immediately in simulation). Sequencing at anchor time is thereby
-        fix -> tiles -> glyph -> overlays, all in the first ready tick."""
+        (``store.map_frame_ready()`` — GPS translation on real water and in
+        GPS-simulated runs, immediately in a non-GPS sim). Sequencing at
+        anchor time is thereby fix -> tiles -> glyph -> overlays, all in the
+        first ready tick."""
         store = self._store
         robot = store.robot
 
@@ -373,7 +377,9 @@ class MapView(QGraphicsView):
             self.target_line.setLine(0, 0, 0, 0)
 
         self._refresh_manual_target()
-        # Tiles need a GPS anchor; in simulation fit is None and they stay off.
+        # Tiles need a GPS anchor; in a non-GPS sim fit is None and they
+        # stay off. With simulated GPS the anchor is real and tiles show
+        # the imagery of the location the mission was planned at.
         self.tiles.update_view(
             store.geo.fit if store.geo.is_valid else None,
             self.mapToScene(self.viewport().rect()).boundingRect(),
@@ -518,7 +524,7 @@ class MapView(QGraphicsView):
         if store.geo.is_valid and store.geo.fit is not None:
             lat, lon = store.geo.fit.world_to_latlon(x, y)
             parts.append(f"GPS {lat:.6f}°, {lon:.6f}°")
-        elif store.mission.simulation:
+        elif store.mission.simulation and not store.mission.gps_simulated:
             parts.append("GPS n/a (simulation)")
         else:
             parts.append("GPS n/a (waiting for fix)")

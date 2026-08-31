@@ -79,8 +79,8 @@ class LeftPanel(QWidget):
             sec_layers.add_widget(box)
         self._layer_boxes["satellite"].setEnabled(False)
         self._layer_boxes["satellite"].setToolTip(
-            "Enabled once the odom ↔ GPS georeference is established "
-            "(requires GPS fix and a few metres of motion).")
+            "Enabled once the odom ↔ GPS georeference is anchored "
+            "(a few GPS fixes, real or simulated — no motion needed).")
         layout.addWidget(sec_layers)
 
         # ---- Robot -----------------------------------------------------------

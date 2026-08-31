@@ -89,10 +89,11 @@ class LaunchConfig:
 
     package: str = "blueboat_control"
     launch_file: str = "BlueBoat_launch.py"
-    # Gazebo simulation alternative (Sim_launch.py): declares only
-    # robot_file / trajectory / controller_type and always starts
-    # master_control + path_generation + path_publisher + simulation_interface
-    # — no MAVROS, no robot_interface/param_set, no pinger.
+    # Gazebo simulation alternative (Sim_launch.py): declares
+    # robot_file / trajectory / controller_type / data_dir / spawn_yaw and
+    # always starts master_control + path_generation + path_publisher +
+    # simulation_interface — no MAVROS, no robot_interface/param_set,
+    # no pinger.
     sim_launch_file: str = "Sim_launch.py"
     sim_robot_files: list[str] = field(default_factory=lambda: ["thrusters_ur"])
     sim_default_controller: str = "MPC"
@@ -158,6 +159,22 @@ class GeoConfig:
 
 
 @dataclass
+class SimGpsConfig:
+    """Simulated robot GPS for Gazebo runs of GPS-anchored missions.
+
+    The bridge node synthesises NavSatFix messages from the sim odom (world
+    metres -> lat/lon about the receiver origin, pure translation). The
+    receiver origin — the boat's FIRST fix — is placed ``offset_north_m``
+    north of the mission's first point, so the anchor/deferred-deploy
+    pipeline runs exactly as on real water. Non-anchored sim runs simulate
+    no GPS at all."""
+
+    offset_north_m: float = 10.0   # first fix this far north of the path start
+    noise_sigma_m: float = 0.4     # Gaussian noise per EN axis, metres
+    rate_hz: float = 5.0           # matches the real MAVROS fix rate
+
+
+@dataclass
 class DesignerConfig:
     """Mission Pattern Designer settings."""
 
@@ -188,6 +205,7 @@ class AppConfig:
     los: LosApproximation = field(default_factory=LosApproximation)
     map: MapConfig = field(default_factory=MapConfig)
     geo: GeoConfig = field(default_factory=GeoConfig)
+    sim_gps: SimGpsConfig = field(default_factory=SimGpsConfig)
     designer: DesignerConfig = field(default_factory=DesignerConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3

@@ -136,6 +136,19 @@ class CommandCenter(QObject):
         if node:
             node.request_mission_path(total_time, dt)
 
+    def arm_sim_gps(self, model) -> None:
+        """Point the bridge's simulated-GPS timer at a SimGpsModel."""
+        node = self._node()
+        if node:
+            node.set_sim_gps(model)
+
+    def disarm_sim_gps(self) -> None:
+        """Stop the simulated GPS feed. Silent when ROS is down — this is
+        idle-path cleanup and must never complain during shutdown."""
+        node = self._ros.node
+        if node is not None:
+            node.set_sim_gps(None)
+
     def set_simulation_mode(self, simulation: bool) -> None:
         """Adapt the safe-shutdown sequence to the running graph.
 

@@ -85,6 +85,10 @@ class MissionState:
     controller_type: str = ""
     use_pinger: bool = False
     simulation: bool = False                # Sim_launch.py graph (no MAVROS/pinger)
+    gps_simulated: bool = False             # sim run with a synthesised NavSatFix
+                                            # feed (GPS-anchored mission): the full
+                                            # GPS pipeline — anchor gate, tiles,
+                                            # deferred deploy — runs as on real water
     manual_target: tuple[float, float] | None = None
     started_t: float | None = None          # first odom after launch
     path_target: tuple[float, float] | None = None   # x_d, y_d from /monitoring_data
@@ -273,11 +277,27 @@ class DataStore:
         return None
 
     def map_frame_ready(self) -> bool:
-        """True once the map may draw: in simulation immediately (the sim
-        world is already ENU, identity anchor, no tiles), on the real boat
-        once the odom->GPS translation is anchored (a few fixes, no vehicle
-        motion required). Nothing is drawn on the map before this."""
-        return self.mission.simulation or self.geo.is_valid
+        """True once the map may draw. Two simulation modes exist:
+
+        * non-GPS sim (no anchored mission): immediately — the sim world is
+          already ENU, identity anchor, no tiles;
+        * GPS-sim (anchored mission, synthesised NavSatFix feed) and real
+          water: once the odom->GPS translation is anchored (a few fixes,
+          no vehicle motion required).
+
+        Nothing is drawn on the map before this."""
+        return self.geo.is_valid or (
+            self.mission.simulation and not self.mission.gps_simulated)
+
+    def reset_georeference(self) -> None:
+        """Fresh anchor for a fresh run — called on every mission launch.
+
+        Each launch restarts the robot side, which latches a NEW world
+        origin; pairs recorded against the previous run's origin are wrong
+        by construction, and the rolling fit window would blend the two
+        frames for minutes. Consumers read ``store.geo`` per tick, so
+        swapping the object is safe."""
+        self.geo = GeoReferencer(self.cfg.geo)
 
     def active_target_distance(self) -> float | None:
         tgt = self.active_target_world()

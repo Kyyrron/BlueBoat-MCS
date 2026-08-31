@@ -7,10 +7,15 @@ Two mission types, matching the two launch files of the stack:
   (disabled when ``use_pinger`` is set, since the launch file then skips
   ``path_generation``) and ``use_pinger``.
 * **Gazebo simulation** — ``Sim_launch.py`` with ``robot_file``,
-  ``trajectory`` and ``controller_type`` only. The simulation launch always
-  starts ``master_control``, so an empty controller is not offered; motors /
-  note / pinger do not exist in that graph and their fields are hidden to
-  keep the dialog coherent with what will actually run.
+  ``trajectory``, ``controller_type`` (and ``spawn_yaw`` for GPS-anchored
+  missions). The simulation launch always starts ``master_control``, so an
+  empty controller is not offered; motors / note / pinger do not exist in
+  that graph and their fields are hidden to keep the dialog coherent with
+  what will actually run. A GPS-anchored custom path takes the SAME
+  deferred-deploy pipeline as on real water: the station synthesises the
+  GPS feed itself (first fix lands north of the path's first point) and
+  spawns the boat with a random heading, so anchoring, deployment and
+  hot-reload are exercised exactly as at sea.
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -18,6 +23,8 @@ The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 
 from __future__ import annotations
 
+import math
+import random
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -247,18 +254,23 @@ class LaunchDialog(QDialog):
                 extra[key] = value
         custom = self._trajectory.currentData()
         gps_src = gps_dst = ""
+        gps_simulated = False
+        spawn_yaw = None
         if custom:
             src = Path(custom)
-            # Deferred GPS deployment only applies to the REAL robot, whose
-            # world origin changes every run. In simulation there is no GPS
-            # (the georeference can never converge, so the deployed file
-            # would never be written and the boat would hold at (0,0)
-            # forever) and Gazebo's world frame is stable — so an anchored
-            # mission executes its design-frame points directly.
-            if (not sim) and io_yaml.read_geo_anchor(src) is not None:
+            if io_yaml.read_geo_anchor(src) is not None:
+                # GPS-anchored: the SAME deferred-deploy pipeline on real
+                # water and in simulation. On real water MAVROS provides the
+                # fixes; in simulation the station synthesises them (the
+                # boat's first fix lands offset_north_m north of the path's
+                # first point) and spawns the boat with a random heading, so
+                # anchoring, deployment and hot-reload run exactly as at sea.
                 gps_src = str(src)
                 gps_dst = str(io_yaml.deployed_path(src.parent, src.stem))
                 trajectory = f"from_yaml:{gps_dst}"
+                if sim:
+                    gps_simulated = True
+                    spawn_yaw = random.uniform(-math.pi, math.pi)
             else:
                 trajectory = f"from_yaml:{custom}"
         else:
@@ -273,5 +285,7 @@ class LaunchDialog(QDialog):
             robot_file=self._robot_file.currentText().strip() or "thrusters_ur",
             gps_anchored_source=gps_src,
             gps_deployed_target=gps_dst,
+            gps_simulated=gps_simulated,
+            spawn_yaw_rad=spawn_yaw,
             extra_args=extra,
         )

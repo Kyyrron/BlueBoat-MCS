@@ -41,12 +41,15 @@ class LaunchParameters:
     * ``BlueBoat_launch.py`` (real robot): ``enable_motors``, ``note``,
       ``controller_type``, ``trajectory``, ``use_pinger``.
     * ``Sim_launch.py`` (Gazebo): ``robot_file``, ``trajectory``,
-      ``controller_type`` only — it always starts ``master_control`` (so the
-      controller must be non-empty) and never MAVROS / robot_interface /
-      param_set / pinger nodes.
+      ``controller_type``, ``data_dir``, ``spawn_yaw`` — it always starts
+      ``master_control`` (so the controller must be non-empty) and never
+      MAVROS / robot_interface / param_set / pinger nodes.
 
     ``to_cli`` emits exactly the arguments the chosen file declares; passing
     real-robot arguments to the simulation launch would abort it.
+    ``spawn_yaw:=`` is emitted only when ``spawn_yaw_rad`` is set, before
+    ``extra_args`` — so an operator ``spawn_yaw:=`` in Extra args overrides
+    it (in ``ros2 launch`` the last occurrence wins).
     """
 
     enable_motors: bool = False
@@ -61,6 +64,10 @@ class LaunchParameters:
     # 'trajectory' argument already points path_generation at the latter).
     gps_anchored_source: str = ""
     gps_deployed_target: str = ""
+    # Simulation of a GPS-anchored mission: the station synthesises the GPS
+    # feed itself and spawns the boat with this heading (radians ENU).
+    gps_simulated: bool = False
+    spawn_yaw_rad: float | None = None
     extra_args: dict[str, str] = field(default_factory=dict)
 
     def to_cli(self) -> list[str]:
@@ -73,6 +80,8 @@ class LaunchParameters:
                 f"trajectory:={self.trajectory}",
                 f"controller_type:={self.controller_type}",
             ]
+            if self.spawn_yaw_rad is not None:
+                args.append(f"spawn_yaw:={self.spawn_yaw_rad:.6f}")
         else:
             args = [
                 f"enable_motors:={b(self.enable_motors)}",

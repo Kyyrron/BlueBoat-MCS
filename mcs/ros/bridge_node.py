@@ -133,6 +133,20 @@ class BridgeNode(Node):
         self._pub_input_str = self.create_publisher(String, t.input_str, 10)
         self._pub_manual_target = self.create_publisher(Float32MultiArray, t.manual_target, 10)
 
+        # ---- Simulated GPS (Gazebo runs of GPS-anchored missions) ----------
+        # The station itself publishes NavSatFix on the real GPS topic, which
+        # its OWN subscription above then receives (DDS local loopback), so
+        # the entire real data path — QoS, diagnostics marking, SignalBus,
+        # store pairing — is exercised with zero new wire names. Nothing else
+        # publishes that topic in a sim graph (no MAVROS). The publisher and
+        # timer exist permanently; a disarmed timer tick is a no-op, so
+        # arming never creates/destroys ROS entities.
+        self._sim_gps_lock = threading.Lock()
+        self._sim_gps_model = None      # armed by the GUI thread via set_sim_gps
+        self._last_odom: tuple[float, float, float] | None = None  # (t_mono, x, y)
+        self._pub_sim_gps = self.create_publisher(NavSatFix, t.gps, best_effort)
+        self.create_timer(1.0 / max(cfg.sim_gps.rate_hz, 0.1), self._publish_sim_gps)
+
         # ---- Path service client -------------------------------------------
         self._path_client = None
         if BLUEBOAT_IFACES_AVAILABLE:
@@ -169,6 +183,9 @@ class BridgeNode(Node):
         tw = msg.twist.twist
         twist = [tw.linear.x, tw.linear.y, tw.linear.z,
                  tw.angular.x, tw.angular.y, tw.angular.z]
+        # No lock: _on_odom and the sim-GPS timer both run on the node's
+        # single-threaded executor.
+        self._last_odom = (t, p.position.x, p.position.y)
         self._bus.odom_received.emit(t, pose, twist)
 
     def _on_compass(self, msg: Float64) -> None:
@@ -243,6 +260,33 @@ class BridgeNode(Node):
             msg.data = [float(x), float(y)]
             self._pub_manual_target.publish(msg)
         self._bus.command_sent.emit(f"manual_target ← [{x:.2f}, {y:.2f}]")
+
+    # ---------------------------------------------------------- simulated GPS
+    def set_sim_gps(self, model) -> None:
+        """Arm (a SimGpsModel) or disarm (None) the simulated GPS feed.
+
+        Thread-safe: called from the GUI thread; the ROS timer reads under
+        the same lock. After the swap the model is touched only by the ROS
+        thread, so the model itself needs no locking. Duck-typed on purpose
+        — the bridge stays import-light."""
+        with self._sim_gps_lock:
+            self._sim_gps_model = model
+
+    def _publish_sim_gps(self) -> None:
+        """ROS-thread timer: synthesise one NavSatFix from the latest odom."""
+        with self._sim_gps_lock:
+            model = self._sim_gps_model
+        if model is None or self._last_odom is None:
+            return
+        t, x, y = self._last_odom
+        if time.monotonic() - t > 0.5:
+            return  # Gazebo paused or starting: no fake fixes from stale poses
+        lat, lon = model.fix_for(x, y)
+        msg = NavSatFix()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.latitude = float(lat)
+        msg.longitude = float(lon)
+        self._pub_sim_gps.publish(msg)
 
     # ---------------------------------------------------------- path service
     def request_mission_path(self, total_time: float, dt: float) -> None:
