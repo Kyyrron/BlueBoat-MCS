@@ -37,6 +37,11 @@ frame silently):
 5. GPS-anchored mission: deploys within seconds while station-keeping, path
    lands on its real-world coordinates.
 
+Steps 2–5 can now be rehearsed in simulation (launch a GPS-anchored path in
+Gazebo: the station simulates the GPS feed and spawns the boat with a random
+heading — same pipeline end to end). A green sim rehearsal is
+model-conditional evidence only; the field run remains the confirmation.
+
 ### A2 — Confirm the compass topic is actually published in your setup
 **NOT VERIFIABLE HERE** (needs MAVROS).
 

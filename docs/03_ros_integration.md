@@ -68,7 +68,8 @@ runs instead:
 
 ```
 ros2 launch blueboat_control Sim_launch.py \
-    robot_file:=<name> trajectory:=<name> controller_type:=<PID|LoS|MPC>
+    robot_file:=<name> trajectory:=<name> controller_type:=<PID|LoS|MPC> \
+    [spawn_yaw:=<radians>]
 ```
 
 That graph consists of the Gazebo world, `simulation_interface.py`
@@ -82,6 +83,20 @@ readiness gating drops the FCU check, the mission path is always requested
 skips the `param_mode` acknowledgement wait, which structurally cannot
 arrive (the command is still published; the publish-before-terminate
 ordering is preserved).
+
+**GPS-anchored missions in simulation** take the same deferred-deploy path
+as on real water: the dialog passes a random `spawn_yaw` (boat spawns at
+Gazebo (0, 0) with an arbitrary heading) and the station's own bridge node
+synthesises the GPS feed — a 5 Hz timer converts the sim odom (world
+metres) to lat/lon about a receiver origin placed
+`SimGpsConfig.offset_north_m` (10 m) north of the mission's first point,
+publishing `sensor_msgs/NavSatFix` on `/mavros/global_position/global`
+(nothing else publishes it in the sim graph) with configurable Gaussian
+noise. Its own subscription receives the fixes back, so anchoring,
+satellite tiles, diagnostics and the deferred deployment run identically
+to a field trial — which is the point: an offline-planned GPS path can be
+rehearsed in sim before the real-world session. Non-anchored sim missions
+simulate no GPS and use the plain identity-anchor map.
 
 Started in its own process session; stopped with SIGINT to the group
 (graceful, propagated by `ros2 launch`), escalating to SIGTERM after

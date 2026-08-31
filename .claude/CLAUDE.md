@@ -78,7 +78,7 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 | Topic | Type | Produced by | Used for | Notes |
 |---|---|---|---|---|
 | `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | pose, yaw, speed, trail | **Local ENU**: position translated at that node's first callback (world origin = boat position at launch), axes East/North, yaw **absolute ENU** (0 = East, CCW+; NOT re-zeroed). Same frame kind as the simulator's Gazebo-bridged odom — only the origin differs. The pre-2026-08-31 hybrid (translated position, launch-relative yaw) is gone; see `docs/03_ros_integration.md` item 00. |
-| `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS | georeference, GPS read-out | BEST_EFFORT QoS. `lat==0 and lon==0` means no fix and is discarded. |
+| `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS (real) · **the station's own bridge node** (Gazebo run of a GPS-anchored mission: a 5 Hz timer synthesises fixes from the sim odom — world metres → lat/lon about a receiver origin placed `SimGpsConfig.offset_north_m` north of the mission's first point — received back through its own subscription, so the whole pipeline incl. diagnostics runs as on real water) | georeference, GPS read-out | BEST_EFFORT QoS. `lat==0 and lon==0` means no fix and is discarded. |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **robot glyph heading (preferred)** | Degrees **clockwise from north** (0=N, 90=E). Converted to the app-wide convention (radians CCW from east) as `radians(90 - hdg)`. Fallback: the odom yaw directly (absolute ENU). Subscribed **BEST_EFFORT** — this and the GPS fix are the only two; every other subscription uses the default reliable depth-10 profile. |
 | `/mavros/state` | `mavros_msgs/State` | MAVROS | armed / connected / flight mode | Only subscribed when `mavros_msgs` imports; absent in simulation. |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface.py` | USBL pinger marker | **ROBOT/BODY frame.** With `fixed_pinger=False` (the default) it is seeded from the Waterlinked *filtered* (`filaco`) position and dead-reckoned at odom rate between USBL updates. |
@@ -161,9 +161,11 @@ anchor.** `io_yaml.deploy_mission()` raises when `current_fit` is None; the
 watcher polls `geo.is_valid`, which converges from the first few GPS fixes
 with **no vehicle motion** (the world frame is local ENU, so only a
 translation is estimated — the old heading-alignment requirement and its
-station-keeping deadlock are gone). Deferred deployment is real-robot only —
-`_start_gps_deployment` returns immediately in simulation, where no GPS
-exists and the design-frame points are executed directly.
+station-keeping deadlock are gone). Deferred deployment runs on real water
+**and** in Gazebo runs of GPS-anchored missions (`gps_simulated`: the
+station synthesises the fixes itself and spawns the boat with a random
+heading via `spawn_yaw:=`) — only a sim launch of a *non-anchored* mission
+skips it and executes design-frame points directly.
 
 **N9 — Keep `mcs/` free of robot-side code.** Robot-side changes belong in the
 `BlueBoat-Control` submodule (§6); nothing under `mcs/` imports robot-side
@@ -195,11 +197,21 @@ rationale and the portable recipe in the root `GPS_MAP_ARCHITECTURE.md`):
   There is no rotation estimation: with an ENU odom frame the true rotation
   is zero by construction (the old Kabsch fit / `heading_aligned` /
   `world_yaw_to_true` machinery is deleted).
-- **Nothing is drawn before `store.map_frame_ready()`** — `mission.simulation
-  or geo.is_valid`. Until then `refresh()` hides every item and shows a
-  "waiting for GPS fix" notice, and manual-target clicks are **refused**. In
-  simulation the anchor is the identity (fit stays None), drawing starts
-  immediately, tiles stay off.
+- **Nothing is drawn before `store.map_frame_ready()`** — `geo.is_valid or
+  (mission.simulation and not mission.gps_simulated)`. Until then
+  `refresh()` hides every item and shows a "waiting for GPS fix" notice,
+  and manual-target clicks are **refused**. Two simulation modes:
+  *non-GPS sim* (non-anchored mission) uses the identity anchor (fit stays
+  None), draws immediately, tiles off; *GPS-sim* (`gps_simulated`, anchored
+  mission) runs the full real-water pipeline — the bridge synthesises the
+  NavSatFix feed (§2), the anchor gates the map, and tiles show the real
+  imagery of the location the mission was planned at.
+- **The georeferencer is reset on every mission launch**
+  (`store.reset_georeference()` in `_on_mission_launched`): each launch
+  restarts the robot side with a NEW world origin, so pairs from the
+  previous run are wrong by construction. The map re-anchors from fresh
+  fixes within seconds; a relaunch briefly showing "waiting for GPS fix"
+  is correct, not a regression.
 - Satellite tiles are placed **axis-aligned** from `(lat0, lon0)`
   (`tile_layer._place_tile`): NW corner at its east/north metres, per-tile
   metres-per-pixel scale, no rotation ever.
@@ -382,9 +394,10 @@ this only with new evidence, not from scratch.
 `smoke_test.py` is a linear script — not a test framework — that imports every
 module, builds the full window offscreen and drives synthetic telemetry through
 the `SignalBus`.
-It prints fourteen checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
-`LoS predictor ok`, `start alignment ok`, `designer ok`, `deploy guard ok`,
-`store ok`, `stats ok`, `pinger anchor ok`, `map frame ok`, `sentinel ok`,
+It prints seventeen checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
+`sim gps model ok`, `LoS predictor ok`, `start alignment ok`, `designer ok`,
+`deploy guard ok`, `launch dialog sim-gps ok`, `store ok`, `stats ok`,
+`pinger anchor ok`, `map frame ok`, `sentinel ok`, `georef reset ok`,
 `safe shutdown ok`, `window ok`, `SMOKE TEST PASSED`) and aborts on the first
 failed assertion. It passes on this tree, exit status 0, and runs identically
 across all three environment shapes: no `rclpy` (GUI-only); `rclpy` importable
@@ -410,7 +423,14 @@ simulation identity anchor (drawing and clicks immediate) and the glyph
 heading source (compass first, else absolute odom yaw). The `GeoReferencer`
 block additionally asserts stationary anchoring at `min_pairs`, glitch
 robustness of the median/MAD estimate, and that a sustained odom/GPS
-inconsistency flips `is_valid` off. `designer ok` covers the Qt-free designer
+inconsistency flips `is_valid` off. `sim gps model ok` pins the simulated
+receiver's translation mapping, first-call origin latch and seeded-noise
+reproducibility; `launch dialog sim-gps ok` proves a sim launch of an
+anchored mission takes the deferred-deploy branch with `gps_simulated` and
+a bounded random `spawn_yaw:=` (and that non-anchored/real launches are
+untouched); the map-frame block's 0c section asserts the anchor gate holds
+in GPS-sim until synthetic fixes arrive; `georef reset ok` proves every
+launch starts from a fresh georeferencer. `designer ok` covers the Qt-free designer
 layer — sampling invariants, the save/load/resample round trip, every stock
 pattern and interpolation from its own `schema` defaults, and both extension
 registries.

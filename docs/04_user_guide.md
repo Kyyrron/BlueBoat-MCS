@@ -45,8 +45,13 @@ The map is always **north-up and fixed** — it never rotates, and it is
 **GPS-frame-only**: on real water nothing is drawn until the first GPS fixes
 anchor the frame (a "Waiting for GPS fix" notice shows — typically a few
 seconds, no driving needed), then tiles, glyph and overlays appear together,
-geographically placed, with the glyph at its true heading. In simulation the
-map draws immediately (no tiles — there is no GPS). Only the
+geographically placed, with the glyph at its true heading. In a simulation
+of a **GPS-anchored mission** the station simulates the GPS itself, so the
+map behaves exactly as above — including satellite imagery of the location
+the path was planned at (the boat's first fix appears 10 m north of the
+path start, and the boat spawns with a random heading). In a simulation
+without a GPS-anchored path the map draws immediately (no tiles — there is
+no GPS). Only the
 vehicle icon rotates, exactly like QGroundControl. A briefly empty map right
 after a real-water launch is expected, not a fault; manual-target clicks
 during that window are refused rather than sent somewhere wrong.
@@ -112,10 +117,12 @@ selector chooses between the *Real robot* launch and the *Gazebo simulation*
 (`Sim_launch.py`). Real robot: controller type (empty / PID / LoS / MPC),
 trajectory, use-pinger, motor enable (always re-confirmed, with a second
 warning dialog), a log note and free-form extra launch arguments. Gazebo
-simulation: robot file, trajectory and controller only — the simulation
+simulation: robot file, trajectory and controller — the simulation
 always runs a controller, and motor/pinger/note fields are hidden because
 they do not exist in that graph; mission-state readiness shows "(sim)" and
-does not wait for a flight controller. On OK the station runs the ROS2 launch file; the LED turns
+does not wait for a flight controller. Selecting a GPS-anchored custom
+path in simulation additionally arms the simulated GPS feed and passes a
+random `spawn_yaw` (shown in the status bar and the console command line). On OK the station runs the ROS2 launch file; the LED turns
 orange while nodes come up and green once the required ones report
 (FCU connected + odometry flowing). Launch output streams to the console line.
 
@@ -159,10 +166,10 @@ same satellite layer as the main map. **Center Pattern** (`F`) frames the
 current selection, or the whole mission, on screen; **Zoom + / Zoom −**
 toolbar buttons (`+` / `−`) zoom about the view centre. **Align to Start**
 rigid-transforms the whole mission so it begins at world (0,0) with its
-first tangent along +x: because every launch (simulation or real) zeroes
-the world frame at the boat — origin = boat position, +x = boat heading —
-an aligned mission always starts at the boat and its first motion is
-forward. Saving a non-GPS mission that doesn't already start that way
+first tangent along +x: the world frame is local ENU — origin = the boat's
+launch position, +x = EAST — so an aligned mission starts at the launch
+point heading east (mainly useful in simulation; real missions should be
+GPS-anchored). Saving a non-GPS mission that doesn't already start that way
 offers this alignment automatically; GPS-anchored missions are
 geographically fixed and are never realigned (the boat turns toward them
 instead). If the robot is
@@ -174,12 +181,13 @@ editor simply works in the local world frame. A mission saved with a GPS
 reference remembers it: reopening the mission restores the origin (and the
 satellite layer), every waypoint is linked to real-world GPS coordinates,
 and the launch dialog labels it “(GPS)”. Launching such a mission uses
-deferred deployment: the boat holds position while you drive it a few
-metres to establish the run's georeference — the map's `N↑` badge is the
-signal that it has converged — then the path deploys automatically onto its
-true GPS coordinates, independent of where the robot was powered on. The
-hold is physics, not a fault: the rotation cannot be measured from a
-stationary boat. `07_getting_started.md` has this as a field checklist. At the end of any custom
+deferred deployment: the boat holds position for the first seconds while
+the run's georeference anchors from the incoming GPS fixes — no driving
+needed — then the path deploys automatically onto its true GPS
+coordinates, independent of where the robot was powered on. The same flow
+runs in **simulation** (the station simulates the GPS feed and spawns the
+boat with a random heading), so a planned path can be rehearsed before the
+field trial. `07_getting_started.md` has this as a field checklist. At the end of any custom
 path the target clamps at the final pose forever, so the boat
 station-keeps there; the same holds on a reached manual target.
 

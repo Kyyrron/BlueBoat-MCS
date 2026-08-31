@@ -141,9 +141,21 @@ north = radians(lat − lat0) · R
   (`2πR·cos(lat)/(256·2^z)`), with a negative y-scale (tile pixels go south).
   **Axis-aligned, no rotation, ever.** Pick the zoom so one tile pixel ≈ one
   screen pixel.
-- **Simulation mode** (no GPS exists): the sim world is already ENU, so use
-  the identity (`t = 0`), draw immediately, keep tiles off. Same code path,
-  no special regime.
+- **Simulation modes** (two, both the same drawing code):
+  - *No GPS* (mission not anchored to GPS): the sim world is already ENU, so
+    use the identity (`t = 0`), draw immediately, keep tiles off.
+  - *Simulated GPS* (GPS-anchored mission): synthesise the receiver instead
+    of special-casing the map. A pure model converts world metres →
+    lat/lon by translation from the vehicle's **first** position
+    (`fix = latlon(world − world_first + noise, origin)`), with the origin
+    placed a fixed offset (we use 10 m north) from the mission's first
+    point, small Gaussian noise (σ ≈ 0.4 m) and the real fix rate (5 Hz).
+    Publish it on the *real* GPS topic and let your own subscription receive
+    it back — anchor gating, tiles (real imagery of the planned location),
+    diagnostics and deferred deployment then run the identical real-water
+    path, which is what makes offline-planned GPS missions rehearsable
+    before a field trial. Spawn the vehicle with a random heading to also
+    rehearse anchoring at arbitrary orientations.
 
 ## 6. Interaction inverse (reading things back)
 
@@ -210,5 +222,7 @@ Regression-test the round trip with a **non-trivial `t`** (ours asserts
 - Trajectory following works from any launch heading (vehicle-side fix).
 - The map is north-up with correctly-aligned imagery from the moment it
   appears, and it never rotates, slides, or switches modes afterwards.
-- Real water and simulation run the identical drawing code; simulation is
-  just the identity anchor with tiles off.
+- Real water and simulation run the identical drawing code; a non-GPS sim is
+  just the identity anchor with tiles off, and a GPS-anchored mission can be
+  rehearsed end-to-end in sim through a synthesised receiver (Section 5) —
+  anchor, tiles, deferred deployment and all.
