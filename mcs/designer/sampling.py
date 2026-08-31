@@ -44,9 +44,9 @@ def start_misalignment(xy, tol_m: float, tol_deg: float
     """``(origin, initial tangent angle)`` if the sampled polyline *xy* does
     not start at ``(0, 0)`` heading ``+x`` within tolerance, else ``None``.
 
-    The robot's world frame is zeroed at launch (origin = boat position,
-    +x = boat heading), so an aligned mission starts at the boat and begins
-    by moving forward. Both the designer (in-memory model) and the launch
+    The robot's world frame is local ENU (origin = launch position,
+    +x = EAST), so an aligned mission starts at the launch point heading
+    east. Both the designer (in-memory model) and the launch
     dialog (runtime YAML on disk) answer this question through this one
     function, so they can never disagree about the same mission.
 

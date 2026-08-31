@@ -60,6 +60,7 @@ class DiagnosticsConfig:
         "/blueboat/odom": 0.5,
         "/mavros/state": 2.0,
         "/mavros/global_position/global": 2.0,
+        "/mavros/global_position/compass_hdg": 2.0,
         "/blueboat/pinger_coordinates": 1.0,
         "/uw_gps_data": 3.0,
         "/monitoring_data": 0.5,
@@ -72,6 +73,7 @@ class DiagnosticsConfig:
         "/blueboat/odom": 20.0,
         "/mavros/state": 1.0,
         "/mavros/global_position/global": 5.0,
+        "/mavros/global_position/compass_hdg": 5.0,
         "/blueboat/pinger_coordinates": 20.0,
         "/uw_gps_data": 2.0,
         "/monitoring_data": 20.0,
@@ -145,12 +147,13 @@ class MapConfig:
 
 @dataclass
 class GeoConfig:
-    """Online odom<->GPS georeferencing parameters."""
+    """Online odom<->GPS georeferencing parameters (translation-only:
+    /blueboat/odom is local ENU, so no rotation is estimated and no vehicle
+    motion is needed — the anchor converges from the first few fixes)."""
 
     fit_window_s: float = 180.0     # use pairs from the last N seconds
-    min_spread_m: float = 4.0       # boat must have moved this far to fit
-    min_pairs: int = 25
-    refit_period_s: float = 5.0
+    min_pairs: int = 5              # ~1 s of GPS before the anchor is trusted
+    refit_period_s: float = 5.0     # throttle once the anchor is supported
     max_residual_m: float = 6.0     # above this the fit is flagged low-quality
 
 
@@ -165,10 +168,12 @@ class DesignerConfig:
     default_speed_mps: float = 0.5    # time-parameterization cruise speed
     preview_arrow_every_m: float = 8.0
     undo_depth: int = 100
-    # "Does the mission already start at the boat, moving forward?" — the
-    # world frame is zeroed at launch, so an aligned mission starts at (0,0)
-    # along +x. Shared by the designer's Align to Start and by the launch
-    # dialog's badge, so the two can never disagree about the same file.
+    # "Does the mission start at the world origin, heading +x?" — the world
+    # frame is local ENU (origin = launch point, +x = East), so an aligned
+    # mission starts at the boat's launch position heading EAST. Shared by
+    # the designer's Align to Start and by the launch dialog's badge, so the
+    # two can never disagree about the same file. GPS-anchored missions are
+    # geographically fixed and exempt.
     start_align_tol_m: float = 0.05
     start_align_tol_deg: float = 2.0
 

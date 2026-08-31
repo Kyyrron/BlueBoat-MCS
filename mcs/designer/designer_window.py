@@ -236,8 +236,10 @@ class DesignerWindow(QMainWindow):
         align_act = act(edit, "Align to Start", self._align_to_start)
         align_act.setToolTip(
             "Rigid-transform the mission so it starts at world (0,0) with "
-            "its first tangent along +x — i.e. at the boat, moving forward, "
-            "every launch (the world frame is zeroed at launch).")
+            "its first tangent along +x. The world frame is local ENU "
+            "(origin = launch point, +x = EAST), so an aligned mission "
+            "starts at the boat's launch position heading east — mainly "
+            "useful for simulation; real missions should be GPS-anchored.")
 
     # ---------------------------------------------------- start alignment
     def _start_misalignment(self) -> tuple[tuple[float, float], float] | None:
@@ -262,7 +264,8 @@ class DesignerWindow(QMainWindow):
         self.model.align_to_start(*mis)
         self.map.sync_positions()
         self.statusBar().showMessage(
-            "Mission aligned: starts at the boat, first motion forward.", 5000)
+            "Mission aligned: starts at the launch point, first motion "
+            "east (+x).", 5000)
 
     def _maybe_offer_alignment(self) -> None:
         """Before saving a NON-GPS mission that does not start at the boat,
@@ -275,11 +278,11 @@ class DesignerWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self, "Align mission to robot start?",
-            "Every launch zeroes the world frame at the boat (origin = boat "
-            "position, +x = boat heading). This mission does not start at "
-            "(0,0) along +x, so the robot would first cut across to it.\n\n"
-            "Align the mission so it starts at the boat and begins by "
-            "moving forward?",
+            "The world frame is local ENU: origin = the boat's launch "
+            "position, +x = EAST. This mission does not start at (0,0) "
+            "along +x, so the robot would first cut across to it.\n\n"
+            "Align the mission so it starts at the launch point, heading "
+            "east? (For real-water missions, prefer a GPS anchor instead.)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if answer == QMessageBox.StandardButton.Yes:
             self._push_undo()
@@ -520,13 +523,23 @@ class DesignerWindow(QMainWindow):
         self.map.refresh_overlays(robot, pinger,
                                   self._robot_box.isChecked(),
                                   self._pinger_box.isChecked())
+        # Keep the georeference live: a fix arriving after the window opened
+        # must enable the satellite layer, and refits must reach the tiles /
+        # GPS read-outs (the fit used to be a construction-time snapshot).
+        self._update_geo_fit()
 
     def _active_fit(self):
-        """The georeference the design frame is expressed in: the station's
-        live fit when the robot is connected and calibrated, else the manual
-        GPS origin, else None."""
+        """The design frame's georeference: a translation-free GeoFit whose
+        ``(lat0, lon0)`` is the GPS of the design origin, so that a design
+        point ``(x, y)`` maps to GPS exactly as :func:`io_yaml.deploy_mission`
+        will map it (design frame == local ENU about the anchor). Derived
+        from the station's live fit when valid (the design origin is then the
+        robot's world origin), else the manual GPS origin, else None."""
         if self._store is not None and self._store.geo.is_valid:
-            return self._store.geo.fit
+            live = self._store.geo.fit
+            lat0, lon0 = live.world_to_latlon(0.0, 0.0)
+            return GeoFit(tx=0.0, ty=0.0, lat0=lat0, lon0=lon0,
+                          rms_m=live.rms_m, n_pairs=live.n_pairs)
         return self._manual_fit
 
     def _update_geo_fit(self, center: bool = False) -> None:
@@ -554,8 +567,8 @@ class DesignerWindow(QMainWindow):
                                 "Could not parse coordinates. Expected "
                                 "'lat, lon' e.g. 33.660196, 130.657780")
             return
-        # World (0,0) := the entered GPS point; axes aligned with east/north.
-        self._manual_fit = GeoFit(theta=0.0, tx=0.0, ty=0.0,
+        # Design (0,0) := the entered GPS point; axes aligned with east/north.
+        self._manual_fit = GeoFit(tx=0.0, ty=0.0,
                                   lat0=latlon[0], lon0=latlon[1],
                                   rms_m=0.0, n_pairs=0)
         self._update_geo_fit()
@@ -621,17 +634,16 @@ class DesignerWindow(QMainWindow):
             return
         samples = sample_mission(self.model, self._cfg.designer.sample_ds_m)
         self.model.name = name
-        # Embed the GPS anchor: lat/lon of the design-frame origin + its
-        # rotation vs east/north. This is what links every waypoint to real
-        # GPS coordinates and lets the station deploy the mission into the
+        # Embed the GPS anchor: lat/lon of the design-frame origin. The
+        # design frame is local ENU, so theta_deg is always 0 (kept for
+        # legacy readers). This is what links every waypoint to real GPS
+        # coordinates and lets the station deploy the mission into the
         # robot's per-run world frame (docs/08).
         fit = self._active_fit()
         anchor = None
         if fit is not None:
-            import math as _math
             lat0, lon0 = fit.world_to_latlon(0.0, 0.0)
-            anchor = {"lat0": lat0, "lon0": lon0,
-                      "theta_deg": _math.degrees(fit.theta)}
+            anchor = {"lat0": lat0, "lon0": lon0, "theta_deg": 0.0}
         path = io_yaml.save_mission(self._dir, name, self.model, samples,
                                     geo_anchor=anchor)
         self._dirty = False
@@ -653,12 +665,19 @@ class DesignerWindow(QMainWindow):
                 # restore it so satellite imagery and GPS readouts are
                 # immediately available for further editing.
                 self._manual_fit = GeoFit(
-                    theta=__import__("math").radians(
-                        float(anchor.get("theta_deg", 0.0))),
                     tx=0.0, ty=0.0, lat0=float(anchor["lat0"]),
                     lon0=float(anchor["lon0"]), rms_m=0.0, n_pairs=0)
                 self._update_geo_fit()
                 self._sat_box.setChecked(True)
+                if float(anchor.get("theta_deg", 0.0)) != 0.0:
+                    # Legacy anchor: points are in a rotated design frame.
+                    # Deployment still honours the rotation; the editor's
+                    # imagery/read-outs assume ENU and are approximate here.
+                    # Re-saving writes theta_deg 0 with the points AS SHOWN.
+                    self.statusBar().showMessage(
+                        "Legacy GPS anchor (theta_deg != 0): imagery and GPS "
+                        "read-outs assume an ENU design frame — verify before "
+                        "re-saving.", 12000)
             self._undo.clear()
             self._redo.clear()
             self._dirty = False

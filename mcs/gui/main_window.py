@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         self.left_panel.refresh()
         self.right_panel.refresh()
         self.map_view.refresh()
-        if (hasattr(self, "_pending_preview_trajectory") and self._pending_preview_trajectory is not None and self.store.world_frame_ready()):
+        if (hasattr(self, "_pending_preview_trajectory") and self._pending_preview_trajectory is not None and self.store.map_frame_ready()):
             trajectory = self._pending_preview_trajectory
             self._pending_preview_trajectory = None
             self._request_path_preview(trajectory)
@@ -208,17 +208,18 @@ class MainWindow(QMainWindow):
         # Georeference status + satellite availability
         geo = self.store.geo
         if geo.fit is None:
-            self._geo_label.setText("georef: collecting…")
+            self._geo_label.setText("georef: waiting for GPS fix…")
         else:
-            quality = "ok" if geo.is_valid else "poor"
+            quality = "anchored" if geo.is_valid else "poor"
             color = theme.OK if geo.is_valid else theme.WARN
             self._geo_label.setText(
-                f"georef: {quality} (rms {geo.fit.rms_m:.1f} m)")
+                f"georef: {quality} (rms {geo.fit.rms_m:.1f} m, "
+                f"{geo.fit.n_pairs} fixes)")
             self._geo_label.setStyleSheet(f"color: {color};")
         self.left_panel.set_satellite_available(geo.is_valid)
         # Map orientation is handled inside MapView (QGC-style: north-up
-        # fixed, only the glyph rotates once heading is aligned) — nothing to
-        # drive from here.
+        # fixed, the scene is ENU by construction, only the glyph rotates)
+        # — nothing to drive from here.
         # Mission readiness → launch state promotion. The FCU-connected check
         # only applies to the real-robot graph; Sim_launch.py has no MAVROS.
         if self.launcher.state == "starting":
@@ -254,14 +255,15 @@ class MainWindow(QMainWindow):
     def _start_gps_deployment(self, params: LaunchParameters) -> None:
         """GPS-anchored mission: path_generation was pointed at a deployed
         file that does not exist yet (it holds position meanwhile). The
-        robot's world origin is created at power-on, and the odom↔GPS fit
-        for THIS run only becomes observable after a few metres of motion —
-        so deployment is deferred: this watcher polls the georeferencer and,
-        once the fit is valid, converts the anchored mission into today's
-        world frame and writes the deployed file; path_generation reloads it
-        on its next path request and the boat transitions onto the true-GPS
-        path. Every waypoint therefore lands on its real-world GPS
-        coordinates regardless of where the robot was switched on."""
+        robot's world origin is created at power-on; the odom↔GPS anchor is
+        a pure translation (the world frame is local ENU) and converges from
+        the first few GPS fixes with NO vehicle motion required — so this
+        watcher typically fires within seconds: it converts the anchored
+        mission into today's world frame and writes the deployed file;
+        path_generation reloads it on its next path request and the boat
+        transitions onto the true-GPS path. Every waypoint therefore lands
+        on its real-world GPS coordinates regardless of where the robot was
+        switched on."""
         self._stop_gps_deployment()
         if not params.gps_anchored_source or params.simulation:
             return
@@ -274,9 +276,8 @@ class MainWindow(QMainWindow):
         self._gps_timer.timeout.connect(lambda: self._poll_gps_deployment(io_yaml))
         self._gps_timer.start(1000)
         self._status.showMessage(
-            "GPS-anchored mission: holding position — drive the boat a few "
-            "metres so the georeference converges; the path deploys "
-            "automatically.", 10000)
+            "GPS-anchored mission: waiting for GPS fixes — the path deploys "
+            "automatically (no motion needed).", 10000)
 
     def _poll_gps_deployment(self, io_yaml) -> None:
         if not self.store.mission.launch_running:
@@ -288,13 +289,14 @@ class MainWindow(QMainWindow):
             if self._gps_hint_countdown <= 0:
                 self._gps_hint_countdown = 20
                 self._status.showMessage(
-                    "GPS path pending: georeference not established yet "
-                    "(needs GPS fix + a few metres of motion).", 8000)
+                    "GPS path pending: waiting for GPS fixes to anchor the "
+                    "frame (check /mavros/global_position/global).", 8000)
             return
         try:
             io_yaml.deploy_mission(self._gps_src, geo.fit, self._gps_dst)
         except Exception as exc:  # noqa: BLE001 - surfaced, retried next poll
             _LOG.error("GPS deployment failed: %s", exc)
+            self._status.showMessage(f"GPS deployment failed: {exc}", 8000)
             return
         self._stop_gps_deployment()
         _LOG.info("GPS mission deployed to %s (fit rms %.2f m)",
@@ -341,6 +343,10 @@ class MainWindow(QMainWindow):
             self.store.mission.launch_running = False
             self.store.mission.manual_target = None
             self.store.mission.simulation = False
+            # A finished run's path must not survive onto the next mission's
+            # map (it would silently re-anchor with the next run's frame).
+            self.store.mission_path = None
+            self._pending_preview_trajectory = None
             self.commands.set_simulation_mode(False)
             self.map_view.clear_manual_target()
             self.toolbar.set_manual_target_active(False)

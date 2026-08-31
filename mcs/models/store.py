@@ -150,8 +150,9 @@ class DataStore:
 
         self.robot_track.append(t, (r.x, r.y, r.yaw))
         self.speed_hist.append(t, (r.speed,))
-        if r.lat is not None and r.lon is not None:
-            self.geo.add_pair(t, r.x, r.y, r.lat, r.lon)
+        # NOTE: geo pairing happens in on_gps (at GPS rate, with a freshness
+        # guard on the odom pose) — pairing here at odom rate re-used one GPS
+        # fix against ~4 different odom positions and biased the estimate.
         # NOTE: the pinger world position is deliberately NOT recomputed here.
         # Re-anchoring a (possibly stale, dead-reckoned) body-frame pinger
         # vector to every new robot pose made the pinger marker follow the
@@ -172,6 +173,11 @@ class DataStore:
         if lat == 0.0 and lon == 0.0:
             return
         self.robot.lat, self.robot.lon = lat, lon
+        # Feed the georeferencer at GPS rate, only when the odom pose is
+        # fresh enough to count as concurrent with this fix.
+        r = self.robot
+        if r.has_odom and (t - r.t) < 0.5:
+            self.geo.add_pair(t, r.x, r.y, lat, lon)
 
     def on_mavros_state(self, t: float, connected: bool, armed: bool, mode: str) -> None:
         self.robot.fcu_connected = connected
@@ -254,26 +260,24 @@ class DataStore:
 
     def robot_true_heading(self) -> float | None:
         """Robot heading referenced to true north/east (CCW from east), or
-        None if no absolute heading source is available yet.
+        None if no heading source is available yet.
 
-        Prefers /mavros/global_position/compass_hdg, which is ABSOLUTE and
-        available immediately — unlike the odom yaw, whose world frame is
-        launch-zeroed (yaw 0 at launch, so the glyph would face east at the
-        start regardless of the real heading). Falls back to the georeference
-        offset (yaw + theta) only once heading-aligned."""
+        Prefers /mavros/global_position/compass_hdg (magnetometer, absolute).
+        Falls back to the odom yaw directly: /blueboat/odom's yaw is absolute
+        ENU (0 = East, CCW+) on both the real boat and the simulator, so no
+        frame correction is applied — see GPS_MAP_ARCHITECTURE.md."""
         if self.robot.compass_heading is not None:
             return self.robot.compass_heading
-        if not self.robot.has_odom:
-            return None
-        fit = self.geo.fit
-        if fit is None or not fit.heading_aligned:
-            return None
-        return fit.world_yaw_to_true(self.robot.yaw)
+        if self.robot.has_odom:
+            return self.robot.yaw
+        return None
 
-    def world_frame_ready(self) -> bool:
-        """True once the odom->GPS heading alignment has been established."""
-        fit = self.geo.fit
-        return fit is not None and fit.heading_aligned
+    def map_frame_ready(self) -> bool:
+        """True once the map may draw: in simulation immediately (the sim
+        world is already ENU, identity anchor, no tiles), on the real boat
+        once the odom->GPS translation is anchored (a few fixes, no vehicle
+        motion required). Nothing is drawn on the map before this."""
+        return self.mission.simulation or self.geo.is_valid
 
     def active_target_distance(self) -> float | None:
         tgt = self.active_target_world()

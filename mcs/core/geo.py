@@ -1,20 +1,26 @@
-"""Online georeferencing between the ROS local/world frame and GPS.
+"""Online georeferencing between the ROS local-ENU world frame and GPS.
 
-``robot_interface.py`` defines the world frame with an origin and yaw offset
-(``lat0``, ``lon0``, ``yaw0``) that are internal to that node and never
-published.  Rather than duplicating or modifying robot-side logic, the
-station *estimates* the same rigid transform online: it collects
-simultaneous pairs of (odom XY, GPS position projected to local
-east/north metres) and fits a 2-D rotation + translation with the Kabsch
-algorithm once the vehicle has moved enough for the problem to be
-well-conditioned.
+``robot_interface.py`` publishes ``/blueboat/odom`` in a **local-ENU** frame:
+position translated so the origin is the boat's launch point, axes East/North,
+yaw absolute ENU (0 = East, CCW+). The simulator publishes the same frame kind
+(Gazebo world, ENU). The only unknown between that frame and GPS is therefore a
+**pure translation** — the EN position of the world origin — which the station
+estimates online by pairing odom positions with GPS fixes.
+
+There is deliberately **no rotation estimation** here. The previous design
+fitted a rotation with the Kabsch algorithm; against an ENU-axis odom frame the
+fitted angle is ~0 by construction, the fit needed vehicle motion to converge
+(deadlocking GPS-anchored deployments that hold position until deployed), and
+its rolling-window refits made the whole scene wander. A translation estimate
+converges from the first GPS fixes, with no motion required.
 
 The result enables:
+* the map scene itself (local east/north metres about ``(lat0, lon0)``),
 * GPS read-out of any clicked map point,
 * placement of the satellite tile layer,
-* GPS display for the pinger world position,
+* GPS-anchored mission deployment,
 
-with an explicit quality flag (RMS residual) shown to the operator.
+with an explicit quality figure (RMS residual) shown to the operator.
 
 Web-mercator helpers for the tile layer also live here.
 """
@@ -71,79 +77,55 @@ def metres_per_pixel(lat: float, zoom: int, tile_px: int = 256) -> float:
 # ------------------------------------------------------------- georeferencer
 @dataclass
 class GeoFit:
-    """Rigid map between the robot's local/world frame and GPS.
+    """Translation between the robot's local-ENU world frame and GPS.
 
-    ``World(x, y) = R(theta) @ EN + t``  (inverted: ``EN = R(-theta)(world - t)``).
+    The one convention, defined here and nowhere else::
 
-    ``theta`` is the rotation from the local east/north (ENU) frame to the
-    robot's world frame. Equivalently, the robot's world +x axis points at
-    bearing ``theta`` measured CCW from east. A robot yaw expressed in the
-    world frame therefore corresponds to the true (north/east) heading
-    ``world_yaw + theta``.
+        EN = world + t          world = EN - t          t = (tx, ty)
 
-    ``heading_aligned`` is False for a *translation-only* fit (produced from
-    the very first GPS fix, before the vehicle has moved enough for rotation
-    to be observable): position/tile placement are usable immediately, but
-    ``theta`` is a placeholder (0) and must not be trusted for heading until
-    the flag turns True.
+    where ``EN`` are metres east/north of ``(lat0, lon0)`` (equirectangular)
+    and ``t`` is the EN position of the world frame's origin — the boat's
+    launch point. There is **no rotation**: the world frame's axes are already
+    East/North (see the module docstring), so world→EN and EN→world are pure
+    translations and a world yaw *is* a true ENU heading.
+
+    ``rms_m`` is the residual of the window pairs against ``t`` — the health
+    figure shown to the operator; ``n_pairs`` how many pairs support it.
     """
 
-    theta: float          # rotation from local-EN frame to world frame
-    tx: float             # world-frame offset
-    ty: float
+    tx: float             # EN east of the world origin
+    ty: float             # EN north of the world origin
     lat0: float           # projection origin (first GPS fix)
     lon0: float
-    rms_m: float          # fit residual
+    rms_m: float          # residual of pairs against t
     n_pairs: int
-    heading_aligned: bool = False
 
     def world_to_enu(self, x: float, y: float) -> tuple[float, float]:
-        """Rotate a world-frame point into the local east/north frame.
-
-        The scene the map draws in is ENU (north-up, fixed), so every
-        world-frame quantity (odom pose, trails, targets, mission paths) is
-        placed through this. Pure rotation about the georeference origin —
-        no lat/lon round-trip, so it is cheap enough for per-frame use.
-        ``EN = R(-theta) (world - t)``."""
-        c, s = math.cos(-self.theta), math.sin(-self.theta)
-        dx, dy = x - self.tx, y - self.ty
-        return c * dx - s * dy, s * dx + c * dy
+        """World point -> local east/north metres. ``EN = world + t``."""
+        return x + self.tx, y + self.ty
 
     def enu_to_world(self, east: float, north: float) -> tuple[float, float]:
-        c, s = math.cos(self.theta), math.sin(self.theta)
-        return c * east - s * north + self.tx, s * east + c * north + self.ty
+        """Local east/north metres -> world point. ``world = EN - t``."""
+        return east - self.tx, north - self.ty
 
-    # world -> lat/lon
+    # world <-> lat/lon
     def world_to_latlon(self, x: float, y: float) -> tuple[float, float]:
-        c, s = math.cos(-self.theta), math.sin(-self.theta)
-        dx, dy = x - self.tx, y - self.ty
-        east = c * dx - s * dy
-        north = s * dx + c * dy
-        return local_en_to_latlon(east, north, self.lat0, self.lon0)
+        return local_en_to_latlon(x + self.tx, y + self.ty, self.lat0, self.lon0)
 
     def latlon_to_world(self, lat: float, lon: float) -> tuple[float, float]:
         east, north = latlon_to_local_en(lat, lon, self.lat0, self.lon0)
-        c, s = math.cos(self.theta), math.sin(self.theta)
-        return c * east - s * north + self.tx, s * east + c * north + self.ty
-
-    # --- heading alignment ------------------------------------------------
-    @property
-    def world_heading_offset(self) -> float:
-        """Angle to add to a world-frame yaw to obtain the true heading
-        (measured CCW from east). This is exactly ``theta`` — see the class
-        docstring; exposed by name so heading consumers don't reach into the
-        transform's internals."""
-        return self.theta
-
-    def world_yaw_to_true(self, world_yaw: float) -> float:
-        """Convert a robot yaw in the world frame to a true (north/east)
-        heading, normalised to (-pi, pi]."""
-        a = world_yaw + self.theta
-        return math.atan2(math.sin(a), math.cos(a))
+        return east - self.tx, north - self.ty
 
 
 class GeoReferencer:
-    """Accumulates (world XY, GPS) pairs and maintains the best-fit transform."""
+    """Accumulates (world XY, GPS) pairs and maintains the translation estimate.
+
+    ``add_pair`` must be fed at **GPS rate** with a fresh odom position (the
+    caller guards staleness) — pairing every odom message with a possibly
+    stale GPS fix biases the estimate. ``t`` is the per-axis **median** of
+    ``EN - world`` over the rolling window, so a single GPS glitch cannot
+    drag the map; the RMS residual against ``t`` is the health figure.
+    """
 
     def __init__(self, cfg: GeoConfig) -> None:
         self._cfg = cfg
@@ -159,77 +141,46 @@ class GeoReferencer:
 
     @property
     def is_valid(self) -> bool:
-        """True as soon as *any* usable fit exists (translation-only counts).
+        """True once enough pairs agree on the translation.
 
-        Tile placement and GPS read-outs only need the origin, which is known
-        from the first fix; requiring the full rotated fit here is what kept
-        the satellite layer unavailable while GPS was already streaming. Use
-        :attr:`heading_aligned` to know whether ``theta`` is trustworthy."""
-        return self._fit is not None and self._fit.rms_m <= self._cfg.max_residual_m
-
-    @property
-    def heading_aligned(self) -> bool:
-        """True once the rotated Kabsch fit has been established (enough
-        motion for the world<->ENU rotation to be observable)."""
-        return self._fit is not None and self._fit.heading_aligned
+        ``min_pairs`` is small (a couple of seconds of GPS): no vehicle
+        motion is needed for a translation to be observable, so the map
+        anchors almost immediately after the first fixes."""
+        return (
+            self._fit is not None
+            and self._fit.n_pairs >= self._cfg.min_pairs
+            and self._fit.rms_m <= self._cfg.max_residual_m
+        )
 
     def add_pair(self, t: float, x: float, y: float, lat: float, lon: float) -> None:
-        """Feed a simultaneous odom position and GPS fix (called ~ GPS rate)."""
+        """Feed a GPS fix with the concurrent odom position (called at GPS rate)."""
         if lat == 0.0 and lon == 0.0:  # NavSatFix with no fix
             return
         if self._lat0 is None:
             self._lat0, self._lon0 = lat, lon
-            # Immediate translation-only fit from the very first fix: origin
-            # is known, rotation is not yet observable so theta = 0. This
-            # makes is_valid True right away (satellite/tiles usable) while
-            # heading_aligned stays False until motion permits the Kabsch fit.
-            self._fit = GeoFit(
-                theta=0.0, tx=float(x), ty=float(y),
-                lat0=self._lat0, lon0=self._lon0, rms_m=0.0, n_pairs=1,
-                heading_aligned=False,
-            )
         east, north = latlon_to_local_en(lat, lon, self._lat0, self._lon0)
         self._pairs.append(t, (x, y, east, north))
-        if t - self._last_fit_t >= self._cfg.refit_period_s:
+        # Refit on every pair until the estimate is supported, then throttle.
+        supported = self._fit is not None and self._fit.n_pairs >= self._cfg.min_pairs
+        if not supported or t - self._last_fit_t >= self._cfg.refit_period_s:
             self._last_fit_t = t
             self._refit(t)
 
     # ------------------------------------------------------------- internal
     def _refit(self, now: float) -> None:
         ts, vs = self._pairs.window(now - self._cfg.fit_window_s, now + 1.0)
-        if len(ts) < self._cfg.min_pairs:
+        if len(ts) == 0:
             return
-        world = vs[:, 0:2]
-        en = vs[:, 2:4]
-        spread = float(np.linalg.norm(world.max(axis=0) - world.min(axis=0)))
-        if spread < self._cfg.min_spread_m:
-            # Not enough motion yet: rotation is unobservable. Keep the
-            # translation-only fit but refresh its offset from the latest
-            # (world, EN) correspondence so tiles/read-outs track the boat.
-            assert self._lat0 is not None and self._lon0 is not None
-            wx, wy = world.mean(axis=0)
-            ex, ey = en.mean(axis=0)
-            self._fit = GeoFit(
-                theta=0.0, tx=float(wx - ex), ty=float(wy - ey),
-                lat0=self._lat0, lon0=self._lon0, rms_m=0.0, n_pairs=len(ts),
-                heading_aligned=False,
-            )
-            return
-
-        # Kabsch: rotation aligning EN onto world (scale fixed to 1: both metres)
-        wc = world - world.mean(axis=0)
-        ec = en - en.mean(axis=0)
-        h = ec.T @ wc
-        u, _, vt = np.linalg.svd(h)
-        d = np.sign(np.linalg.det(vt.T @ u.T))
-        r = vt.T @ np.diag([1.0, d]) @ u.T
-        theta = math.atan2(r[1, 0], r[0, 0])
-        t = world.mean(axis=0) - r @ en.mean(axis=0)
-        residual = world - (en @ r.T + t)
-        rms = float(np.sqrt(np.mean(np.sum(residual ** 2, axis=1))))
+        offsets = vs[:, 2:4] - vs[:, 0:2]          # EN - world, per pair
+        t_est = np.median(offsets, axis=0)          # robust to GPS glitches
+        residual = offsets - t_est
+        err = np.hypot(residual[:, 0], residual[:, 1])
+        # Robust spread (MAD-scaled): a single glitch in the window must not
+        # inflate the health figure and hide the map; only a *sustained*
+        # inconsistency between odom and GPS pushes it past max_residual_m.
+        rms = float(np.median(err) * 1.4826)
         assert self._lat0 is not None and self._lon0 is not None
         self._fit = GeoFit(
-            theta=theta, tx=float(t[0]), ty=float(t[1]),
+            tx=float(t_est[0]), ty=float(t_est[1]),
             lat0=self._lat0, lon0=self._lon0, rms_m=rms, n_pairs=len(ts),
-            heading_aligned=True,
         )

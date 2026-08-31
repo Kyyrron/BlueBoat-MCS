@@ -188,8 +188,9 @@ class MissionPathItem(PolylineItem):
 
 
 def draw_north_indicator(painter, viewport_w: int, north_up: bool) -> None:
-    """Small compass hint: 'N ^' when the view is north-up, else a world-up
-    notice so the operator knows geographic orientation is not yet known."""
+    """Small compass hint: 'N ^'. The scene is ENU by construction so the map
+    is always north-up and callers pass True; the world-up notice branch is
+    kept only for API compatibility."""
     painter.save()
     painter.resetTransform()
     painter.setFont(QFont("DejaVu Sans", 9, QFont.Weight.Bold))

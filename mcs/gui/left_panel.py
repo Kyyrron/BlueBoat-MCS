@@ -130,7 +130,10 @@ class LeftPanel(QWidget):
         g = self.robot_grid
         if r.has_odom:
             g.set("World (x, y)", f"{r.x:+8.2f}, {r.y:+8.2f} m")
-            g.set("Heading", f"{_deg(r.yaw):6.1f}°")
+            # Same source as the map glyph (compass first, else the absolute
+            # ENU odom yaw) so the two can never disagree on screen.
+            hdg = s.robot_true_heading()
+            g.set("Heading", f"{_deg(hdg):6.1f}°" if hdg is not None else "—")
             g.set("Speed", f"{r.speed:5.2f} m/s")
         else:
             g.set("World (x, y)", "no odom")

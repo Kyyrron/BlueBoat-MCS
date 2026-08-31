@@ -34,26 +34,73 @@ assert len(a) <= 101
 assert ts.last()[0] == 9999 * 0.1
 print("TimeSeries ok")
 
-# --- GeoReferencer: synthetic boat moving, world = R(30deg)@EN + (5, -3) ---
+# --- GeoReferencer: translation-only anchor, EN = world + t ---
+# /blueboat/odom is local ENU (axes East/North, origin = launch point), so the
+# only unknown between world and GPS is the translation t = EN(world origin).
+# No motion is required: a stationary boat's fixes anchor the frame too.
 geo = GeoReferencer(cfg.geo)
-theta = math.radians(30); lat0, lon0 = 43.10, 5.90
+lat0, lon0 = 43.10, 5.90
+# The boat launches at world (0,0) and GPS starts reporting once it has
+# reached world (37, -23): the referencer latches its projection origin at
+# that FIRST fix, so its t = EN(world origin) = (-37, +23) in its own frame
+# — a non-trivial anchor, as in the field (odom starts before GPS).
+_t_true = (-37.0, 23.0)
 from mcs.core.geo import local_en_to_latlon
 
 t = 0.0
 for i in range(300):
     t += 1.0
-    east, north = 0.05 * i, 0.03 * i  # boat path in EN metres
-    x = math.cos(theta) * east - math.sin(theta) * north + 5.0
-    y = math.sin(theta) * east + math.cos(theta) * north - 3.0
-    lat, lon = local_en_to_latlon(east, north, lat0, lon0)
+    x, y = 37.0 + 0.05 * i, -23.0 + 0.03 * i      # world pose (= true EN
+    lat, lon = local_en_to_latlon(x, y, lat0, lon0)  # about the launch point)
     geo.add_pair(t, x, y, lat, lon)
 assert geo.fit is not None, "geo fit missing"
 assert geo.is_valid, f"geo rms {geo.fit.rms_m}"
-lat, lon = geo.fit.world_to_latlon(5.0, -3.0)
-assert abs(lat - lat0) < 1e-6 and abs(lon - lon0) < 1e-6
-xx, yy = geo.fit.latlon_to_world(lat0, lon0)
-assert abs(xx - 5.0) < 1e-3 and abs(yy + 3.0) < 1e-3
-print(f"GeoReferencer ok (theta_hat={math.degrees(geo.fit.theta):.2f} deg, rms={geo.fit.rms_m:.3f} m)")
+assert abs(geo.fit.tx - _t_true[0]) < 1e-3 and abs(geo.fit.ty - _t_true[1]) < 1e-3, \
+    (geo.fit.tx, geo.fit.ty)
+for _p in ((0.0, 0.0), (13.5, -7.25), (-40.0, 60.0)):
+    _rt = geo.fit.latlon_to_world(*geo.fit.world_to_latlon(*_p))
+    assert math.hypot(_rt[0] - _p[0], _rt[1] - _p[1]) < 1e-6, (_p, _rt)
+# world_to_latlon must reproduce the true GPS of a world point.
+_lat_w, _lon_w = geo.fit.world_to_latlon(50.0, -15.0)
+_lat_t, _lon_t = local_en_to_latlon(50.0, -15.0, lat0, lon0)
+assert abs(_lat_w - _lat_t) < 1e-8 and abs(_lon_w - _lon_t) < 1e-8
+
+# Anchors within a couple of fixes, boat stationary — no motion needed.
+_g_still = GeoReferencer(cfg.geo)
+for _i in range(cfg.geo.min_pairs):
+    _g_still.add_pair(float(_i), 7.0, -4.0,
+                      *local_en_to_latlon(7.0, -4.0, lat0, lon0))
+assert _g_still.is_valid and _g_still.fit.n_pairs == cfg.geo.min_pairs
+assert abs(_g_still.fit.tx + 7.0) < 1e-6 and abs(_g_still.fit.ty - 4.0) < 1e-6
+
+# Robustness: one GPS glitch must not drag the median anchor nor flip
+# is_valid; a *sustained* odom/GPS inconsistency must flag the fit invalid.
+_g2 = GeoReferencer(cfg.geo)
+t2 = 0.0
+for _i in range(50):
+    t2 += 1.0
+    _e, _n = 100.0 + 0.1 * _i, -50.0 + 0.05 * _i
+    _g2.add_pair(t2, _e - 100.0, _n + 50.0, *local_en_to_latlon(_e, _n, lat0, lon0))
+_g2.add_pair(t2 + 1.0, 5.0, 2.5, *local_en_to_latlon(400.0, 300.0, lat0, lon0))
+for _i in range(50, 55):
+    t2 += cfg.geo.refit_period_s + 1.0
+    _e, _n = 100.0 + 0.1 * _i, -50.0 + 0.05 * _i
+    _g2.add_pair(t2, _e - 100.0, _n + 50.0, *local_en_to_latlon(_e, _n, lat0, lon0))
+assert _g2.is_valid, f"glitch broke the fit (rms {_g2.fit.rms_m})"
+assert abs(_g2.fit.tx) < 0.5 and abs(_g2.fit.ty) < 0.5, (_g2.fit.tx, _g2.fit.ty)
+
+import random as _random
+
+_g3 = GeoReferencer(cfg.geo)
+_rng = _random.Random(7)
+t3 = 0.0
+for _i in range(40):
+    t3 += cfg.geo.refit_period_s + 0.1
+    _e, _n = _rng.uniform(-200, 200), _rng.uniform(-200, 200)
+    _g3.add_pair(t3, 0.0, 0.0, *local_en_to_latlon(_e, _n, lat0, lon0))
+assert _g3.fit is not None and not _g3.is_valid, f"rms {_g3.fit.rms_m}"
+print(f"GeoReferencer ok (t=({geo.fit.tx:.2f}, {geo.fit.ty:.2f}) m, "
+      f"rms={geo.fit.rms_m:.3f} m)")
 
 # --- LoS predictor converges to target ---
 pts = predict_los_path((0, 0, 0), (20, 10), cfg.los)
@@ -268,12 +315,10 @@ finally:
     shutil.rmtree(_dsn_dir, ignore_errors=True)
 print("designer ok")
 
-# --- N8: deploy_mission refuses a non-heading-aligned georeference ---
-# A translation-only fit carries theta = 0 as a PLACEHOLDER, not a measurement.
-# Deploying against it silently rotates the whole mission by the true heading
-# offset, so the guard must raise rather than write a wrong file.
-from mcs.core.geo import GeoFit
-
+# --- N8: deploy_mission needs a geo_anchor and a usable translation fit ---
+# The world frame is local ENU, so deployment is a pure translation: a plain
+# translation fit (no motion, no rotation) is the HAPPY path now. The guard
+# still refuses a missing fit or a source without an anchor, writing nothing.
 _dep_dir = Path(tempfile.mkdtemp())
 try:
     _dep_m = MissionModel()
@@ -282,20 +327,22 @@ try:
     for _x, _y in ((0.0, 0.0), (10.0, 0.0), (10.0, 8.0)):
         _dep_m.add_waypoint(_x, _y)
     _dep_s = sample_mission(_dep_m, cfg.designer.sample_ds_m)
+    # Anchor the design 120 m east / 80 m north of the launch point, so the
+    # deployment visibly relocates the mission (a launch-point anchor would
+    # deploy to the identity and prove nothing).
+    _anch_lat, _anch_lon = local_en_to_latlon(120.0, 80.0, lat0, lon0)
     _dep_src = io_yaml.save_mission(
         _dep_dir, "anchored", _dep_m, _dep_s,
-        geo_anchor={"lat0": lat0, "lon0": lon0, "theta_deg": 0.0})
+        geo_anchor={"lat0": _anch_lat, "lon0": _anch_lon, "theta_deg": 0.0})
     _dep_n = len(_yaml.safe_load(_dep_src.read_text())["points"])
 
     _dep_dst = io_yaml.deployed_path(_dep_dir, "anchored")
     assert _dep_dst == _dep_dir / ".deployed" / "anchored.yaml", _dep_dst
 
-    # Translation-only fit -> refuse, and write nothing at all.
-    _flat_fit = GeoFit(theta=0.0, tx=0.0, ty=0.0, lat0=lat0, lon0=lon0,
-                       rms_m=0.0, n_pairs=1, heading_aligned=False)
+    # No fit at all -> refuse, and write nothing.
     try:
-        io_yaml.deploy_mission(_dep_src, _flat_fit, _dep_dst)
-        raise AssertionError("deploy_mission accepted a non-aligned fit")
+        io_yaml.deploy_mission(_dep_src, None, _dep_dst)
+        raise AssertionError("deploy_mission accepted a missing fit")
     except ValueError:
         pass
     assert not _dep_dst.exists(), "guard must precede every write"
@@ -309,7 +356,7 @@ try:
     except ValueError:
         pass
 
-    # Heading-aligned fit -> deploy into THIS run's world frame.
+    # Translation fit -> deploy into THIS run's world frame.
     io_yaml.deploy_mission(_dep_src, geo.fit, _dep_dst)
     _dep_out = _yaml.safe_load(_dep_dst.read_text())
     assert "geo_anchor" not in _dep_out, "deployed file must not stay anchored"
@@ -317,18 +364,38 @@ try:
     assert abs(_dep_out["deployed_fit_rms_m"] - round(geo.fit.rms_m, 3)) < 1e-9
     assert len(_dep_out["points"]) == _dep_n
     assert _dep_out["speed"] == _dep_m.speed and _dep_out["loop"] is False
-    # Non-vacuous: the fit rotates by 30 deg and offsets by (5, -3), so the
+    # Non-vacuous: the anchor sits 120/80 m from the launch point, so the
     # deployed coordinates cannot be the design-frame ones.
     _dep_in_pts = _yaml.safe_load(_dep_src.read_text())["points"]
     assert max(math.hypot(_o[1] - _i[1], _o[2] - _i[2])
                for _i, _o in zip(_dep_in_pts, _dep_out["points"])) > 1.0
-    # ...and they are exactly what the design->GPS->world chain produces.
-    _anchor_fit = GeoFit(theta=0.0, tx=0.0, ty=0.0, lat0=lat0, lon0=lon0,
-                         rms_m=0.0, n_pairs=0)
+    # ...they are exactly what the design->GPS->world chain produces, and
+    # yaw passes through untouched (theta_deg == 0: design frame IS ENU).
     for _i, _o in zip(_dep_in_pts, _dep_out["points"]):
         _wx, _wy = geo.fit.latlon_to_world(
-            *_anchor_fit.world_to_latlon(_i[1], _i[2]))
+            *local_en_to_latlon(_i[1], _i[2], _anch_lat, _anch_lon))
         assert math.hypot(_o[1] - _wx, _o[2] - _wy) < 1e-3, (_i, _o)
+        assert abs(_o[3] - round(float(_i[3]), 5)) < 1e-6, (_i, _o)
+
+    # Legacy anchor (theta_deg != 0): points rotated into ENU, yaw by -theta.
+    _leg_src = io_yaml.save_mission(
+        _dep_dir, "legacy_anchor", _dep_m, _dep_s,
+        geo_anchor={"lat0": _anch_lat, "lon0": _anch_lon, "theta_deg": 30.0})
+    _leg_dst = io_yaml.deployed_path(_dep_dir, "legacy_anchor")
+    io_yaml.deploy_mission(_leg_src, geo.fit, _leg_dst)
+    _leg_out = _yaml.safe_load(_leg_dst.read_text())
+    _th = math.radians(30.0)
+    _c30, _s30 = math.cos(_th), math.sin(_th)
+    for _i, _o in zip(_yaml.safe_load(_leg_src.read_text())["points"],
+                      _leg_out["points"]):
+        _e = _c30 * _i[1] + _s30 * _i[2]
+        _n = -_s30 * _i[1] + _c30 * _i[2]
+        _wx, _wy = geo.fit.latlon_to_world(
+            *local_en_to_latlon(_e, _n, _anch_lat, _anch_lon))
+        assert math.hypot(_o[1] - _wx, _o[2] - _wy) < 1e-3, (_i, _o)
+        _dy = math.atan2(math.sin(_i[3] - _th - _o[3]),
+                         math.cos(_i[3] - _th - _o[3]))
+        assert abs(_dy) < 1e-4, (_i, _o)
 finally:
     shutil.rmtree(_dep_dir, ignore_errors=True)
 print("deploy guard ok")
@@ -351,7 +418,9 @@ for i in range(200):
     w.bus.pinger_body_received.emit(tm, [3.0, 1.0, -2.0])
     w.bus.monitoring_received.emit(tm, [i*0.05, x, y, yaw, x+2, y+1, 0, 1.0, 1.2])
     w.bus.thruster_received.emit(tm, 1.0, 1.2)
-    w.bus.gps_received.emit(tm, 43.1 + 1e-6 * i, 5.9 + 2e-6 * i)
+    # GPS consistent with the local-ENU odom (world = EN about the origin
+    # fix): on_gps pairs each fix with the concurrent odom pose.
+    w.bus.gps_received.emit(tm, *local_en_to_latlon(x, y, 43.1, 5.9))
 app.processEvents()
 
 assert w.store.robot.has_odom
@@ -432,12 +501,11 @@ w.map_view.target_clicked.connect(lambda x, y: got.append((x, y)))
 w._on_target_clicked(12.0, -4.0)
 assert w.store.mission.manual_target == (12.0, -4.0)
 
-# --- Map frame round trip: every mouse position read back out of the view ---
-# The scene is the raw world frame before heading alignment and local ENU
-# after, so an un-inverted input is wrong by the georeference rotation. The
-# published manual target is the one that moves the boat (/blueboat/manual_target
-# is a WORLD-frame topic); the inspector, the measure endpoints and the
-# recentring are the same defect where it only shows in a read-out.
+# --- Map frame: one GPS/ENU scene, gated on the anchor, exact inverses ---
+# The scene is local east/north metres about the latched GPS origin (pure
+# translation EN = world + t); every mouse position comes back through the
+# exact inverse. Nothing is drawn — and manual-target clicks are refused —
+# until the anchor exists; in simulation the identity anchor draws at once.
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 
@@ -460,31 +528,60 @@ def _click(px: int, py: int):
     return _mv.mapToScene(QPoint(px, py))
 
 try:
-    _flat = GeoReferencer(cfg.geo)   # translation-only fit: world-up scene
-    _flat.add_pair(0.0, 0.0, 0.0, 43.1, 5.9)
-    assert _flat.is_valid and not _flat.heading_aligned
     _c = _mv.viewport().rect().center()
     _px, _py = _c.x() + 37, _c.y() + 23
 
-    # -- rotated fit (theta = 30 deg, heading-aligned): the scene becomes ENU
-    w.store.geo = geo
-    _mv._update_scene_mode()
-    assert _mv.north_up, "ENU scene expected once the fit is heading-aligned"
+    # 0. pre-anchor gating: real water, no fit -> nothing drawn, clicks refused
+    w.store.geo = GeoReferencer(cfg.geo)   # no pairs yet
+    assert not w.store.mission.simulation
+    assert not w.store.map_frame_ready()
+    _mv.refresh()
+    assert not _mv._waiting_label.isHidden()
+    for _item in (_mv.robot_item, _mv.robot_track, _mv.mission_path,
+                  _mv.pinger_marker, _mv.manual_marker, _mv.target_line):
+        assert not _item.isVisible(), _item
+    _mv.set_mode(MapMode.MANUAL_TARGET)
+    _pub.clear(); _seen.clear()
+    _click(_px, _py)
+    assert not _pub, "click must be refused without a GPS anchor"
+    assert _seen and "waiting for GPS" in _seen[-1], _seen
 
-    # scene <-> world is an exact round trip
+    # 0b. simulation: identity anchor, draws immediately (the F8 regression)
+    w.store.mission.simulation = True
+    assert w.store.map_frame_ready()
+    _mv.refresh()
+    assert _mv._waiting_label.isHidden()
+    assert _mv.robot_item.isVisible()
+    _mv.set_mode(MapMode.MANUAL_TARGET)
+    _pub.clear()
+    _scene = _click(_px, _py)
+    assert _pub and _pub[-1] == (_scene.x(), _scene.y()), (_pub, _scene)
+    w.store.mission.simulation = False
+
+    # -- anchored fit (t = (37, -23)): the scene is EN about (lat0, lon0)
+    w.store.geo = geo
+    assert w.store.map_frame_ready()
+    _mv.refresh()
+    assert _mv.north_up and _mv._waiting_label.isHidden()
+
+    # scene <-> world: exact round trip, and scene = world + t (non-vacuous)
     for _p in ((0.0, 0.0), (13.5, -7.25), (-40.0, 60.0)):
-        _rt = _mv._to_world(*_mv._to_scene(*_p))
+        _sp = _mv._to_scene(*_p)
+        assert abs(_sp[0] - (_p[0] + geo.fit.tx)) < 1e-9
+        assert abs(_sp[1] - (_p[1] + geo.fit.ty)) < 1e-9
+        _rt = _mv._to_world(*_sp)
         assert math.hypot(_rt[0] - _p[0], _rt[1] - _p[1]) < 1e-9, (_p, _rt)
 
     # 1. publish path: what reaches CommandCenter must be WORLD
     _mv.set_mode(MapMode.MANUAL_TARGET)
+    _pub.clear()
     _scene = _click(_px, _py)
     assert _pub, "manual target click published nothing"
     _sent = _pub[-1]
     _back = _mv._to_scene(*_sent)
     assert math.hypot(_back[0] - _scene.x(), _back[1] - _scene.y()) < 1e-6, (_sent, _scene)
     # non-vacuous: publishing the scene point verbatim is the bug being guarded
-    assert math.hypot(_sent[0] - _scene.x(), _sent[1] - _scene.y()) > 0.1, _sent
+    assert math.hypot(_sent[0] - _scene.x(), _sent[1] - _scene.y()) > 1.0, _sent
     assert w.store.mission.manual_target == _sent
     _mk = _mv.manual_marker.scene_pos()   # crosshair stays where it was clicked
     assert math.hypot(_mk[0] - _scene.x(), _mk[1] - _scene.y()) < 1e-6, (_mk, _scene)
@@ -521,20 +618,6 @@ try:
     assert _want != _scene_text        # non-vacuous
     _mv.set_mode(MapMode.NORMAL)
 
-    # 3b. a measurement in progress, and the inspector dot, hold bare scene
-    # points: the regime switch must drop them rather than strand them.
-    _mv.set_mode(MapMode.MEASURE)
-    _mv._handle_measure_click(_a)
-    _mv._inspect_point(QPointF(*_rs))
-    assert _mv._measure_start is not None and _mv.click_marker.isVisible()
-    w.store.geo = _flat
-    _mv._update_scene_mode()
-    assert not _mv.north_up
-    assert _mv._measure_start is None and not _mv.click_marker.isVisible()
-    w.store.geo = geo
-    _mv._update_scene_mode()
-    _mv.set_mode(MapMode.NORMAL)
-
     # 4. center_on_robot: world in, scene out (the mirror-image defect)
     _mv.center_on_robot()
     assert _mv._did_initial_center
@@ -542,30 +625,20 @@ try:
     _tol = 2.0 / max(_mv._px_per_m(), 1e-9)   # centerOn scrolls to whole pixels
     assert math.hypot(_ctr.x() - _rs[0], _ctr.y() - _rs[1]) <= _tol, (_ctr, _rs)
 
-    # 5. translation-only fit: the pre-alignment regime must be untouched
-    w.store.geo = _flat
-    _mv._update_scene_mode()
-    assert not _mv.north_up
-    _mv.set_mode(MapMode.MANUAL_TARGET)
-    _pub.clear()
-    _scene = _click(_px, _py)
-    assert _pub[-1] == (_scene.x(), _scene.y()), (_pub[-1], _scene)
-
-    # 6. the crosshair follows the scene across the switch to ENU: it is
-    # placed once at click time, so only the refresh tick can move it.
-    w.store.geo = geo
-    _mv._update_scene_mode()
-    _mv._refresh_manual_target()
-    _want_mk = _mv._to_scene(*w.store.mission.manual_target)
-    _mk = _mv.manual_marker.scene_pos()
-    assert math.hypot(_mk[0] - _want_mk[0], _mk[1] - _want_mk[1]) < 1e-6, (_mk, _want_mk)
-    assert math.hypot(_want_mk[0] - _scene.x(), _want_mk[1] - _scene.y()) > 1.0
+    # 5. glyph heading: compass first, else the ABSOLUTE ENU odom yaw, with
+    # no frame correction in between (the old theta machinery is gone).
+    _saved_ch = w.store.robot.compass_heading
+    w.store.robot.compass_heading = None
+    assert abs(_mv._scene_heading(0.0) - w.store.robot.yaw) < 1e-12
+    w.store.robot.compass_heading = 1.234
+    assert abs(_mv._scene_heading(0.0) - 1.234) < 1e-12
+    w.store.robot.compass_heading = _saved_ch
 finally:
     w.commands.publish_manual_target = _saved_publish
     _mv.point_inspected.disconnect(_seen.append)
     _mv.set_mode(MapMode.NORMAL)
     w.store.geo = _saved_geo
-    _mv._update_scene_mode()
+    _mv.refresh()
 print("map frame ok")
 
 # --- N2: [0.0, 0.0] on /blueboat/manual_target is a handover sentinel ---

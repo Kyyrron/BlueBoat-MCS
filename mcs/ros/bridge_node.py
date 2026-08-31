@@ -173,8 +173,8 @@ class BridgeNode(Node):
 
     def _on_compass(self, msg: Float64) -> None:
         # /mavros/global_position/compass_hdg: absolute heading in DEGREES,
-        # clockwise from north (0=N, 90=E). Available immediately, unlike the
-        # launch-zeroed odom yaw — used to orient the glyph from the start.
+        # clockwise from north (0=N, 90=E). Preferred glyph heading source;
+        # the fallback is the odom yaw, which is absolute ENU too.
         t = self._mark(self._cfg.topics.compass_hdg)
         self._bus.compass_received.emit(t, float(msg.data))
 

@@ -1,7 +1,22 @@
-"""The interactive mission map.
+"""The interactive mission map — GPS-frame-only.
 
-A ``QGraphicsView`` over a scene whose coordinates are ROS world metres
-(+y flipped so north-ish is up).  Provides:
+A ``QGraphicsView`` over a scene whose coordinates are **local east/north
+metres about the latched GPS origin** ``(lat0, lon0)`` (+y flipped in the view
+transform so north is up).  There is exactly ONE scene frame and it never
+changes: north-up, east-right, view never rotates (only the robot glyph
+rotates, to its true heading).  Every world-frame quantity (odom pose, trails,
+targets, mission paths) is placed through the pure translation
+``GeoFit.world_to_enu`` (``EN = world + t``); every mouse position read back
+out of the view goes through the exact inverse.  ``/blueboat/odom`` is local
+ENU on both the real boat and the simulator, so no rotation exists anywhere in
+this pipeline — see ``GPS_MAP_ARCHITECTURE.md``.
+
+**Nothing is drawn before the frame is anchored**: on real water the map stays
+empty (with a notice) until the first GPS fixes establish the translation; in
+simulation the anchor is the identity and drawing starts immediately (tiles
+stay off — there is no GPS to place them with).
+
+Provides:
 
 * smooth wheel zoom anchored under the cursor, drag panning;
 * toggleable layers: satellite, robot trajectory, mission path, pinger
@@ -87,13 +102,11 @@ class MapView(QGraphicsView):
         self.setBackgroundBrush(QColor(theme.BG_DARK))
         self.scale(20.0, -20.0)  # ~20 px/m initially, y-up (north-up)
         # QGroundControl-style rendering: the map is ALWAYS north-up and
-        # never rotates. Once the georeference is heading-aligned the scene
-        # is the local east/north (ENU) frame — every world-frame quantity
-        # is converted with GeoFit.world_to_enu() at placement, tiles are
-        # placed north-up, and only the robot glyph rotates (to its TRUE
-        # heading). Before alignment the scene is the raw robot world frame
-        # (world-up); the switch happens once, preserving the framing.
-        self._enu_scene = False
+        # never rotates. The scene IS the local east/north (ENU) frame about
+        # the latched GPS origin — every world-frame quantity is placed
+        # through the pure translation GeoFit.world_to_enu(), tiles are
+        # axis-aligned, and only the robot glyph rotates (to its TRUE
+        # heading). There is no second regime and no scene switch.
 
         # ---- Layers --------------------------------------------------------
         self.tiles = TileLayer(self._scene, cfg.map)
@@ -113,7 +126,14 @@ class MapView(QGraphicsView):
                      self.pinger_marker, self.manual_marker, self.click_marker):
             self._scene.addItem(item)
         self.pinger_marker.setVisible(False)
-        self._pinger_layer_enabled = True  # checkbox intent; data-gated in refresh()
+        # Checkbox *intent* per layer; the refresh() gate may hide any item
+        # while the map frame is not anchored, so actual visibility is
+        # re-derived from these each tick.
+        self._pinger_layer_enabled = True
+        self._robot_track_enabled = True
+        self._pinger_track_enabled = True
+        self._mission_path_enabled = True
+        self._target_line_enabled = True
         self.manual_marker.setVisible(False)
         self.click_marker.setVisible(False)
         self._grid_visible = True
@@ -135,6 +155,16 @@ class MapView(QGraphicsView):
         self._scene.addItem(self._measure_text)
         self._measure_line.setVisible(False)
         self._measure_text.setVisible(False)
+
+        # "waiting for GPS" notice — shown while the map frame is not
+        # anchored yet (real water, before the first GPS fixes). Nothing is
+        # drawn on the map until it disappears.
+        self._waiting_label = QLabel(
+            "Waiting for GPS fix — the map anchors to the first fixes", self)
+        self._waiting_label.setStyleSheet(
+            f"background: {theme.WARN}; color: black; font-weight: bold;"
+            "padding: 6px 16px; border-radius: 4px;")
+        self._waiting_label.hide()
 
         # "Manual Target Reached" banner
         self._banner = QLabel("Manual Target Reached", self)
@@ -177,8 +207,8 @@ class MapView(QGraphicsView):
         self._reached_announced = False
 
     def show_manual_target(self, x: float, y: float) -> None:
-        """``x, y`` are WORLD metres (what was published); refresh() keeps the
-        crosshair placed across a scene-regime switch."""
+        """``x, y`` are WORLD metres (what was published); refresh() re-places
+        the crosshair from the stored world value every tick."""
         self.manual_marker.set_world_pos(*self._to_scene(x, y))
         self.manual_marker.setVisible(True)
         self.predicted_path.setVisible(True)
@@ -190,13 +220,19 @@ class MapView(QGraphicsView):
 
     # ============================================================ visibility
     def set_layer_visible(self, layer: str, visible: bool) -> None:
+        def _intent(attr, item):
+            def apply(v: bool) -> None:
+                setattr(self, attr, v)
+                item.setVisible(v and self._store.map_frame_ready())
+            return apply
+
         mapping = {
             "satellite": self.tiles.set_enabled,
-            "robot_track": self.robot_track.setVisible,
-            "mission_path": self.mission_path.setVisible,
+            "robot_track": _intent("_robot_track_enabled", self.robot_track),
+            "mission_path": _intent("_mission_path_enabled", self.mission_path),
             "pinger": self._set_pinger_layer_enabled,
-            "pinger_track": self.pinger_track.setVisible,
-            "target_line": self.target_line.setVisible,
+            "pinger_track": _intent("_pinger_track_enabled", self.pinger_track),
+            "target_line": _intent("_target_line_enabled", self.target_line),
             "heading": self.robot_item.set_heading_visible,
             "grid": self._set_grid_visible,
         }
@@ -218,90 +254,82 @@ class MapView(QGraphicsView):
         self.viewport().update()
 
     def _to_scene(self, wx: float, wy: float) -> tuple[float, float]:
-        """World-frame point -> current scene coordinates (ENU when the
-        georeference is heading-aligned, else the raw world frame)."""
+        """World-frame point -> scene (local east/north metres).
+
+        Pure translation ``EN = world + t``. In simulation there is no GPS
+        and no fit: the sim world is already ENU, so the identity is the
+        correct (and exact) anchor."""
         fit = self._store.geo.fit
-        if self._enu_scene and fit is not None:
+        if fit is not None:
             return fit.world_to_enu(wx, wy)
         return wx, wy
 
     def _to_world(self, sx: float, sy: float) -> tuple[float, float]:
-        """Scene coordinates -> world frame: the exact inverse of
-        :meth:`_to_scene`, under the identical regime test.
+        """Scene (east/north metres) -> world frame: the exact inverse of
+        :meth:`_to_scene`, under the identical test.
 
-        Every mouse position arrives in scene coordinates, and in the ENU
-        scene those are NOT world metres. Anything read back out of the view
-        — the published manual target above all, but also the inspector,
-        the measure read-out and GPS conversion — must come back through
-        here, or it is wrong by the georeference rotation ``theta``.
-        A no-op in the world-up scene, where scene *is* world."""
+        Every mouse position arrives in scene coordinates. Anything read
+        back out of the view — the published manual target above all, but
+        also the inspector, the measure read-out and GPS conversion — must
+        come back through here."""
         fit = self._store.geo.fit
-        if self._enu_scene and fit is not None:
+        if fit is not None:
             return fit.enu_to_world(sx, sy)
         return sx, sy
 
     def _scene_points(self, xy) -> np.ndarray:
-        if not (self._enu_scene and self._store.geo.fit is not None) or len(xy) == 0:
-            return xy
         fit = self._store.geo.fit
-        c, s = math.cos(-fit.theta), math.sin(-fit.theta)
-        dx = xy[:, 0] - fit.tx
-        dy = xy[:, 1] - fit.ty
+        if fit is None or len(xy) == 0:
+            return xy
         out = np.empty_like(xy[:, 0:2])
-        out[:, 0] = c * dx - s * dy
-        out[:, 1] = s * dx + c * dy
+        out[:, 0] = xy[:, 0] + fit.tx
+        out[:, 1] = xy[:, 1] + fit.ty
         return out
 
     def _scene_heading(self, world_yaw: float) -> float:
-        """Glyph heading in scene axes.
+        """Glyph heading in scene (ENU) axes.
 
-        Priority: the absolute true heading from the store
-        (``robot_true_heading()`` — compass first, georef offset otherwise).
-        In the ENU scene that true heading (CCW from east) is already the
-        scene heading. In the world-up scene (before georeferencing) the
-        scene axes are the launch-zeroed world frame, so a TRUE heading is
-        rotated back by the georef ``theta`` when a fit exists; without any
-        fit there is no absolute reference and we fall back to the raw yaw."""
+        ``robot_true_heading()`` — compass first, else the odom yaw, which is
+        absolute ENU on both the real boat and the simulator — IS the scene
+        heading; no correction is applied."""
         true_h = self._store.robot_true_heading()
-        fit = self._store.geo.fit
-        if self._enu_scene and fit is not None:
-            if true_h is not None:
-                return true_h
-            return fit.world_yaw_to_true(world_yaw)
-        # world-up scene
-        if true_h is not None and fit is not None:
-            a = true_h - fit.theta
-            return math.atan2(math.sin(a), math.cos(a))
         return true_h if true_h is not None else world_yaw
-
-    def _update_scene_mode(self) -> None:
-        """Enable the ENU scene once heading is aligned; keep the current
-        framing (recentre on the robot / view centre) across the switch."""
-        geo = self._store.geo
-        want = geo.fit is not None and geo.heading_aligned
-        if want == self._enu_scene:
-            return
-        centre_world = None
-        r = self._store.robot
-        if r.has_odom:
-            centre_world = (r.x, r.y)
-        self._enu_scene = want
-        if centre_world is not None:
-            sx, sy = self._to_scene(*centre_world)
-            self.centerOn(sx, sy)
-        # Anything holding a bare scene coordinate is stale the moment the
-        # regime changes: an in-progress measurement and the inspector dot
-        # are the two that are placed once and never refreshed.
-        if self._measure_start is not None:
-            self._clear_measurement()
-        self.click_marker.setVisible(False)
-        self.viewport().update()
 
     # ================================================================ refresh
     def refresh(self) -> None:
-        """Called at the UI tick (10 Hz): pull the store, update items."""
+        """Called at the UI tick (10 Hz): pull the store, update items.
+
+        The single gate: nothing is drawn until the map frame is anchored
+        (``store.map_frame_ready()`` — GPS translation on real water,
+        immediately in simulation). Sequencing at anchor time is thereby
+        fix -> tiles -> glyph -> overlays, all in the first ready tick."""
         store = self._store
         robot = store.robot
+
+        ready = store.map_frame_ready()
+        self._waiting_label.setVisible(not ready)
+        if not ready:
+            self._waiting_label.adjustSize()
+            self._waiting_label.move(
+                (self.width() - self._waiting_label.width()) // 2, 12)
+            for item in (self.robot_item, self.robot_track, self.pinger_track,
+                         self.mission_path, self.predicted_path,
+                         self.target_line, self.pinger_marker,
+                         self.manual_marker, self.click_marker):
+                item.setVisible(False)
+            self.tiles.update_view(
+                None,
+                self.mapToScene(self.viewport().rect()).boundingRect(),
+                self._px_per_m(),
+            )
+            return
+        # Layer-visibility intent is owned by the checkboxes; restore what
+        # the gate hid (data-gated items are re-decided below each tick).
+        self.robot_item.setVisible(True)
+        self.robot_track.setVisible(self._robot_track_enabled)
+        self.pinger_track.setVisible(self._pinger_track_enabled)
+        self.mission_path.setVisible(self._mission_path_enabled)
+        self.target_line.setVisible(self._target_line_enabled)
 
         # Time window (absolute)
         if self._window is None:
@@ -309,8 +337,6 @@ class MapView(QGraphicsView):
         else:
             t0 = store.t0 + self._window[0]
             t1 = store.t0 + self._window[1]
-
-        self._update_scene_mode()
 
         max_pts = self._cfg.map.trajectory_max_points_drawn
         _, xy = store.robot_track.decimated_window(t0, t1, max_pts)
@@ -333,8 +359,10 @@ class MapView(QGraphicsView):
         if has_pinger:
             self.pinger_marker.set_world_pos(*self._to_scene(*self._store.pinger.world))
 
-        if store.mission_path is not None and store.world_frame_ready():
+        if store.mission_path is not None:
             self.mission_path.set_points(self._scene_points(store.mission_path[:, 0:2]))
+        else:
+            self.mission_path.set_points(np.empty((0, 2)))
 
         target = store.active_target_world()
         if target is not None and robot.has_odom:
@@ -345,11 +373,11 @@ class MapView(QGraphicsView):
             self.target_line.setLine(0, 0, 0, 0)
 
         self._refresh_manual_target()
+        # Tiles need a GPS anchor; in simulation fit is None and they stay off.
         self.tiles.update_view(
             store.geo.fit if store.geo.is_valid else None,
             self.mapToScene(self.viewport().rect()).boundingRect(),
             self._px_per_m(),
-            enu_scene=self._enu_scene,
         )
         if self._grid_visible:
             self.viewport().update()
@@ -358,12 +386,15 @@ class MapView(QGraphicsView):
         store = self._store
         mt = store.mission.manual_target
         if mt is None or not store.robot.has_odom:
+            self.manual_marker.setVisible(False)
             self.predicted_path.setPath(self.predicted_path.path().__class__())
             return
-        # Re-placed every tick, not only at click time: the manual target is
-        # the one item whose position would otherwise be stranded in the old
-        # frame if the scene switches to ENU while it is active.
+        # Re-placed every tick from the stored WORLD value, so the crosshair
+        # tracks the live anchor and survives having been hidden by the
+        # pre-anchor gate.
         self.manual_marker.set_world_pos(*self._to_scene(*mt))
+        self.manual_marker.setVisible(True)
+        self.predicted_path.setVisible(True)
         pts = predict_los_path(
             (store.robot.x, store.robot.y, store.robot.yaw), mt, self._cfg.los)
         self.predicted_path.set_points(self._scene_points(np.asarray(pts))
@@ -385,8 +416,8 @@ class MapView(QGraphicsView):
         super().drawBackground(painter, rect)
         if not self._grid_visible:
             return
-        # The scene is axis-aligned (world-up before alignment, ENU/north-up
-        # after), so a normal scene-space grid is already screen-aligned.
+        # The scene is axis-aligned ENU (north-up, always), so a normal
+        # scene-space grid is already screen-aligned.
         self._grid_spacing = draw_grid(painter, rect, self._px_per_m(),
                                        high_contrast=self.tiles.enabled)
 
@@ -396,7 +427,7 @@ class MapView(QGraphicsView):
             draw_scale_bar(painter, self.viewport().width(),
                            self.viewport().height(), self._px_per_m(),
                            getattr(self, "_grid_spacing", 0.0))
-        draw_north_indicator(painter, self.viewport().width(), self._enu_scene)
+        draw_north_indicator(painter, self.viewport().width(), True)
 
     def _px_per_m(self) -> float:
         # The view is never rotated (north-up fixed), so the horizontal
@@ -405,9 +436,8 @@ class MapView(QGraphicsView):
 
     @property
     def north_up(self) -> bool:
-        """True when the scene is ENU (map north-up and geographically
-        oriented). Before heading alignment the map is world-up."""
-        return self._enu_scene
+        """Always True: the scene is ENU by construction and never rotates."""
+        return True
 
     # ============================================================= map tools
     def zoom_in(self) -> None:
@@ -453,10 +483,16 @@ class MapView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             scene_pt = self.mapToScene(event.position().toPoint())
             if self._mode is MapMode.MANUAL_TARGET:
+                if not self._store.map_frame_ready():
+                    # Refuse: without the GPS anchor a click cannot be
+                    # converted to the robot's world frame.
+                    self.point_inspected.emit(
+                        "manual target unavailable — waiting for GPS fix")
+                    return
                 # target_clicked carries WORLD: /blueboat/manual_target is a
                 # world-frame topic and master_control does its own frame
                 # conversion, so the scene point is inverted here, once, at
-                # the view boundary.
+                # the view boundary (pure translation, EN - t).
                 self.target_clicked.emit(*self._to_world(scene_pt.x(), scene_pt.y()))
                 return
             if self._mode is MapMode.MEASURE:
@@ -482,8 +518,10 @@ class MapView(QGraphicsView):
         if store.geo.is_valid and store.geo.fit is not None:
             lat, lon = store.geo.fit.world_to_latlon(x, y)
             parts.append(f"GPS {lat:.6f}°, {lon:.6f}°")
+        elif store.mission.simulation:
+            parts.append("GPS n/a (simulation)")
         else:
-            parts.append("GPS n/a (georeference not established)")
+            parts.append("GPS n/a (waiting for fix)")
         if store.robot.has_odom:
             d = math.hypot(x - store.robot.x, y - store.robot.y)
             parts.append(f"robot ↔ point {d:.2f} m")

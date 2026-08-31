@@ -355,10 +355,10 @@ class MissionModel(QObject):
         sampled point) lands on world (0, 0) and the initial tangent
         *angle* lands on +x.
 
-        Rationale: the robot's world frame is zeroed at launch (origin =
-        boat position, +x = boat heading), so an aligned mission always
-        starts at the boat and begins by moving forward — identically in
-        simulation and on the real robot. Locked waypoints are transformed
+        Rationale: the robot's world frame is local ENU (origin = launch
+        position, +x = EAST), so an aligned mission always starts at the
+        launch point heading east — identically in simulation and on the
+        real robot. Locked waypoints are transformed
         too: locks protect against editing mistakes, and a whole-mission
         rigid transform is not one. Segment interpolation parameters are
         chord-relative and therefore invariant under this transform."""

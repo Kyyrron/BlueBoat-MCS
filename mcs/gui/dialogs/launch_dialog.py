@@ -205,9 +205,9 @@ class LaunchDialog(QDialog):
         realigned (the boat turns toward it instead), so it is exempt from
         the start-alignment check -- the same exemption
         DesignerWindow._maybe_offer_alignment makes. Everything else is
-        checked against its own samples, because the world frame is zeroed
-        at launch and a mission that does not start at (0,0) along +x makes
-        the boat cut across to its start first.
+        checked against its own samples: the world frame is local ENU
+        (origin = launch point, +x = east), so a mission that does not
+        start at (0,0) along +x makes the boat cut across to its start.
 
         Informational only: the launch path never rewrites a mission file.
         """
@@ -219,10 +219,12 @@ class LaunchDialog(QDialog):
                 path, cfg.designer.start_align_tol_m,
                 cfg.designer.start_align_tol_deg) is not None:
             return (" (not start-aligned)",
-                    ("This mission does not start at (0,0) along +x. The world "
-                     "frame is zeroed at the boat every launch, so the boat "
-                     "will first cut across to the mission start.\n"
-                     "Fix it with Edit \u25b8 Align to Start in the Survey "
+                    ("This mission does not start at (0,0) heading east "
+                     "(+x). The world frame is local ENU with its origin at "
+                     "the launch point, so the boat will first cut across "
+                     "to the mission start.\n"
+                     "For real water, prefer a GPS-anchored mission; "
+                     "otherwise use Edit \u25b8 Align to Start in the Survey "
                      "Pattern Designer."))
         return ("", "")
 
