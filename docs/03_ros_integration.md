@@ -197,6 +197,17 @@ built there — nothing is copied from this repo (`CLAUDE.md` §6, §3 N9).
 4. Cosmetic: `robot_interface` publishes monitoring on
    `blueboat/monitoring_data` (relative) while `master_control` uses the
    global `/monitoring_data` — the station follows `master_control`.
+5. **MPC on `fsin` orbits — expected from the current construction, not a
+   station bug (2026-09-01).** Observed on the station map: under MPC on the
+   `fsin` trajectory the boat locks into a perfect circle near the start
+   while the reference runs ahead (live-distance plot oscillating at the
+   loop period, growing). The `fsin` reference itself is a chain of
+   near-closed ~2 m loops (364.75° heading swing per half-cycle), and the
+   MPC's cost/governor combination settles into a self-orbit once displaced.
+   Full mechanism and the sim-only remedies:
+   `BlueBoat-Control/blueboat_control/src/CONTROLLERS.md` finding **C10**
+   and that module's `TODO.md` §0.3. Nothing to compensate in the station —
+   the map is displaying the truth.
 
 **Path-following speed.** The old "LoS crawls in path-following mode" analysis
 that used to sit here is superseded: path following now uses `los_guidance()`

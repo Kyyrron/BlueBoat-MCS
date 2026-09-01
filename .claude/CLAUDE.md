@@ -394,12 +394,12 @@ this only with new evidence, not from scratch.
 `smoke_test.py` is a linear script — not a test framework — that imports every
 module, builds the full window offscreen and drives synthetic telemetry through
 the `SignalBus`.
-It prints seventeen checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
+It prints nineteen checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
 `sim gps model ok`, `LoS predictor ok`, `start alignment ok`, `designer ok`,
 `deploy guard ok`, `launch dialog sim-gps ok`, `store ok`, `stats ok`,
 `pinger anchor ok`, `map frame ok`, `sentinel ok`, `georef reset ok`,
-`safe shutdown ok`, `window ok`, `SMOKE TEST PASSED`) and aborts on the first
-failed assertion. It passes on this tree, exit status 0, and runs identically
+`safe shutdown ok`, `path preview ok`, `launch crash ok`, `window ok`,
+`SMOKE TEST PASSED`) and aborts on the first failed assertion. It passes on this tree, exit status 0, and runs identically
 across all three environment shapes: no `rclpy` (GUI-only); `rclpy` importable
 but the overlay unsourced, so `blueboat_interfaces` is missing and the bridge
 node comes up with its `/path_request` client disabled; and a fully sourced
@@ -430,7 +430,18 @@ anchored mission takes the deferred-deploy branch with `gps_simulated` and
 a bounded random `spawn_yaw:=` (and that non-anchored/real launches are
 untouched); the map-frame block's 0c section asserts the anchor gate holds
 in GPS-sim until synthetic fixes arrive; `georef reset ok` proves every
-launch starts from a fresh georeferencer. `designer ok` covers the Qt-free designer
+launch starts from a fresh georeferencer. `path preview ok` covers the
+/path_request lifecycle at both ends: GUI side (the tick issues the pending
+request, a failure re-arms it bounded and spaced, mission end cancels and
+clears the retry state, a deferred-GPS launch leaves the preview to the
+deployment poll) and bridge side, on the real `_poll_path_future` code with
+the ROS machinery stubbed (a hung in-flight call is dropped at
+`path_request_timeout_s` instead of blocking every later request for the
+session, an empty path is a failure rather than a silent blank map, cancel
+suppresses even a completed reply from a dead run). `launch crash ok` proves
+a launch process that dies on its own returns the manager to `idle` (the
+exit watch started by `start()`), instead of wedging the Launch button
+forever. `designer ok` covers the Qt-free designer
 layer — sampling invariants, the save/load/resample round trip, every stock
 pattern and interpolation from its own `schema` defaults, and both extension
 registries.

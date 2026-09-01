@@ -142,8 +142,7 @@ class MainWindow(QMainWindow):
         bus.controller_ready_received.connect(store.on_controller_ready)
         bus.param_mode_received.connect(store.on_param_mode)
         bus.mission_path_received.connect(store.on_mission_path)
-        bus.mission_path_failed.connect(
-            lambda err: self._status.showMessage(f"Path request failed: {err}", 5000))
+        bus.mission_path_failed.connect(self._on_mission_path_failed)
 
         # Diagnostics / logs.
         # Each message is fanned out from ONE signal to BOTH sinks — the GUI
@@ -255,10 +254,18 @@ class MainWindow(QMainWindow):
         # Sim_launch.py always starts path_generation; the real launch only
         # does so with a controller and use_pinger:=False.
 
-        # if params.simulation or (params.controller_type and not params.use_pinger):
-        #     QTimer.singleShot(
-        #         3000, lambda: self._request_path_preview(params.trajectory))
-        self._pending_preview_trajectory = params.trajectory
+        self._preview_retries_left = self.cfg.launch.path_request_max_retries
+        self._last_preview_trajectory = None
+        # For a mission with deferred GPS deployment, params.trajectory points
+        # at the DEPLOYED file, which _start_gps_deployment is about to unlink
+        # — requesting it now would preview a stale/absent file. The
+        # deployment poll requests the preview itself once the file is
+        # written; everything else previews via the pending/tick mechanism
+        # (gated on map_frame_ready).
+        deployment_pending = bool(params.gps_anchored_source) and not (
+            params.simulation and not params.gps_simulated)
+        self._pending_preview_trajectory = (
+            None if deployment_pending else params.trajectory)
         self._start_gps_deployment(params)
 
     # ========================================================= simulated GPS
@@ -376,6 +383,7 @@ class MainWindow(QMainWindow):
         custom missions are previewed completely instead of being cut at the
         legacy 120 s limit.
         """
+        self._last_preview_trajectory = trajectory  # retry target on failure
         total = self.cfg.launch.path_preview_total_time_s
         if trajectory.startswith("from_yaml:"):
             try:
@@ -384,9 +392,36 @@ class MainWindow(QMainWindow):
                     Path(trajectory.partition(":")[2]).read_text()) or {}
                 total = float(data.get("duration_s", total)) + 1.0
             except Exception as exc:  # noqa: BLE001 - preview is best-effort
-                _LOG.warning("Could not read YAML duration: %s", exc)
+                _LOG.warning("Could not read YAML duration (falling back to "
+                             "the %.0f s horizon): %s", total, exc)
         self.commands.request_mission_path(
             total_time=total, dt=self.cfg.launch.path_preview_dt_s)
+
+    def _on_mission_path_failed(self, err: str) -> None:
+        """One failed/timed-out /path_request must not mean 'no path ever':
+        re-arm the pending preview (bounded, spaced) while the mission runs."""
+        retries = getattr(self, "_preview_retries_left", 0)
+        trajectory = getattr(self, "_last_preview_trajectory", None)
+        if (trajectory is not None and retries > 0
+                and self.store.mission.launch_running):
+            self._preview_retries_left = retries - 1
+            _LOG.warning("path preview failed (%s) — retrying, %d attempt(s) "
+                         "left", err, retries)
+            self._status.showMessage(
+                f"Path request failed ({err}) — retrying…", 5000)
+            delay_ms = int(self.cfg.launch.path_request_retry_delay_s * 1000)
+            QTimer.singleShot(
+                delay_ms, lambda t=trajectory: self._rearm_path_preview(t))
+            return
+        _LOG.error("path preview failed: %s", err)
+        self._status.showMessage(
+            f"Path request failed: {err} — mission path preview unavailable.",
+            30000)
+        self.bus.launch_output.emit(f"[station] path preview failed: {err}")
+
+    def _rearm_path_preview(self, trajectory: str) -> None:
+        if self.store.mission.launch_running:
+            self._pending_preview_trajectory = trajectory
 
     def _on_mission_stopped(self) -> None:
         pass  # state cleared on 'idle' launch_state
@@ -399,9 +434,14 @@ class MainWindow(QMainWindow):
             self.store.mission.gps_simulated = False
             self.commands.disarm_sim_gps()
             # A finished run's path must not survive onto the next mission's
-            # map (it would silently re-anchor with the next run's frame).
+            # map (it would silently re-anchor with the next run's frame) —
+            # and neither must a request left in flight by the dead run's
+            # path_generation poison the next mission's preview.
             self.store.mission_path = None
             self._pending_preview_trajectory = None
+            self._last_preview_trajectory = None
+            self._preview_retries_left = 0
+            self.commands.cancel_mission_path_request()
             self.commands.set_simulation_mode(False)
             self.map_view.clear_manual_target()
             self.toolbar.set_manual_target_active(False)

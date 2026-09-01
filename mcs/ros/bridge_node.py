@@ -155,9 +155,14 @@ class BridgeNode(Node):
             bus.ros_log.emit(
                 "blueboat_interfaces not available — mission path display disabled."
             )
+        # _path_future / _path_issued_t are touched by the ROS thread only;
+        # the GUI thread communicates through _path_request_args and
+        # _path_cancel under the lock.
         self._path_future = None
+        self._path_issued_t = 0.0
         self._path_pending_lock = threading.Lock()
         self._path_request_args: tuple[float, float] | None = None
+        self._path_cancel = False
 
         # ---- Housekeeping timer (runs in the ROS thread) --------------------
         self.create_timer(cfg.diagnostics.update_period_s, self._emit_stats)
@@ -297,43 +302,72 @@ class BridgeNode(Node):
         with self._path_pending_lock:
             self._path_request_args = (total_time, dt)
 
+    def cancel_mission_path_request(self) -> None:
+        """Drop any pending or in-flight path request (the mission ended).
+
+        Thread-safe: the GUI thread only raises a flag; the ROS-thread poll
+        timer does the future teardown, so ``_path_future`` stays owned by
+        one thread. Without this, a request left in flight by a dying
+        ``path_generation`` would block every later request forever."""
+        with self._path_pending_lock:
+            self._path_request_args = None
+            self._path_cancel = True
+
     def _poll_path_future(self) -> None:
         """ROS-thread timer: issue pending requests, harvest completed ones."""
         if self._path_client is None:
             return
-        # Harvest
-        if self._path_future is not None and self._path_future.done():
-            future, self._path_future = self._path_future, None
-            try:
-                result = future.result()
-            except Exception as exc:  # noqa: BLE001
-                self._bus.mission_path_failed.emit(str(exc))
-                return
-            poses = []
-            for ps in result.path.poses:
-                q = ps.pose.orientation
-                yaw = float(np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
-                                       1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
-                poses.append((ps.pose.position.x, ps.pose.position.y, yaw))
-            self._bus.mission_path_received.emit(poses)
+        with self._path_pending_lock:
+            cancel, self._path_cancel = self._path_cancel, False
+        if cancel:
+            if self._path_future is not None:
+                self._path_future.cancel()
+                self._path_future = None
+            return  # even a completed reply belongs to the ended mission
+        # Harvest — or time out — the in-flight request
+        if self._path_future is not None:
+            if self._path_future.done():
+                future, self._path_future = self._path_future, None
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    self._bus.mission_path_failed.emit(str(exc))
+                    return
+                poses = []
+                for ps in result.path.poses:
+                    q = ps.pose.orientation
+                    yaw = float(np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
+                                           1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+                    poses.append((ps.pose.position.x, ps.pose.position.y, yaw))
+                if not poses:
+                    self._bus.mission_path_failed.emit(
+                        "path service returned an empty path")
+                    return
+                self._bus.mission_path_received.emit(poses)
+            elif (time.monotonic() - self._path_issued_t
+                    > self._cfg.launch.path_request_timeout_s):
+                # A hung call — path_generation died mid-request — must not
+                # block every later request for the rest of the session.
+                self._path_future.cancel()
+                self._path_future = None
+                self._bus.mission_path_failed.emit(
+                    "no reply within "
+                    f"{self._cfg.launch.path_request_timeout_s:.0f} s")
             return
-        # Issue
+        # Issue. The pending args stay queued until the request can actually
+        # go out, so a newer GUI request always overwrites an older one.
+        if not self._path_client.service_is_ready():
+            return
         with self._path_pending_lock:
             args, self._path_request_args = self._path_request_args, None
-        if args is None or self._path_future is not None:
-            if args is not None:  # a request was pending while another ran
-                with self._path_pending_lock:
-                    self._path_request_args = args
-            return
-        if not self._path_client.service_is_ready():
-            with self._path_pending_lock:  # retry on next poll
-                self._path_request_args = args
+        if args is None:
             return
         total_time, dt = args
         request = RequestPath.Request()
         n = int(total_time / dt) + 1
         request.path_request.data = np.linspace(0.0, total_time, n, dtype=float)
         self._path_future = self._path_client.call_async(request)
+        self._path_issued_t = time.monotonic()
 
     # ------------------------------------------------------------ statistics
     def _emit_stats(self) -> None:

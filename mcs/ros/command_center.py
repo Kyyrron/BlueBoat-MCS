@@ -136,6 +136,13 @@ class CommandCenter(QObject):
         if node:
             node.request_mission_path(total_time, dt)
 
+    def cancel_mission_path_request(self) -> None:
+        """Drop any pending/in-flight /path_request. Silent when ROS is down —
+        this is idle-path cleanup and must never complain during shutdown."""
+        node = self._ros.node
+        if node is not None:
+            node.cancel_mission_path_request()
+
     def arm_sim_gps(self, model) -> None:
         """Point the bridge's simulated-GPS timer at a SimGpsModel."""
         node = self._node()

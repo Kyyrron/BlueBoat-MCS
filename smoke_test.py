@@ -936,6 +936,193 @@ assert len(_es_done) == 1
 _es_ros.node = _es_node
 print("safe shutdown ok")
 
+# --- Path preview: one failed /path_request must never be terminal ---
+# The preview used to have exactly one shot: a failure (or a request left
+# hanging by a dying path_generation) meant no mission path for the rest of
+# the app session. Asserted here: the tick issues the pending request, a
+# failure re-arms it (bounded, spaced), retries stop when exhausted, a
+# deferred-GPS launch leaves the preview to the deployment poll (the
+# trajectory argument points at a file that was just unlinked), and mission
+# end cancels whatever the bridge still holds.
+
+
+class _PathNode:
+    def __init__(self):
+        self.requests: list[tuple[float, float]] = []
+        self.cancels = 0
+
+    def request_mission_path(self, total_time: float, dt: float) -> None:
+        self.requests.append((total_time, dt))
+
+    def cancel_mission_path_request(self) -> None:
+        self.cancels += 1
+
+    def set_sim_gps(self, model) -> None:  # disarm call on every launch
+        pass
+
+
+_pv_node = _PathNode()
+_pv_saved_node = w.ros.node
+_pv_saved_delay = cfg.launch.path_request_retry_delay_s
+w.ros.node = _pv_node
+cfg.launch.path_request_retry_delay_s = 0.02
+try:
+    w._on_mission_launched(_LP(simulation=True, controller_type="MPC",
+                               trajectory="circle"))
+    assert w._pending_preview_trajectory == "circle"
+    assert w.store.map_frame_ready()      # non-GPS sim: identity anchor
+    w._on_tick()
+    assert w._pending_preview_trajectory is None
+    assert len(_pv_node.requests) == 1, _pv_node.requests
+    assert w._last_preview_trajectory == "circle"
+
+    # A failure re-arms the pending preview; a tick then re-requests. (The
+    # window's own 10 Hz tick also runs under _pump, so assert on the
+    # request count, which is tick-source-agnostic.)
+    w.bus.mission_path_failed.emit("synthetic failure")
+    assert w._preview_retries_left == cfg.launch.path_request_max_retries - 1
+    assert _pump(lambda: len(_pv_node.requests) >= 2, 2.0), \
+        "failure did not re-arm the preview"
+    w._on_tick()
+    assert len(_pv_node.requests) == 2, _pv_node.requests
+
+    # Bounded: with no retries left a failure must NOT re-arm/re-request.
+    w._preview_retries_left = 0
+    w.bus.mission_path_failed.emit("synthetic failure")
+    assert not _pump(lambda: len(_pv_node.requests) > 2, 0.2), _pv_node.requests
+    assert w._pending_preview_trajectory is None
+
+    # Mission end drops the bridge's pending/in-flight request and the
+    # retry target — a dead run's request cannot poison the next mission.
+    w._on_launch_state("idle")
+    assert _pv_node.cancels == 1
+    assert w._last_preview_trajectory is None
+    assert w._preview_retries_left == 0
+
+    # Deferred-GPS launch: params.trajectory names the DEPLOYED file, which
+    # the launch just unlinked — the tick path must not preview it; the
+    # deployment poll owns the request once the file exists.
+    _pv_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_pv_"))
+    try:
+        _pv_src = _pv_dir / "design.yaml"
+        _pv_src.write_text("format: blueboat_trajectory/1\n")
+        _pv_dst = _pv_dir / ".deployed" / "design.yaml"
+        _pv_dst.parent.mkdir()
+        w._on_mission_launched(_LP(
+            simulation=False, controller_type="LoS",
+            trajectory=f"from_yaml:{_pv_dst}",
+            gps_anchored_source=str(_pv_src),
+            gps_deployed_target=str(_pv_dst)))
+        assert w._pending_preview_trajectory is None
+        _n = len(_pv_node.requests)
+        w._on_tick()
+        assert len(_pv_node.requests) == _n, "deferred launch must not request"
+        w._on_launch_state("idle")
+    finally:
+        shutil.rmtree(_pv_dir, ignore_errors=True)
+finally:
+    w.ros.node = _pv_saved_node
+    cfg.launch.path_request_retry_delay_s = _pv_saved_delay
+    w._stop_gps_deployment()
+
+# Bridge-side request lifecycle, exercised on the REAL _poll_path_future code
+# with the ROS machinery stubbed out (env-independent: no rclpy needed).
+import threading as _threading
+from types import SimpleNamespace as _NS
+
+from mcs.ros.bridge_node import BridgeNode as _BridgeNode
+
+
+class _FakeFuture:
+    def __init__(self, result=None):
+        self._result = result
+        self.cancelled = False
+
+    def done(self) -> bool:
+        return self._result is not None
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def result(self):
+        return self._result
+
+
+_bb = _BridgeNode.__new__(_BridgeNode)   # path-service state only, no super()
+_bb._cfg = cfg
+_bb._bus = SignalBus()
+_bb._path_client = _NS(service_is_ready=lambda: False)
+_bb._path_pending_lock = _threading.Lock()
+_bb._path_request_args = None
+_bb._path_cancel = False
+_bb._path_future = None
+_bb._path_issued_t = 0.0
+_bb_fails: list[str] = []
+_bb_paths: list = []
+_bb._bus.mission_path_failed.connect(_bb_fails.append)
+_bb._bus.mission_path_received.connect(_bb_paths.append)
+
+# (1) A hung in-flight call is dropped at the deadline — it no longer blocks
+# every later request for the rest of the session.
+_bb._path_future = _f = _FakeFuture()
+_bb._path_issued_t = time.monotonic() - cfg.launch.path_request_timeout_s - 1.0
+_bb._poll_path_future()
+app.processEvents()
+assert _bb._path_future is None and _f.cancelled
+assert _bb_fails and "no reply" in _bb_fails[-1], _bb_fails
+
+# (2) An empty path is a FAILURE, not a silent blank map.
+_bb._path_future = _FakeFuture(result=_NS(path=_NS(poses=[])))
+_bb._poll_path_future()
+app.processEvents()
+assert _bb._path_future is None
+assert "empty" in _bb_fails[-1], _bb_fails
+
+# (3) A real reply still comes through as poses.
+_pose = _NS(pose=_NS(position=_NS(x=2.0, y=-1.0),
+                     orientation=_NS(w=1.0, x=0.0, y=0.0, z=0.0)))
+_bb._path_future = _FakeFuture(result=_NS(path=_NS(poses=[_pose])))
+_bb._poll_path_future()
+app.processEvents()
+assert _bb_paths and _bb_paths[-1][0][:2] == (2.0, -1.0), _bb_paths
+
+# (4) Cancel drops both the queued args and the in-flight future, and a
+# completed-but-cancelled reply is NOT delivered (it belongs to a dead run).
+_bb.request_mission_path(120.0, 0.5)
+_bb._path_future = _f2 = _FakeFuture(result=_NS(path=_NS(poses=[_pose])))
+_n_paths = len(_bb_paths)
+_bb.cancel_mission_path_request()
+_bb._poll_path_future()
+app.processEvents()
+assert _bb._path_future is None and _f2.cancelled
+assert _bb._path_request_args is None
+assert len(_bb_paths) == _n_paths
+print("path preview ok")
+
+# --- Crashed launch returns the state machine to 'idle' ---
+# A launch that died on its own used to leave the manager at
+# 'starting'/'running' forever: the Launch button stayed disabled and the
+# dead run's path was never cleared. The exit watch (started by start(),
+# reused by stop()) finalises it from the GUI thread.
+import subprocess as _subprocess
+
+from mcs.ros.launch_manager import LaunchManager as _LM
+
+_lm_bus = SignalBus()
+_lm_states: list[str] = []
+_lm_bus.launch_state_changed.connect(_lm_states.append)
+_lm = _LM(cfg, _lm_bus)
+_lm._proc = _subprocess.Popen(["sleep", "0.15"])
+_lm._set_state("running")
+_lm._watch_exit()
+_lm._watch_exit()                       # second call: no duplicate chain
+assert _lm.state == "running"           # process still alive
+assert _pump(lambda: _lm.state == "idle", 5.0), "crash never finalised"
+assert _lm._proc is None
+assert not _lm._exit_poll_active
+assert _lm_states[-1] == "idle"
+print("launch crash ok")
+
 w.close()
 print("window ok")
 print("SMOKE TEST PASSED")

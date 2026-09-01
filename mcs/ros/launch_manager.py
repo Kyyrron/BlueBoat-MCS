@@ -23,10 +23,11 @@ import signal
 import subprocess
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer
 
-from mcs.config.settings import AppConfig
+from mcs.config.settings import DEFAULT_CONFIG_DIR, AppConfig
 from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class LaunchManager(QObject):
         self._proc: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
         self._state = "idle"
+        self._exit_poll_active = False
         self.last_parameters: LaunchParameters | None = None
 
     # ------------------------------------------------------------------ API
@@ -129,11 +131,23 @@ class LaunchManager(QObject):
             *params.to_cli(),
         ]
         self._bus.launch_output.emit("$ " + " ".join(cmd))
+        # A stable working directory for the whole node tree: tools that
+        # resolve relative paths (acados codegen historically dropped
+        # acados_ocp.json + c_generated_code/ into whatever directory the
+        # station happened to be started from) land their artifacts in one
+        # known place — never this repository. The environment is inherited
+        # as-is: the station runs from a sourced shell.
+        launch_cwd = DEFAULT_CONFIG_DIR / "launch_cwd"
+        try:
+            launch_cwd.mkdir(parents=True, exist_ok=True)
+        except OSError:  # unwritable home: fall back to inheriting our cwd
+            launch_cwd = Path.cwd()
         try:
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                cwd=str(launch_cwd),
                 start_new_session=True,  # own process group -> group signalling
             )
         except FileNotFoundError:
@@ -149,6 +163,10 @@ class LaunchManager(QObject):
             target=self._pump_output, name="launch-output", daemon=True
         )
         self._reader.start()
+        # Watch for the process dying on its own (crash, bad launch argument):
+        # without this the state machine stayed at 'starting'/'running' forever
+        # and the Launch button never re-enabled.
+        self._watch_exit()
         return True
 
     def notify_running(self) -> None:
@@ -195,14 +213,23 @@ class LaunchManager(QObject):
                  + self._cfg.launch.sigterm_timeout_s) * 1000),
             lambda: escalate(signal.SIGKILL, "SIGKILL"),
         )
-        # Poll for exit without blocking the GUI thread.
-        self._poll_exit()
+        # Poll for exit without blocking the GUI thread (no-op if the watch
+        # started by start() is already running).
+        self._watch_exit()
 
     # ------------------------------------------------------------- internal
+    def _watch_exit(self) -> None:
+        """Begin the GUI-thread exit watch; at most one chain at a time."""
+        if self._exit_poll_active:
+            return
+        self._exit_poll_active = True
+        self._poll_exit()
+
     def _poll_exit(self) -> None:
         if self.running:
             QTimer.singleShot(200, self._poll_exit)
             return
+        self._exit_poll_active = False
         self._finalise()
 
     def _finalise(self) -> None:

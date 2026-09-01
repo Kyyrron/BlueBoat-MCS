@@ -110,6 +110,14 @@ class LaunchConfig:
     # duration_s overrides it automatically.
     path_preview_total_time_s: float = 120.0
     path_preview_dt_s: float = 0.5
+    # An in-flight /path_request with no reply after this long is dropped
+    # (path_generation died mid-call, e.g. Stop/E-STOP while requesting) —
+    # without the deadline the stuck future would block every later request
+    # for the rest of the app session. A dropped or failed request is
+    # re-armed up to max_retries times, spaced by retry_delay.
+    path_request_timeout_s: float = 10.0
+    path_request_max_retries: int = 3
+    path_request_retry_delay_s: float = 2.0
 
 
 @dataclass

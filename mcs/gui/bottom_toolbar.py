@@ -260,7 +260,7 @@ class BottomToolbar(QWidget):
     # ================================================================ feedback
     def _on_launch_state(self, state: str) -> None:
         led = {"idle": "never", "starting": "warn",
-               "running": "ok", "stopping": "warn"}[state]
+               "running": "ok", "stopping": "warn"}.get(state, "warn")
         self._launch_led.set_status(led)
         self.launch_button.setEnabled(state == "idle")
         self.stop_button.setEnabled(state in ("starting", "running"))
