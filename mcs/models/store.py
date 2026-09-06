@@ -90,6 +90,8 @@ class MissionState:
                                             # GPS pipeline — anchor gate, tiles,
                                             # deferred deploy — runs as on real water
     manual_target: tuple[float, float] | None = None
+    world_dir: str = ""                     # personalized world folder ("" = empty Gazebo)
+    sea_choice: object = None               # SeaChoice chosen at launch (sim only)
     started_t: float | None = None          # first odom after launch
     path_target: tuple[float, float] | None = None   # x_d, y_d from /monitoring_data
 
@@ -134,6 +136,7 @@ class DataStore:
         self.target_dist_hist = TimeSeries(dim=1)  # robot<->active-target distance
         self.mission_path: np.ndarray | None = None  # (n, 3) x, y, yaw
         self._t0: float | None = None             # experiment time origin
+        self.sea = None                           # SeaReadout | None (sim only)
 
     # -------------------------------------------------------------- updates
     def on_odom(self, t: float, pose, twist) -> None:
@@ -163,6 +166,13 @@ class DataStore:
         # robot's motion; it is now computed once per pinger message, with
         # the pose concurrent with that message (see on_pinger_body).
         self._record_target_distance(t)
+
+    def on_sea_state(self, t: float, payload: dict) -> None:
+        """Latest simulator sea state (``/sim/sea_state`` JSON)."""
+        from mcs.core.sea import parse_readback
+        r = parse_readback(payload, received_mono=t)
+        if r is not None:
+            self.sea = r
 
     def on_compass(self, t: float, heading_deg: float) -> None:
         """Absolute heading from /mavros/global_position/compass_hdg
@@ -345,3 +355,4 @@ class DataStore:
         self.robot.travelled_m = 0.0
         self.mission.started_t = None
         self._t0 = None
+        self.sea = None

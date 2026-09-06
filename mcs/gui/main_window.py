@@ -12,7 +12,7 @@ import logging
 import math
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QLabel,
@@ -32,6 +32,7 @@ from mcs.gui.left_panel import LeftPanel
 from mcs.gui.map.map_view import MapMode, MapView
 from mcs.gui.mission_stats import FloatingStatsBox
 from mcs.gui.right_panel import RightPanel
+from mcs.gui.sea_state_box import FloatingSeaBox
 from mcs.models.store import DataStore
 from mcs.ros.command_center import CommandCenter
 from mcs.ros.launch_manager import LaunchManager, LaunchParameters
@@ -82,6 +83,9 @@ class MainWindow(QMainWindow):
         # Floating Mission Stats Box (parented to the map_view so it floats without breaking the splitter)
         self.stats_box = FloatingStatsBox(self.store, self.map_view)
         self.right_panel.time_window_changed.connect(self.stats_box.refresh_stats)
+        # Floating Sea State box — mirror of the stats box, glued to the
+        # top-LEFT of the map view (i.e. right against the left panel).
+        self.sea_box = FloatingSeaBox(self.store, self.map_view)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -141,6 +145,7 @@ class MainWindow(QMainWindow):
         bus.thruster_received.connect(store.on_thruster)
         bus.controller_ready_received.connect(store.on_controller_ready)
         bus.param_mode_received.connect(store.on_param_mode)
+        bus.sea_state_received.connect(store.on_sea_state)
         bus.mission_path_received.connect(store.on_mission_path)
         bus.mission_path_failed.connect(self._on_mission_path_failed)
 
@@ -180,6 +185,7 @@ class MainWindow(QMainWindow):
         self.toolbar.measure_mode_changed.connect(self._on_measure_mode)
         self.toolbar.create_pattern_clicked.connect(self._open_designer)
         self.toolbar.mission_launched.connect(self._on_mission_launched)
+        self.sea_box.modify_sea_clicked.connect(self._on_modify_sea)
         self.toolbar.mission_stopped.connect(self._on_mission_stopped)
         bus.launch_state_changed.connect(self._on_launch_state)
 
@@ -204,6 +210,14 @@ class MainWindow(QMainWindow):
             if self.stats_box.pos().x() != expected_x or self.stats_box.pos().y() != expected_y:
                 self.stats_box.move(expected_x, expected_y)
                 self.stats_box.raise_()
+
+        # Sea state box: the mirror position, glued to the top-left of the map
+        # view. It hides itself outside a running simulation.
+        if hasattr(self, 'sea_box'):
+            self.sea_box.refresh()
+            if self.sea_box.pos() != QPoint(8, 8):
+                self.sea_box.move(8, 8)
+                self.sea_box.raise_()
 
         # Georeference status + satellite availability
         geo = self.store.geo
@@ -236,6 +250,8 @@ class MainWindow(QMainWindow):
         m.use_pinger = params.use_pinger
         m.simulation = params.simulation
         m.gps_simulated = params.gps_simulated
+        m.world_dir = params.world_dir
+        m.sea_choice = params.sea
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
         self.store.reset_experiment()
@@ -243,10 +259,20 @@ class MainWindow(QMainWindow):
         # origin — the previous run's odom<->GPS pairs are wrong by
         # construction, so the anchor must start fresh (real and sim alike).
         self.store.reset_georeference()
-        if params.gps_simulated:
+        # Personalized-world runs (world_dir set) get their GPS from the
+        # simulator's mavros shim, anchored on the world's own origin —
+        # arming the station's SimGps too would put a second publisher on
+        # the same topic with an arbitrary receiver origin and deploy the
+        # trajectory into the wrong frame relative to the world geometry.
+        if params.gps_simulated and not params.world_dir:
             self._arm_sim_gps(params)
         else:
             self.commands.disarm_sim_gps()
+            if params.world_dir:
+                self._status.showMessage(
+                    "Personalized world: GPS fixes come from the simulator's "
+                    "mavros shim — the path deploys into the world's own "
+                    "frame.", 10000)
         # Mission-path preview: the station asks the path_generation SERVICE
         # (/path_request) for the whole path — the same call path_publisher
         # makes, but direct, so it works identically on the real robot and
@@ -277,7 +303,9 @@ class MainWindow(QMainWindow):
         rotated into EN with exactly ``io_yaml.deploy_mission``'s
         convention). Arms the bridge's NavSatFix timer; the fixes then flow
         through the identical real-water pipeline (own subscription ->
-        diagnostics -> store -> anchor -> deferred deploy)."""
+        diagnostics -> store -> anchor -> deferred deploy). Never called for
+        a personalized-world run: there the simulator's mavros shim is the
+        one GPS publisher (see _on_mission_launched)."""
         from mcs.core.geo import local_en_to_latlon
         from mcs.core.sim_gps import SimGpsModel
         from mcs.designer import io_yaml
@@ -321,7 +349,9 @@ class MainWindow(QMainWindow):
         transitions onto the true-GPS path. Every waypoint therefore lands
         on its real-world GPS coordinates regardless of where the robot was
         switched on. Runs on real water and in GPS-simulated Gazebo runs
-        alike — only a sim without simulated GPS (non-anchored mission)
+        alike — empty Gazebo (station-synthesised fixes) and personalized
+        worlds (the simulator's mavros shim publishes the fixes) both take
+        this path; only a sim without simulated GPS (non-anchored mission)
         skips it."""
         self._stop_gps_deployment()
         if not params.gps_anchored_source or (
@@ -498,6 +528,28 @@ class MainWindow(QMainWindow):
         self.map_view.set_mode(MapMode.MEASURE if on else MapMode.NORMAL)
 
     # ================================================================ designer
+    def _on_modify_sea(self) -> None:
+        """Left panel 'Modify situation…': live sea-state change (sim)."""
+        from mcs.core.sea import SeaCatalog, SeaChoice, find_presets_file
+        from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
+        if not self.store.mission.simulation:
+            return
+        catalog = SeaCatalog.load(find_presets_file(self.cfg.sea.presets_file))
+        last = self.store.mission.sea_choice
+        dlg = SeaStateDialog(catalog, self.cfg.sea,
+                             last if isinstance(last, SeaChoice) else None,
+                             live=True, parent=self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        choice = dlg.choice()
+        if self.commands.send_sea_state(choice.command_json(dlg.ramp_s())):
+            self.store.mission.sea_choice = choice
+            self._status.showMessage(
+                f"Sea state command sent: {choice.summary(catalog)} "
+                f"(ramp {dlg.ramp_s():.0f} s)", 8000)
+        else:
+            self._status.showMessage("ROS is not running — sea state not sent", 8000)
+
     def _open_designer(self) -> None:
         """Open the Survey Pattern Designer (one shared, non-modal instance
         with live robot/pinger overlays and the station's georeference)."""

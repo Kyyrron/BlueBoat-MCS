@@ -18,6 +18,7 @@ bridge, mirroring the philosophy of QGroundControl's link layer.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -26,7 +27,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R  # same dependency as the stack
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, Float32MultiArray, Float64, String
@@ -128,10 +129,16 @@ class BridgeNode(Node):
             self.create_subscription(MavrosState, t.mavros_state, self._on_state, 10)
         else:
             bus.ros_log.emit("mavros_msgs not available — FCU state display disabled.")
+        # Simulator sea state: the node latches its status (TRANSIENT_LOCAL,
+        # depth 1) so a station started after the sim still gets the current
+        # situation immediately; the reader matches that durability.
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(String, t.sea_state, self._on_sea_state, latched)
 
         # ---- Publishers ----------------------------------------------------
         self._pub_input_str = self.create_publisher(String, t.input_str, 10)
         self._pub_manual_target = self.create_publisher(Float32MultiArray, t.manual_target, 10)
+        self._pub_sea_command = self.create_publisher(String, t.sea_state_command, 10)
 
         # ---- Simulated GPS (Gazebo runs of GPS-anchored missions) ----------
         # The station itself publishes NavSatFix on the real GPS topic, which
@@ -235,6 +242,15 @@ class BridgeNode(Node):
         t = self._mark(self._cfg.topics.controller_ready)
         self._bus.controller_ready_received.emit(t, bool(msg.data))
 
+    def _on_sea_state(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.sea_state)
+        try:
+            payload = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if isinstance(payload, dict):
+            self._bus.sea_state_received.emit(t, payload)
+
     def _on_param_mode(self, msg: String) -> None:
         t = self._mark(self._cfg.topics.param_mode)
         self._bus.param_mode_received.emit(t, str(msg.data))
@@ -257,6 +273,14 @@ class BridgeNode(Node):
         i.e. a publish will be delivered (and retransmitted if needed) by DDS.
         Thread-safe: rmw graph queries may be called from any thread."""
         return self._pub_input_str.get_subscription_count()
+
+    def publish_sea_state_command(self, payload: str) -> None:
+        """Publish a JSON command on /sim/sea_state/command (sim only)."""
+        with self._pub_lock:
+            msg = String()
+            msg.data = payload
+            self._pub_sea_command.publish(msg)
+        self._bus.command_sent.emit("sea_state/command ← " + payload[:60])
 
     def publish_manual_target(self, x: float, y: float) -> None:
         """Publish a manual target; (0, 0) resumes the original mission."""

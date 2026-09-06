@@ -28,6 +28,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QTimer
 
 from mcs.config.settings import DEFAULT_CONFIG_DIR, AppConfig
+from mcs.core.sea import SeaChoice
 from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
@@ -37,17 +38,23 @@ _LOG = logging.getLogger(__name__)
 class LaunchParameters:
     """Arguments of the selected launch file.
 
-    Two launch targets exist, with different declared arguments:
+    Three launch targets exist, with different declared arguments:
 
     * ``BlueBoat_launch.py`` (real robot): ``enable_motors``, ``note``,
       ``controller_type``, ``trajectory``, ``use_pinger``.
-    * ``Sim_launch.py`` (Gazebo): ``robot_file``, ``trajectory``,
+    * ``Sim_launch.py`` (empty Gazebo): ``robot_file``, ``trajectory``,
       ``controller_type``, ``data_dir``, ``spawn_yaw`` — it always starts
       ``master_control`` (so the controller must be non-empty) and never
       MAVROS / robot_interface / param_set / pinger nodes.
+    * ``blueboat_sss_sim full_mission_launch.py`` (personalized world,
+      selected when ``world_dir`` is set): ``world_dir``, ``with_control``,
+      ``trajectory_file``, ``controller_type`` — same control graph as
+      ``Sim_launch.py`` plus the simulated sonar and a mavros shim that
+      publishes the GPS fixes from the world's own anchor. It declares NO
+      ``robot_file``/``trajectory``/``spawn_yaw``.
 
     ``to_cli`` emits exactly the arguments the chosen file declares; passing
-    real-robot arguments to the simulation launch would abort it.
+    another target's arguments would abort ``ros2 launch``.
     ``spawn_yaw:=`` is emitted only when ``spawn_yaw_rad`` is set, before
     ``extra_args`` — so an operator ``spawn_yaw:=`` in Extra args overrides
     it (in ``ros2 launch`` the last occurrence wins).
@@ -69,13 +76,34 @@ class LaunchParameters:
     # feed itself and spawns the boat with this heading (radians ENU).
     gps_simulated: bool = False
     spawn_yaw_rad: float | None = None
+    # Personalized Gazebo world (blueboat_sss_sim full_mission_launch.py):
+    # absolute world folder, set by the post-launch world-choice dialog;
+    # "" = plain Sim_launch.py. In this mode the world's mavros shim owns
+    # the GPS feed and the station's SimGps is left disarmed.
+    world_dir: str = ""
+    # Sea state (current + waves) of a simulated run: ``sea_*`` arguments of
+    # full_mission_launch.py in world mode; in the empty Gazebo world
+    # (Sim_launch.py declares none) a companion sea_state_launch.py process
+    # carries them (LaunchManager.start). None / null = calm, no companion.
+    sea: SeaChoice | None = None
     extra_args: dict[str, str] = field(default_factory=dict)
+
+    def sea_args(self) -> list[str]:
+        return self.sea.launch_args() if (self.sea and not self.sea.is_null) else []
 
     def to_cli(self) -> list[str]:
         def b(v: bool) -> str:
             return "True" if v else "False"
 
-        if self.simulation:
+        if self.simulation and self.world_dir:
+            args = [
+                f"world_dir:={self.world_dir}",
+                "with_control:=true",
+                f"trajectory_file:={self.gps_deployed_target}",
+                f"controller_type:={self.controller_type}",
+                *self.sea_args(),          # before extra_args: an override wins
+            ]
+        elif self.simulation:
             args = [
                 f"robot_file:={self.robot_file}",
                 f"trajectory:={self.trajectory}",
@@ -97,6 +125,37 @@ class LaunchParameters:
         return args
 
 
+def companion_command(cfg, params: LaunchParameters) -> list[str] | None:
+    """The sea-state companion launch for the empty Gazebo world, or None.
+
+    ``Sim_launch.py`` (BlueBoat-Control) declares no ``sea_*`` argument, so
+    the sea state rides a second ``ros2 launch`` of the simulator's
+    ``sea_state_launch.py`` against the stock world name; a null choice
+    (no current, calm) starts nothing, keeping that path byte-identical to
+    today's. World mode needs no companion: ``full_mission_launch.py``
+    includes ``sea_state_launch.py`` itself. Module scope and Qt-free so
+    the smoke test can pin it."""
+    if not (params.simulation and not params.world_dir and params.sea
+            and not params.sea.is_null):
+        return None
+    return ["ros2", "launch", cfg.sea.companion_package,
+            cfg.sea.companion_launch_file,
+            f"world_name:={cfg.sea.stock_world_name}", *params.sea.launch_args()]
+
+
+def launch_target(cfg, params: LaunchParameters) -> tuple[str, str]:
+    """(package, launch file) for the given parameters.
+
+    Module-level and Qt-free so the smoke test can pin the three-way choice
+    without a LaunchManager. *cfg* is the ``LaunchConfig`` dataclass.
+    """
+    if params.simulation and params.world_dir:
+        return cfg.sim_world_package, cfg.sim_world_launch_file
+    if params.simulation:
+        return cfg.package, cfg.sim_launch_file
+    return cfg.package, cfg.launch_file
+
+
 class LaunchManager(QObject):
     """Owns the ``ros2 launch`` child process."""
 
@@ -105,9 +164,13 @@ class LaunchManager(QObject):
         self._cfg = cfg
         self._bus = bus
         self._proc: subprocess.Popen[bytes] | None = None
+        self._sea_proc: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
         self._state = "idle"
         self._exit_poll_active = False
+        # Pending SIGTERM/SIGKILL escalation, held so it can be disarmed the
+        # moment the tree exits rather than firing into the next launch.
+        self._escalation_timers: list[QTimer] = []
         self.last_parameters: LaunchParameters | None = None
 
     # ------------------------------------------------------------------ API
@@ -123,11 +186,10 @@ class LaunchManager(QObject):
         if self.running:
             self._bus.launch_output.emit("A mission is already running.")
             return False
-        launch_file = (self._cfg.launch.sim_launch_file if params.simulation
-                       else self._cfg.launch.launch_file)
+        package, launch_file = launch_target(self._cfg.launch, params)
         cmd = [
             "ros2", "launch",
-            self._cfg.launch.package, launch_file,
+            package, launch_file,
             *params.to_cli(),
         ]
         self._bus.launch_output.emit("$ " + " ".join(cmd))
@@ -163,11 +225,55 @@ class LaunchManager(QObject):
             target=self._pump_output, name="launch-output", daemon=True
         )
         self._reader.start()
+        self._start_companion(params, launch_cwd)
         # Watch for the process dying on its own (crash, bad launch argument):
         # without this the state machine stayed at 'starting'/'running' forever
         # and the Launch button never re-enabled.
         self._watch_exit()
         return True
+
+    def _start_companion(self, params: LaunchParameters, cwd: Path) -> None:
+        """Best effort: the sea-state companion never aborts a mission."""
+        cmd = companion_command(self._cfg, params)
+        if cmd is None:
+            return
+        self._bus.launch_output.emit("$ " + " ".join(cmd) + "   [sea]")
+        try:
+            self._sea_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=str(cwd), start_new_session=True)
+        except OSError as exc:
+            self._bus.launch_output.emit(
+                f"[sea] companion launch failed ({exc}); mission continues "
+                "without sea state")
+            self._sea_proc = None
+            return
+        threading.Thread(target=self._pump_companion, name="sea-output",
+                         daemon=True).start()
+
+    def _pump_companion(self) -> None:
+        proc = self._sea_proc
+        if proc is None or proc.stdout is None:
+            return
+        for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            if line:
+                self._bus.launch_output.emit("[sea] " + line)
+
+    def _signal_companion(self, sig: signal.Signals, proc=None) -> None:
+        """Signal the sea-state companion.
+
+        `proc` is passed explicitly by the escalation chain, which must act on
+        the companion it was started for and never on whatever happens to be in
+        `self._sea_proc` by the time it fires.
+        """
+        proc = self._sea_proc if proc is None else proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except ProcessLookupError:
+            pass
 
     def notify_running(self) -> None:
         """Promote 'starting' -> 'running' once telemetry says the graph is up.
@@ -190,13 +296,25 @@ class LaunchManager(QObject):
         self._set_state("stopping")
         pgid = os.getpgid(self._proc.pid)
         self._bus.launch_output.emit("Stopping mission (SIGINT to launch group)…")
+        self._signal_companion(signal.SIGINT)
         try:
             os.killpg(pgid, signal.SIGINT)
         except ProcessLookupError:
             self._finalise()
             return
 
+        # The escalation fires seconds later, and the Launch button re-enables
+        # the moment the state goes idle. Both lambdas therefore capture the
+        # process they were armed for: reading self._proc / self._sea_proc at
+        # fire time meant a relaunch inside the 12 s window killpg'd a recycled
+        # pgid and SIGTERM'd the NEW sea companion. They are also cancelled by
+        # _finalise() as soon as the tree is actually gone.
+        doomed, doomed_sea = self._proc, self._sea_proc
+
         def escalate(sig: signal.Signals, label: str) -> None:
+            if self._proc is not doomed:
+                return          # that launch is long gone; this is a later one
+            self._signal_companion(sig, doomed_sea)
             if self.running:
                 self._bus.launch_output.emit(f"Nodes still alive — sending {label}.")
                 try:
@@ -204,15 +322,17 @@ class LaunchManager(QObject):
                 except ProcessLookupError:
                     pass
 
-        QTimer.singleShot(
-            int(self._cfg.launch.sigint_timeout_s * 1000),
-            lambda: escalate(signal.SIGTERM, "SIGTERM"),
-        )
-        QTimer.singleShot(
-            int((self._cfg.launch.sigint_timeout_s
-                 + self._cfg.launch.sigterm_timeout_s) * 1000),
-            lambda: escalate(signal.SIGKILL, "SIGKILL"),
-        )
+        self._cancel_escalation()
+        for delay_s, sig, label in (
+                (self._cfg.launch.sigint_timeout_s, signal.SIGTERM, "SIGTERM"),
+                (self._cfg.launch.sigint_timeout_s
+                 + self._cfg.launch.sigterm_timeout_s, signal.SIGKILL, "SIGKILL")):
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(
+                lambda s=sig, lbl=label: escalate(s, lbl))
+            timer.start(int(delay_s * 1000))
+            self._escalation_timers.append(timer)
         # Poll for exit without blocking the GUI thread (no-op if the watch
         # started by start() is already running).
         self._watch_exit()
@@ -232,11 +352,21 @@ class LaunchManager(QObject):
         self._exit_poll_active = False
         self._finalise()
 
+    def _cancel_escalation(self) -> None:
+        """Disarm any pending SIGTERM/SIGKILL escalation."""
+        for timer in self._escalation_timers:
+            timer.stop()
+        self._escalation_timers.clear()
+
     def _finalise(self) -> None:
+        self._cancel_escalation()
         if self._proc is not None:
             code = self._proc.poll()
             self._bus.launch_output.emit(f"Mission process exited (code {code}).")
         self._proc = None
+        if self._sea_proc is not None:
+            self._signal_companion(signal.SIGTERM)
+            self._sea_proc = None
         self._set_state("idle")
 
     def _pump_output(self) -> None:

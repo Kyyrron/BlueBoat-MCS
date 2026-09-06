@@ -34,6 +34,8 @@ class SignalBus(QObject):
     controller_ready_received = Signal(float, bool)
     #: t_mono, mode string ('default' / 'override' / ...)
     param_mode_received = Signal(float, str)
+    #: t_mono, decoded /sim/sea_state JSON (simulator sea state; sim only)
+    sea_state_received = Signal(float, object)
 
     # ---- Mission path ----------------------------------------------------
     #: list[(x, y, yaw)] returned by the /path_request service

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QInputDialog,
@@ -34,16 +35,19 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSplitter,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core import worlds
 from mcs.core.geo import GeoFit
 from mcs.designer import io_yaml, patterns
 from mcs.designer.designer_map import DesignerMapView, EditMode
@@ -79,6 +83,12 @@ class DesignerWindow(QMainWindow):
         self._clipboard: list[dict] = []
         self._dirty = False
         self._manual_fit: GeoFit | None = None
+        # Gazebo world the anchor was taken from (Set GPS Origin ▸ From a
+        # Gazebo World): (world dir, parsed metadata). Transient window
+        # state — never on the model, never in undo, never in the saved
+        # runtime YAML; saving with it set copies the world folder for the
+        # new path (see _write).
+        self._world_ref: tuple[Path, dict] | None = None
 
         # ---- Central map + right column -----------------------------------
         self.map = DesignerMapView(cfg, self.model)
@@ -190,7 +200,15 @@ class DesignerWindow(QMainWindow):
         act(files, "Save", self._file_save, "Ctrl+S")
         act(files, "Save As…", self._file_save_as, "Ctrl+Shift+S")
         files.addSeparator()
-        act(files, "Set GPS Origin…", self._set_gps_origin)
+        gps_btn = QToolButton()
+        gps_btn.setText("Set GPS Origin…")
+        gps_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        gps_menu = QMenu(gps_btn)
+        gps_menu.addAction("Enter Coordinates…", self._set_gps_origin)
+        gps_menu.addAction("From a Gazebo World…",
+                           self._set_gps_origin_from_world)
+        gps_btn.setMenu(gps_menu)
+        files.addWidget(gps_btn)
         files.addSeparator()
         self._sat_box = QCheckBox("Satellite")
         self._sat_box.setEnabled(False)
@@ -578,6 +596,47 @@ class DesignerWindow(QMainWindow):
             f"GPS origin set: {latlon[0]:.6f}, {latlon[1]:.6f} — satellite "
             "layer available.", 6000)
 
+    def _set_gps_origin_from_world(self) -> None:
+        """Anchor the design frame on a generated Gazebo world.
+
+        The world's ``geo_anchor`` becomes the design origin (design frame
+        == the world's local frame) and its limit rectangle is drawn on the
+        map as a read-only reference. Saving then copies the world folder
+        for the new path (see :meth:`_write`). A world selected here is
+        deliberately kept even if the origin is later retyped — the copy's
+        provenance offset is recomputed from the anchor actually saved.
+        """
+        meta_file, _ = QFileDialog.getOpenFileName(
+            self, "Select a world (metadata.yaml)",
+            self._cfg.launch.worlds_root, "World metadata (metadata.yaml)")
+        if not meta_file:
+            return
+        mp = Path(meta_file)
+        meta = worlds.read_world_meta(mp) \
+            if mp.name == worlds.METADATA_NAME else None
+        if meta is None:
+            QMessageBox.warning(
+                self, "From a Gazebo World",
+                "Not a world metadata.yaml (expected format "
+                "'blueboat_world_meta/1' with geo_anchor and limits).")
+            return
+        anchor = meta["geo_anchor"]
+        # Design (0,0) := the world's origin; axes aligned with east/north.
+        self._manual_fit = GeoFit(tx=0.0, ty=0.0,
+                                  lat0=float(anchor["lat0"]),
+                                  lon0=float(anchor["lon0"]),
+                                  rms_m=0.0, n_pairs=0)
+        self._world_ref = (mp.parent, meta)
+        self.map.set_world_limits(
+            (meta.get("limits") or {}).get("corners_gps"),
+            f"{mp.parent.parent.name}/{mp.parent.name}")
+        self._update_geo_fit()
+        self._sat_box.setChecked(True)
+        self.map.centerOn(0.0, 0.0)
+        self.statusBar().showMessage(
+            f"GPS origin set from world '{mp.parent.name}' — design frame == "
+            "world frame; saving copies the world for the new path.", 8000)
+
     # ================================================================== files
     def _update_title(self) -> None:
         name = self.model.name or "untitled"
@@ -593,11 +652,16 @@ class DesignerWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
         return answer == QMessageBox.StandardButton.Yes
 
+    def _clear_world_ref(self) -> None:
+        self._world_ref = None
+        self.map.set_world_limits(None)
+
     def _file_new(self) -> None:
         if not self._confirm_discard():
             return
         self.model.from_dict({"speed": self._cfg.designer.default_speed_mps,
                               "items": []})
+        self._clear_world_ref()
         self._undo.clear()
         self._redo.clear()
         self._dirty = False
@@ -646,19 +710,29 @@ class DesignerWindow(QMainWindow):
             anchor = {"lat0": lat0, "lon0": lon0, "theta_deg": 0.0}
         path = io_yaml.save_mission(self._dir, name, self.model, samples,
                                     geo_anchor=anchor)
+        # A path designed "from a Gazebo World" gets that world copied under
+        # its own name (~/worlds/<name>/<world>/), so the launch flow finds
+        # it grouped with this path. The runtime YAML itself carries no
+        # world data; an already-existing copy is left untouched.
+        world_note = ""
+        if self._world_ref is not None and anchor is not None:
+            world_note = " · " + worlds.duplicate_world_for_path(
+                self._world_ref[0], Path(self._cfg.launch.worlds_root),
+                name, path, anchor)
         self._dirty = False
         self._update_title()
         anchored = " · GPS-anchored" if anchor is not None else ""
         self.statusBar().showMessage(
             f"Saved {path} ({len(samples.t)} samples, "
             f"{samples.length_m:.1f} m{anchored}) — available in Launch "
-            "Mission → custom paths.", 8000)
+            f"Mission → custom paths.{world_note}", 8000)
 
     def _file_open(self) -> None:
         if not self._confirm_discard():
             return
         dialog = LibraryDialog(self._dir, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected:
+            self._clear_world_ref()
             anchor = io_yaml.load_mission(self._dir, dialog.selected, self.model)
             if anchor is not None:
                 # The GPS origin the mission was designed with is remembered:

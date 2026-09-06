@@ -42,6 +42,32 @@ Gazebo: the station simulates the GPS feed and spawns the boat with a random
 heading — same pipeline end to end). A green sim rehearsal is
 model-conditional evidence only; the field run remains the confirmation.
 
+### A1b — Bench-confirm the 2026-09-04 safety rework before the water
+**NOT VERIFIABLE HERE** (needs a live MAVROS link; props clear, boat on a stand).
+
+Four changes landed together in `BlueBoat-Control` and this module. All four are
+covered by the automated gates as far as a desk can cover them, and none is
+field-confirmed. Run in this order, with the **propellers clear**:
+
+1. **Motor gate.** Launch with `enable_motors:=False`, a transmitter switched
+   on. Confirm `SERVO1_FUNCTION`/`SERVO3_FUNCTION` reach 51/53, that
+   `ros2 topic echo /mavros/rc/override` shows a steady 1500/1500, and that
+   moving the sticks does **not** move the thrusters. This is the reported
+   symptom (`docs/03_ros_integration.md` item 00b); before the fix the node
+   published nothing and the sticks reached the ESCs.
+2. **Override lock.** Pull the MAVROS link mid-handshake. `param_set` must give
+   up within `param_sequence_timeout_s` (20 s), say so once, and lock override
+   when the link returns — never the old "Parameter sequence in progress" loop
+   (item 000).
+3. **The three stop buttons**, motors enabled. **E-STOP** → thrust zero and
+   *stays* zero while the controller keeps commanding, `param_mode` still
+   `override`, launch still running. **E-STOP + Stop Override** → additionally
+   `param_mode` goes `default`; launch still running. **Stop Mission** → nodes
+   terminate, and only then. Then publish `enable` and confirm the boat
+   accepts thrust again (that is the only thing that clears the latch).
+4. **Shutdown.** Ctrl-C the launch: servo mapping restored, CSV closed, and
+   `Robot_data/<stem>/` present with the report PNG inside.
+
 ### A2 — Confirm the compass topic is actually published in your setup
 **NOT VERIFIABLE HERE** (needs MAVROS).
 
@@ -73,6 +99,46 @@ so the symptom looks cosmetic.
 frame, which silently breaks the GPS-only map, manual targets and non-East
 trajectory following — there is no wire-level version handshake. Rebuild
 `/blueboat_ws` before any A1 field check.
+
+---
+
+## B. Simulation verification
+
+### B1 — End-to-end run of a personalized-world launch (2026-09-01 feature)
+Needs ROS2 sourced with `blueboat_sss_sim` built (no hardware). The offline
+side is smoke-covered (`worlds ok` / `world launch ok` / the preview block's
+world case), but the full graph has not been run end to end. Check, with the
+anchored `testGPS` path and `~/worlds/testGPS/world/`:
+1. the world-choice dialog lists `testGPS / world` and Launch in World echoes
+   `$ ros2 launch blueboat_sss_sim full_mission_launch.py world_dir:=…
+   with_control:=true trajectory_file:=… controller_type:=…`;
+2. Gazebo loads the generated world, the boat spawns at its origin, and the
+   mavros shim's fixes anchor the station map (tiles at the mission's real
+   location, no "second publisher" fight — the station's SimGps must stay
+   disarmed);
+3. the deferred deploy writes `.deployed/<name>.yaml` within seconds and the
+   boat transitions onto the path at its true GPS position inside the world;
+4. sonar topics flow (`/side_scan_sonar/*/profile`) and Stop Mission tears
+   the graph down cleanly.
+
+### B3 — End-to-end run of the sea-state flow (2026-09-03 feature)
+Offline-verified only (`smoke_test.py` "sea state ok": catalogue fallback,
+CLI in both branches, companion command, dialog headless, timeline YAML
+round-trip, readback parse). To confirm live: launch a Gazebo mission
+(empty world and a personalized world), pick "Strong from E" + "Slight
+from NE", watch the SEA STATE box fill within a second (latched
+`/sim/sea_state`), the console's `[sea]` lines in the empty-world case,
+"Modify situation…" → the readback changing over the ramp, and Stop
+taking the companion down with the mission.
+
+### B2 — Optional follow-up: spawn arguments in `full_mission_launch.py`
+`full_mission_launch.py` declares no spawn pose, so the boat always spawns at
+world (0, 0) yaw 0 — launching a path that starts elsewhere in the world means
+a controller transit to its start (decided 2026-09-01: acceptable, MCS-only
+scope). If it ever matters, the change is in **BlueBoat-SSS-Sim** (forward
+`spawn_yaw`/`spawn_x`/`spawn_y` to `upload_rov_launch.py`); the MCS side is
+already ready — operator `Extra args` pass through `to_cli()` last and would
+carry `spawn_yaw:=` untouched.
 
 ---
 

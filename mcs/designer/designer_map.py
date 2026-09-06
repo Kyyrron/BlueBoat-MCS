@@ -52,6 +52,7 @@ C_WAYPOINT = QColor("#e3b341")
 C_WAYPOINT_SEL = QColor("#2f81f7")
 C_WAYPOINT_LOCK = QColor("#8a949e")
 C_PREVIEW = QColor("#3fb950")
+C_WORLD = QColor("#d29922")     # Gazebo-world limits reference rectangle
 
 
 class EditMode(Enum):
@@ -145,6 +146,21 @@ class DesignerMapView(QGraphicsView):
         self.pinger_marker = MarkerItem(theme.C_PINGER, 6.0, "pinger", z=42)
         self.pinger_marker.setVisible(False)
         self._scene.addItem(self.pinger_marker)
+        # Read-only Gazebo-world limits reference (Set GPS Origin ▸ From a
+        # Gazebo World): corners kept in GPS, re-projected through the
+        # active fit on every set_geo_fit push so the rectangle stays
+        # geographically honest under any later anchor change. Not movable /
+        # selectable by construction (no item flags; selection code filters
+        # WaypointItem), z below the preview (20) and waypoints (60).
+        self._world_corners: list | None = None   # [[lat, lon] SW,SE,NE,NW]
+        self._world_name = ""
+        self._world_rect = PolylineItem(C_WORLD, 1.5,
+                                        Qt.PenStyle.DashLine, z=10)
+        self._world_rect.setVisible(False)
+        self._scene.addItem(self._world_rect)
+        self._world_marker = MarkerItem(C_WORLD, 4.0, "", z=10)
+        self._world_marker.setVisible(False)
+        self._scene.addItem(self._world_marker)
 
         self._wp_items: dict[int, WaypointItem] = {}
         self._scene.selectionChanged.connect(self._on_scene_selection)
@@ -429,6 +445,34 @@ class DesignerMapView(QGraphicsView):
     def set_geo_fit(self, fit) -> None:
         self.geo_fit = fit
         self._update_tiles()
+        self._update_world_limits()
+
+    def set_world_limits(self, corners_latlon, name: str = "") -> None:
+        """Show a Gazebo world's limit rectangle as a read-only reference.
+
+        *corners_latlon* are the ``[lat, lon]`` corners from the world's
+        ``metadata.yaml`` (SW, SE, NE, NW); ``None`` hides the overlay.
+        Scene positions derive from the active geo fit, so the rectangle is
+        only drawn once an anchor exists.
+        """
+        self._world_corners = list(corners_latlon) if corners_latlon else None
+        self._world_name = name
+        self._update_world_limits()
+
+    def _update_world_limits(self) -> None:
+        if self.geo_fit is None or not self._world_corners:
+            self._world_rect.setVisible(False)
+            self._world_marker.setVisible(False)
+            return
+        ring = self._world_corners + self._world_corners[:1]
+        pts = np.array([self.geo_fit.latlon_to_world(float(la), float(lo))
+                        for la, lo in ring])
+        self._world_rect.set_points(pts)
+        self._world_rect.setVisible(True)
+        # Label at the NW corner (last of SW,SE,NE,NW).
+        self._world_marker.set_world_pos(*pts[3])
+        self._world_marker.set_label(self._world_name)
+        self._world_marker.setVisible(True)
 
     def _update_tiles(self) -> None:
         self.tiles.update_view(

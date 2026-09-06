@@ -25,7 +25,10 @@ from the repo root; ROS2 comes from the sourced workspace, never from pip.
 │   ├── core/              signals.py (thread boundary), series.py
 │   │                      (append-only growable series, never wrapped —
 │   │                      recording is unbounded), geo.py (odom↔GPS),
-│   │                      los_predictor.py
+│   │                      los_predictor.py, worlds.py (Gazebo world
+│   │                      folders ~/worlds/<path>/<world>/: list, filter
+│   │                      by limits, duplicate — reimplements the SSS-Sim
+│   │                      contract locally, never imports it, per CM-3)
 │   ├── models/store.py    DataStore: the single in-memory state snapshot
 │   ├── ros/               ros_manager (rclpy thread), bridge_node (all
 │   │                      subs/pubs/service), launch_manager, command_center
@@ -85,14 +88,37 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 | `/uw_gps_data` | `std_msgs/Float32MultiArray` | `uwgps_log.py` | raw USBL freshness | 19 values: date(7), aco xyz, ant xyz, lat/lon/dep, filaco xyz. |
 | `/monitoring_data` | `std_msgs/Float32MultiArray` | `master_control.py` | target display, distance plot | `[t, x, y, psi, x_d, y_d, psi_d, u1, u2]`, published at the controller's 20 Hz loop rate. `x_d/y_d/psi_d` are **WORLD frame for every controller branch** (§6, non-negotiable N3). |
 | `/thruster_input` | `std_msgs/Float32MultiArray` | `master_control.py` | motor read-out | Order is **`[right, left]`** in Newtons. |
-| `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface.py` | readiness gating | Default QoS (depth 10, volatile). **Re-published every 1 s** rather than once, because a one-shot handshake races DDS discovery — that periodic republish, not a latched QoS, is what makes a late subscriber receive it. |
-| `/blueboat/param_mode` | `std_msgs/String` | `param_set` | safe-shutdown acknowledgement | `'default'` / `'override'`. This echo is what proves an E-STOP command landed. |
+| `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface.py` | readiness gating; **E-STOP acknowledgement** | Default QoS (depth 10, volatile). **Re-published every 1 s** rather than once, because a one-shot handshake races DDS discovery — that periodic republish, not a latched QoS, is what makes a late subscriber receive it. Since 2026-09-04 it also carries `False`, published the instant `full_stop()` latches, which is what confirms an E-STOP landed (N1b). |
+| `/blueboat/param_mode` | `std_msgs/String` | `param_set` | safe-shutdown acknowledgement | `'default'` / `'override'`, or `''` for "alive but no mode locked". **Heartbeated at 1 Hz** since 2026-09-04, so a late station sees the mode without waiting for a transition — which is exactly why the shutdown sequence requires a transition rather than any matching value (N1). |
+
+**Sea state (sim only, 2026-09-03).** `/sim/sea_state` (`std_msgs/String`
+JSON, subscribed **TRANSIENT_LOCAL depth 1** — the one latched reader in
+the station) feeds `DataStore.sea` (`mcs.core.sea.SeaReadout`) and the
+floating SEA STATE box (`gui/sea_state_box.py`, parented to the
+map view at its top-left — the mirror of the mission-stats box), visible
+only while a Gazebo mission runs;
+`/sim/sea_state/command` (String JSON) is published by "Modify
+situation…" through `CommandCenter.send_sea_state`. Presets come from the
+simulator's installed `share/blueboat_sss_sim/config/sea_states.yaml`,
+read as a file (`mcs.core.sea.SeaCatalog`, never-raises, CM-3); the
+choice is `LaunchParameters.sea` (`SeaChoice`) — `sea_*` arguments in
+world mode, a companion `ros2 launch blueboat_sss_sim sea_state_launch.py
+world_name:=ocean …` (`launch_manager.companion_command`, its own session,
+best effort) in the empty world, nothing when the choice is null.
+Timelines (`blueboat_sea_schedule/1`) live under
+`~/.config/blueboat_mcs/sea_states/`; a **Custom** wave choice
+(`SeaChoice.custom_waves`: Hs, Tp, γ, events) is written there as
+`custom_waves.yaml` (one keyframe, explicit fields) and passed as
+`sea_schedule:=`, or sent as explicit fields in a live command. The dialog
+(`gui/dialogs/sea_state_dialog.py`) is shown by the bottom toolbar after
+the world dialog for **every** simulation launch and again, live, from
+the floating box's button.
 
 ### Publications
 
 | Topic | Type | Consumed by | Contract |
 |---|---|---|---|
-| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `default`, `override`, `stop`, `arm`, `disarm`, `move <l> <r> <s>`. Any unrecognised token falls through to `move_callback`. The station publishes only `default` / `override`. |
+| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `move <l> <r> <s>`. Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override` and — from either E-STOP button — `stop`. `enable` is the only thing that clears the robot-side E-STOP latch. |
 | `/blueboat/manual_target` | `std_msgs/Float32MultiArray` | `master_control.py` | `[x, y]` in the **WORLD frame**. `[0.0, 0.0]` is the *resume-original-mission sentinel*, not a coordinate — a genuine click at the origin is nudged by `1e-3`. Only the explicit "Continue Original Mission" action may publish `[0,0]`. |
 
 ### Services
@@ -117,16 +143,43 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 
 Violating any of these breaks another module, hardware safety, or field data.
 
-**N1 — Safe shutdown before terminating a launch.** E-STOP, Stop Mission and
-app exit must all run the `command_center` sequence: publish `default` on
-`/blueboat/input_str` → verify a matched subscriber via
-`get_subscription_count()` → wait for the `/blueboat/param_mode` echo (one
-republish at T/2) → flush delay → *only then* terminate the process. Killing the
-launch first can leave the motors in override. In a simulation graph
-(`CommandCenter.set_simulation_mode(True)`) the *acknowledgement wait* is
-skipped — `Sim_launch.py` starts neither `robot_interface` nor `param_set`, so
-no echo can arrive — but the publish still happens before the flush and the
-terminate, so the ordering guarantee is unchanged.
+**N1 — Safe shutdown before terminating a launch.** **Stop Mission** and **app
+exit** — the only two paths that terminate anything — must run the
+`command_center` sequence: publish `default` on `/blueboat/input_str` → verify a
+matched subscriber via `get_subscription_count()` → wait for the
+`/blueboat/param_mode` echo (one republish at T/2) → flush delay → *only then*
+terminate the process. Killing the launch first can leave the motors in
+override. In a simulation graph (`CommandCenter.set_simulation_mode(True)`) the
+*acknowledgement wait* is skipped — `Sim_launch.py` starts neither
+`robot_interface` nor `param_set`, so no echo can arrive — but the publish still
+happens before the flush and the terminate, so the ordering guarantee is
+unchanged.
+
+Since `param_set` heartbeats `/blueboat/param_mode` at 1 Hz, the echo that
+confirms *this* command must be a **transition** into `default`: the sequence
+snapshots the last known mode before publishing and ignores repeats. A boat
+already in `default` is reported as its own confirmation level
+(`already-default`) rather than being credited with an echo it never sent.
+
+**N1b — E-STOP cuts the motors and does nothing else.** The three concerns are
+separate operator actions and must never be re-nested (they were until
+2026-09-04, which is why an operator could not stop the boat without also
+surrendering the servo mapping, nor surrender the mapping without ending the
+mission):
+
+| Button | Publishes | Acknowledged by | Terminates? |
+|---|---|---|---|
+| **E-STOP** | `stop` | `/blueboat/controller_ready` → `False` | no |
+| **E-STOP + Stop Override** | `stop`, then `default` | the above, then the `param_mode` transition | no |
+| **Stop Mission** / app exit | `default` | the `param_mode` transition | yes, after confirmation |
+
+`stop` is the real emergency primitive: robot-side `full_stop()` zeroes the
+thrust, closes the motor gate, disarms and **latches** until an explicit
+`enable`, all without leaving override. Leaving override is a *transfer* of
+authority — the RC channels go back to whatever else is transmitting — so it is
+never part of the panic button. The E-STOP acknowledgement runs in its own state
+machine so it can neither block nor be blocked by an in-flight `default`
+sequence.
 
 **N2 — `[0,0]` on `/blueboat/manual_target` is a control-handover sentinel.**
 Never publish it as a position.
@@ -165,7 +218,16 @@ station-keeping deadlock are gone). Deferred deployment runs on real water
 **and** in Gazebo runs of GPS-anchored missions (`gps_simulated`: the
 station synthesises the fixes itself and spawns the boat with a random
 heading via `spawn_yaw:=`) — only a sim launch of a *non-anchored* mission
-skips it and executes design-frame points directly.
+skips it and executes design-frame points directly. A GPS-anchored sim
+launch may instead target a **personalized world**
+(`LaunchParameters.world_dir` set → `blueboat_sss_sim
+full_mission_launch.py`): the deferred deploy still runs, but the fixes
+come from the simulator's mavros shim (the world's own anchor) and the
+station's SimGps stays **disarmed** — arming it too would put a second
+publisher on `/mavros/global_position/global` with an arbitrary origin and
+deploy the path into the wrong frame relative to the world geometry. That
+launch file declares no `spawn_yaw`; the boat spawns at world (0, 0)
+heading east.
 
 **N9 — Keep `mcs/` free of robot-side code.** Robot-side changes belong in the
 `BlueBoat-Control` submodule (§6); nothing under `mcs/` imports robot-side
@@ -276,6 +338,19 @@ action and the badge, with its tolerance in `DesignerConfig`
 the same file. `mcs/designer/{sampling,io_yaml,interpolation,patterns}.py`
 import no Qt at runtime; only `model.py` and the UI modules do.
 
+**Set GPS Origin ▸ From a Gazebo World** anchors the design frame on a
+generated world's `metadata.yaml` (`core/worlds.py::read_world_meta`): the
+world's `geo_anchor` becomes the design origin (design frame == world local
+frame) and its limit rectangle is drawn as a read-only dashed overlay
+(`DesignerMapView.set_world_limits`, corners kept in GPS and re-projected
+through the active fit). The reference is transient window state
+(`_world_ref`) — never on the model, never in undo, never in the runtime
+YAML. Saving with it set copies the world folder to
+`~/worlds/<mission name>/<world name>/` with `metadata.yaml`'s
+`source_path` and `builder_state.yaml`'s `path.name`/`path.file` re-pointed
+at the new mission (`core/worlds.py::duplicate_world_for_path`); an
+existing target is never overwritten (write-once, CM-7).
+
 **Do not hand-edit files under `.deployed/`** — they are regenerated and carry
 `deployed_from` / `deployed_fit_rms_m` provenance.
 
@@ -360,6 +435,10 @@ ros2 launch blueboat_control BlueBoat_launch.py \
     controller_type:=LoS trajectory:=from_yaml:/abs/path/mission.yaml
 ros2 launch blueboat_control Sim_launch.py \
     robot_file:=thrusters_ur controller_type:=MPC trajectory:=circle
+ros2 launch blueboat_sss_sim full_mission_launch.py \
+    world_dir:=$HOME/worlds/<path>/<world> with_control:=true \
+    trajectory_file:=$HOME/.config/blueboat_mcs/trajectories/.deployed/<name>.yaml \
+    controller_type:=PID   # personalized-world launch (needs blueboat_sss_sim built)
 
 # field debugging
 ros2 topic echo /mavros/global_position/compass_hdg
@@ -394,12 +473,13 @@ this only with new evidence, not from scratch.
 `smoke_test.py` is a linear script — not a test framework — that imports every
 module, builds the full window offscreen and drives synthetic telemetry through
 the `SignalBus`.
-It prints nineteen checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
+It prints twenty-two checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
 `sim gps model ok`, `LoS predictor ok`, `start alignment ok`, `designer ok`,
-`deploy guard ok`, `launch dialog sim-gps ok`, `store ok`, `stats ok`,
+`deploy guard ok`, `worlds ok`, `launch dialog sim-gps ok`,
+`world launch ok`, `sea state ok`, `store ok`, `stats ok`,
 `pinger anchor ok`, `map frame ok`, `sentinel ok`, `georef reset ok`,
-`safe shutdown ok`, `path preview ok`, `launch crash ok`, `window ok`,
-`SMOKE TEST PASSED`) and aborts on the first failed assertion. It passes on this tree, exit status 0, and runs identically
+`safe shutdown ok`, `path preview ok`, `launch crash ok`, `sea box ok`,
+`window ok`, `SMOKE TEST PASSED`) and aborts on the first failed assertion. It passes on this tree, exit status 0, and runs identically
 across all three environment shapes: no `rclpy` (GUI-only); `rclpy` importable
 but the overlay unsourced, so `blueboat_interfaces` is missing and the bridge
 node comes up with its `/path_request` client disabled; and a fully sourced
@@ -412,10 +492,18 @@ proves an origin click is nudged to `1e-3` and that only
 `_on_continue_mission()` emits `[0, 0]`, `deploy guard ok` (N8) proves
 `io_yaml.deploy_mission` raises — and writes nothing — with no fit or no
 `geo_anchor`, deploys correctly through a plain translation fit (including a
-legacy `theta_deg ≠ 0` anchor, rotated inline), and `safe shutdown ok` (N1)
-asserts the `command_center` *ordering*: publish before any terminate, on the
-echo path, the timeout path with its single T/2 republish, all three operator
-doors and the no-ROS degraded path. `map frame ok` drives a real
+legacy `theta_deg ≠ 0` anchor, rotated inline), and `safe shutdown ok`
+(N1 / N1b) asserts both the *separation* and the *ordering*: E-STOP publishes
+`stop`, is acknowledged by `controller_ready` going `False`, terminates nothing
+and leaves the Default/Override label alone; E-STOP + Stop Override publishes
+`stop` then `default` and still terminates nothing; only `safe_stop_mission`
+and `safe_app_exit` reach `terminate`, and only after the echo. It also pins
+the anti-false-confirmation rule — a repeated `param_mode` (param_set's 1 Hz
+heartbeat) never counts as an acknowledgement, the already-`default` case
+takes its own labelled path, and the timeout path still republishes once at
+T/2 and still terminates — plus the supersede rule (a terminating request
+upgrades a non-terminating one in flight, never the reverse), the empty-graph
+warning, the simulation short-circuit and the no-ROS degraded path. `map frame ok` drives a real
 `QMouseEvent` through `MapView` under a synthetic translation `GeoFit`
 (`|t| ≈ 44 m`, non-vacuous) and asserts the scene↔world round trip at every
 input site, the pre-anchor gate (nothing drawn, clicks refused), the
@@ -428,9 +516,22 @@ receiver's translation mapping, first-call origin latch and seeded-noise
 reproducibility; `launch dialog sim-gps ok` proves a sim launch of an
 anchored mission takes the deferred-deploy branch with `gps_simulated` and
 a bounded random `spawn_yaw:=` (and that non-anchored/real launches are
-untouched); the map-frame block's 0c section asserts the anchor gate holds
+untouched, and that `parameters()` never sets `world_dir`); the map-frame
+block's 0c section asserts the anchor gate holds
 in GPS-sim until synthetic fixes arrive; `georef reset ok` proves every
-launch starts from a fresh georeferencer. `path preview ok` covers the
+launch starts from a fresh georeferencer. `worlds ok` covers the Qt-free
+`core/worlds.py` layer on a synthetic `~/worlds` tree: enumeration (dir
+names, newest first, invalid folders skipped), the one-point-inside limits
+filter including a legacy `theta_deg` anchor rotated with `deploy_mission`'s
+convention, and duplication (provenance patched, geometry byte-identical,
+an existing target never touched). `world launch ok` pins the
+`full_mission_launch.py` CLI branch (exactly `world_dir` / `with_control` /
+`trajectory_file` / `controller_type`; no `robot_file`/`trajectory`/
+`spawn_yaw` leak), the three-way `launch_target` choice, the headless
+`WorldChoiceDialog` (world vs Empty Gazebo), and the designer overlay
+(rectangle only under a fit, hidden on clear); the `path preview ok` block
+additionally proves a world-mode launch leaves SimGps disarmed while the
+deferred-deploy poll still arms. `path preview ok` covers the
 /path_request lifecycle at both ends: GUI side (the tick issues the pending
 request, a failure re-arms it bounded and spaced, mission end cancels and
 clears the retry state, a deferred-GPS launch leaves the preview to the
@@ -441,7 +542,21 @@ session, an empty path is a failure rather than a silent blank map, cancel
 suppresses even a completed reply from a dead run). `launch crash ok` proves
 a launch process that dies on its own returns the manager to `idle` (the
 exit watch started by `start()`), instead of wedging the Launch button
-forever. `designer ok` covers the Qt-free designer
+forever, and that `stop()`'s SIGTERM/SIGKILL escalation is bound to the
+process it was armed for: it is disarmed when the tree exits, and firing a
+dead launch's escalation leaves a relaunch untouched (it used to read
+`self._proc`/`self._sea_proc` at fire time and killed the *next* run's sea
+companion). Its children are started `start_new_session` and handshake on
+stdout before the test signals them — a child sharing this script's process
+group would SIGINT the smoke test itself, and one still starting up dies on
+the SIGINT instead of surviving to be escalated against. `sea box ok` covers the floating SEA STATE overlay:
+parented to the map view and hidden outside a running simulation, at
+`(8, 8)` against the left panel while the stats box holds the mirror
+position at the right edge, the read-out reflecting a parsed readback,
+each row measuring its own wrapped height so a longer wave string grows
+the box downwards rather than sideways, and the "Modify situation…"
+button still wired to `MainWindow._on_modify_sea`. It also asserts the
+read-out is *not* duplicated back into the left panel. `designer ok` covers the Qt-free designer
 layer — sampling invariants, the save/load/resample round trip, every stock
 pattern and interpolation from its own `schema` defaults, and both extension
 registries.
@@ -454,6 +569,9 @@ launch-file argument errors.
 
 Simulation runs (`Sim_launch.py`) have no MAVROS, no `robot_interface`, no
 `param_set` and no pinger; code paths gated on those must degrade quietly.
+Personalized-world runs (`full_mission_launch.py`) still have no
+`robot_interface`/`param_set`/pinger, but the simulator's mavros shim DOES
+publish `/mavros/global_position/global`, `compass_hdg` and `imu/data`.
 
 ---
 

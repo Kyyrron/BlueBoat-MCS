@@ -1,8 +1,31 @@
-"""High-level operator commands and the **safe-shutdown guarantee**.
+"""High-level operator commands, the **E-STOP** and the **safe-shutdown guarantee**.
 
-Every path that terminates ROS2 nodes — the EMERGENCY STOP button, the
-Stop Mission button and Application Exit — funnels through one sequence,
-:meth:`CommandCenter.safe_shutdown`, which guarantees that::
+Three operator actions, three separate jobs — they are deliberately NOT nested
+(2026-09-04). Before that, E-STOP published ``default``, which dropped out of
+override, and "E-STOP + Stop Override" additionally killed the launch, so an
+operator could not cut the motors without also giving the servo mapping back and
+could not give the mapping back without ending the mission:
+
+===========================  =========================  ===========================
+Action                       Publishes                  Terminates the launch?
+===========================  =========================  ===========================
+E-STOP                       ``stop``                   **no**
+E-STOP + Stop Override       ``stop`` then ``default``  **no**
+Stop Mission / App Exit      ``default``                yes, after confirmation
+===========================  =========================  ===========================
+
+``stop`` is what an emergency stop should be: robot-side it zeroes the thrust,
+disables the motor gate, disarms and **latches** until an explicit ``enable``, all
+without leaving override. Leaving override is a *transfer* of authority — the RC
+channels go back to whatever else is transmitting — so it is the operator's
+separate, deliberate second action, not part of the panic button.
+
+Its acknowledgement is ``/blueboat/controller_ready`` going ``False``, which
+``robot_interface`` publishes the moment it latches.
+
+Every path that terminates ROS2 nodes — Stop Mission and Application Exit —
+funnels through one sequence, :meth:`CommandCenter.safe_shutdown`, which
+guarantees that::
 
     ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: default"
 
@@ -30,6 +53,14 @@ How the guarantee is implemented (layered, strongest evidence first)
    merely delivered. The sequence waits for this echo up to
    ``estop_confirm_timeout_s``; at half the timeout it republishes once
    (idempotent — 'default' is a mode, not an increment).
+
+   ``param_set`` now HEARTBEATS that topic at 1 Hz so a late station sees the
+   mode without waiting for a transition. A heartbeat is not evidence that this
+   command was acted on, so the sequence snapshots the last known mode before
+   publishing and requires a *transition* into ``'default'``. The one case it
+   accepts without a transition is a boat that was already in ``'default'`` when
+   the operator asked — the state being demanded already holds, and that is
+   reported as its own confirmation level rather than dressed up as an echo.
 4. **Reliable-writer flush fallback.** If no echo arrives (e.g. ``param_set``
    not running), the matched-subscription evidence from step 1 plus a
    ``estop_flush_delay_s`` grace period — during which the process, node and
@@ -88,6 +119,11 @@ class CommandCenter(QObject):
         self._republished = False
         self._simulation = False
         self._mode_toggle_next = "default"  # state of the Default/Override button
+        # Last mode seen on /blueboat/param_mode. param_set heartbeats that topic,
+        # so a repeat is not evidence of anything; the sequence needs a
+        # transition, and this is what a transition is measured against.
+        self._last_param_mode: str | None = None
+        self._mode_before: str | None = None   # snapshot taken per sequence
         self._confirm_timer = QTimer(self)
         self._confirm_timer.setSingleShot(True)
         self._confirm_timer.timeout.connect(self._on_confirm_timeout)
@@ -95,6 +131,15 @@ class CommandCenter(QObject):
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._on_retry)
         bus.param_mode_received.connect(self._on_param_mode)
+
+        # E-STOP acknowledgement, kept in its own tiny state machine rather than
+        # in _phase: the panic button must never be blocked by, and must never
+        # block, an in-flight 'default' sequence.
+        self._estop_pending = False
+        self._estop_timer = QTimer(self)
+        self._estop_timer.setSingleShot(True)
+        self._estop_timer.timeout.connect(self._on_estop_timeout)
+        bus.controller_ready_received.connect(self._on_controller_ready)
 
     # ------------------------------------------------------------- commands
     def _node(self):
@@ -156,6 +201,14 @@ class CommandCenter(QObject):
         if node is not None:
             node.set_sim_gps(None)
 
+    def send_sea_state(self, payload: str) -> bool:
+        """Forward a sea-state JSON command to the simulator (sim runs)."""
+        node = self._ros.node
+        if node is None:
+            return False
+        node.publish_sea_state_command(payload)
+        return True
+
     def set_simulation_mode(self, simulation: bool) -> None:
         """Adapt the safe-shutdown sequence to the running graph.
 
@@ -169,12 +222,69 @@ class CommandCenter(QObject):
         """
         self._simulation = simulation
 
+    # ----------------------------------------------------------- emergency
+    def emergency_stop(self) -> None:
+        """E-STOP button: cut the motors and nothing else.
+
+        Publishes ``stop``. Does NOT change the parameter mode and does NOT
+        terminate the launch — both are separate operator actions. Safe to
+        press repeatedly and safe to press while a 'default' sequence is in
+        flight; it shares no state with it.
+        """
+        _LOG.warning("EMERGENCY STOP triggered")
+        node = self._node()
+        if node is None:
+            self._bus.ros_log.emit("E-STOP: ROS layer unavailable — nothing published.")
+            return
+        try:
+            node.publish_input_str("stop")
+        except Exception as exc:  # noqa: BLE001
+            _LOG.error("publish('stop') raised: %s", exc)
+            self._bus.ros_log.emit(f"E-STOP: publish failed ({exc}).")
+            return
+
+        if self._simulation:
+            # Sim_launch.py starts neither robot_interface nor param_set, and
+            # simulation_interface latches controller_ready True forever, so no
+            # acknowledgement can structurally arrive.
+            self._bus.estop_state_changed.emit("estop-sim")
+            return
+
+        self._estop_pending = True
+        self._bus.estop_state_changed.emit("estop")
+        self._estop_timer.start(int(self._cfg.estop_confirm_timeout_s * 1000))
+
+    def stop_override(self) -> None:
+        """E-STOP + Stop Override: cut the motors, THEN hand the mapping back.
+
+        The order is the point. ``stop`` first, so thrust is already zero and
+        the gate latched before the servo functions leave RC passthrough; only
+        then ``default``, through the full confirmation sequence. Still does not
+        terminate anything — that is Stop Mission.
+        """
+        _LOG.warning("E-STOP + Stop Override triggered")
+        self.emergency_stop()
+        self.safe_shutdown(terminate_nodes=False, reason="Stop Override")
+
+    def _on_controller_ready(self, _t: float, ready: bool) -> None:
+        """robot_interface withdraws readiness the instant it latches the stop."""
+        if self._estop_pending and not ready:
+            self._estop_timer.stop()
+            self._estop_pending = False
+            _LOG.info("E-STOP confirmed by controller_ready=False")
+            self._bus.estop_state_changed.emit("estop-confirmed")
+
+    def _on_estop_timeout(self) -> None:
+        if not self._estop_pending:
+            return
+        self._estop_pending = False
+        self._bus.estop_state_changed.emit("estop-timeout")
+        self._bus.ros_log.emit(
+            "E-STOP: 'stop' was published on a reliable writer but no "
+            "controller_ready=False came back. Check that robot_interface is "
+            "running and current; use Stop Mission if the boat is still moving.")
+
     # ------------------------------------------------------- shutdown paths
-    # All three operator paths converge on safe_shutdown():
-    def emergency_stop(self, terminate_nodes: bool) -> None:
-        """EMERGENCY STOP button (highest priority)."""
-        _LOG.warning("EMERGENCY STOP triggered (terminate_nodes=%s)", terminate_nodes)
-        self.safe_shutdown(terminate_nodes=terminate_nodes, reason="E-STOP")
 
     def safe_stop_mission(self) -> None:
         """Stop Mission button: guarantee 'default' before graceful teardown."""
@@ -190,7 +300,22 @@ class CommandCenter(QObject):
     def safe_shutdown(self, terminate_nodes: bool, reason: str) -> None:
         """Publish → verify → confirm → (only then) terminate. See module doc."""
         if self._phase is not _Phase.IDLE:
-            _LOG.info("safe_shutdown re-entered during %s — ignored", self._phase)
+            # A stronger request supersedes a weaker one in flight: pressing
+            # Stop Mission while a Stop Override sequence is confirming must
+            # still terminate. The publish already happened and the ordering
+            # guarantee is unaffected — only the post-confirmation action is
+            # upgraded, never downgraded.
+            if terminate_nodes and not self._terminate_after:
+                self._terminate_after = True
+                _LOG.info("%s during %s — upgraded to terminate on confirmation",
+                          reason, self._phase)
+                self._bus.ros_log.emit(
+                    f"{reason}: a shutdown sequence is already confirming; it "
+                    "will terminate the launch when it completes.")
+            else:
+                _LOG.info("safe_shutdown re-entered during %s — ignored", self._phase)
+                self._bus.ros_log.emit(
+                    f"{reason}: a shutdown sequence is already in progress.")
             return
         node = self._ros.node
         if node is None:
@@ -207,6 +332,13 @@ class CommandCenter(QObject):
         self._terminate_after = terminate_nodes
         self._republished = False
         self._phase = _Phase.WAIT_CONFIRM
+        # Snapshot BEFORE publishing: the echo that confirms this command must
+        # be a transition into 'default', not param_set's 1 Hz heartbeat.
+        self._mode_before = self._last_param_mode
+        # Keep the Default/Override toggle truthful. Set before the state emit,
+        # because the toolbar refreshes that button's label on this very signal
+        # and would otherwise read the stale value for up to a full timeout.
+        self._mode_toggle_next = "override"
         self._bus.estop_state_changed.emit("publishing")
 
         # (1) Graph verification: matched reliable subscription = delivery
@@ -223,15 +355,15 @@ class CommandCenter(QObject):
                 "the writer alive for late discovery.")
         elif matched == 0:
             _LOG.info("%s: no input_str subscriber (expected in simulation)", reason)
+        elif matched < 0:
+            # The graph query itself failed; -1 is a sentinel, not a count.
+            _LOG.warning("%s: subscriber count unavailable — publishing anyway", reason)
         else:
             _LOG.info("%s: %s matched subscriber(s) on input_str", reason, matched)
 
         # (2) Publication — synchronous into the reliable DDS writer.
         try:
             node.publish_input_str("default")
-            # Keep the Default/Override toggle truthful: 'default' was just
-            # published, so the button's next command must be 'override'.
-            self._mode_toggle_next = "override"
         except Exception as exc:  # noqa: BLE001
             _LOG.error("publish('default') raised: %s — retrying once", exc)
             QTimer.singleShot(100, lambda: self._safe_republish())
@@ -243,6 +375,19 @@ class CommandCenter(QObject):
             self._phase = _Phase.FLUSHING
             self._bus.estop_state_changed.emit("sim")
             _LOG.info("%s: simulation graph — ack skipped, flushing", reason)
+            QTimer.singleShot(
+                int(self._cfg.estop_flush_delay_s * 1000), self._finish)
+            return
+
+        # (3a) The boat was already in 'default' when the operator asked. The
+        #      state being demanded holds; say so as its own confirmation level
+        #      rather than waiting for a transition that will never come (and
+        #      rather than letting the heartbeat impersonate an echo).
+        if self._mode_before == "default":
+            self._phase = _Phase.FLUSHING
+            self._bus.estop_state_changed.emit("already-default")
+            _LOG.info("%s: boat already in 'default' — no transition to wait for",
+                      reason)
             QTimer.singleShot(
                 int(self._cfg.estop_flush_delay_s * 1000), self._finish)
             return
@@ -267,7 +412,9 @@ class CommandCenter(QObject):
             self._safe_republish()
 
     def _on_param_mode(self, _t: float, mode: str) -> None:
-        if self._phase is _Phase.WAIT_CONFIRM and mode == "default":
+        self._last_param_mode = mode
+        if (self._phase is _Phase.WAIT_CONFIRM and mode == "default"
+                and self._mode_before != "default"):
             # (3) succeeded: full-chain, acted-upon confirmation.
             self._confirm_timer.stop()
             self._retry_timer.stop()
@@ -296,4 +443,8 @@ class CommandCenter(QObject):
         self._terminate_after = False
         if terminate:
             self._launcher.stop()
+        # Return the toolbar's status label to blank. Without this the last
+        # phase text ("no echo — check chain") stuck for the rest of the
+        # session, long after the condition it described was over.
+        self._bus.estop_state_changed.emit("idle")
         self._bus.shutdown_sequence_finished.emit()

@@ -39,9 +39,14 @@ class TopicsConfig:
     controller_ready: str = "/blueboat/controller_ready"
     param_mode: str = "/blueboat/param_mode"
 
+    # --- Simulation only (BlueBoat-SSS-Sim sea_state_node): the live sea
+    # state (String JSON, latched, 2 Hz) and the command that changes it.
+    sea_state: str = "/sim/sea_state"
+
     # --- Publications (commands consumed by the existing stack) ---
     input_str: str = "/blueboat/input_str"
     manual_target: str = "/blueboat/manual_target"
+    sea_state_command: str = "/sim/sea_state/command"
 
     # --- Services ---
     path_request: str = "/path_request"
@@ -67,6 +72,7 @@ class DiagnosticsConfig:
         "/thruster_input": 0.5,
         "/blueboat/controller_ready": 30.0,
         "/blueboat/param_mode": 60.0,
+        "/sim/sea_state": 3.0,
     })
     stale_age_multiplier: float = 4.0
     expected_hz: dict[str, float] = field(default_factory=lambda: {
@@ -78,6 +84,7 @@ class DiagnosticsConfig:
         "/uw_gps_data": 2.0,
         "/monitoring_data": 20.0,
         "/thruster_input": 20.0,
+        "/sim/sea_state": 2.0,
     })
     rate_window_s: float = 5.0
     update_period_s: float = 1.0
@@ -95,6 +102,15 @@ class LaunchConfig:
     # simulation_interface — no MAVROS, no robot_interface/param_set,
     # no pinger.
     sim_launch_file: str = "Sim_launch.py"
+    # Personalized Gazebo worlds (BlueBoat-SSS-Sim, ~/worlds/<path>/<world>/):
+    # full_mission_launch.py declares world_dir / with_control /
+    # trajectory_file / controller_type (+ use_stock_world, quiet,
+    # with_mavros_shim, sim_origin_*, acquisition args) and NO spawn_yaw.
+    # Its mavros shim publishes the GPS fixes from the world's own anchor,
+    # so the station's SimGps stays disarmed in this mode.
+    sim_world_package: str = "blueboat_sss_sim"
+    sim_world_launch_file: str = "full_mission_launch.py"
+    worlds_root: str = str(Path.home() / "worlds")
     sim_robot_files: list[str] = field(default_factory=lambda: ["thrusters_ur"])
     sim_default_controller: str = "MPC"
     controllers: list[str] = field(default_factory=lambda: ["", "PID", "LoS", "MPC"])
@@ -118,6 +134,32 @@ class LaunchConfig:
     path_request_timeout_s: float = 10.0
     path_request_max_retries: int = 3
     path_request_retry_delay_s: float = 2.0
+
+
+@dataclass
+class SeaConfig:
+    """Sea state (current + waves) for simulated missions.
+
+    The physics and the preset table live in BlueBoat-SSS-Sim
+    (``sea_state_node``, ``config/sea_states.yaml``); the station reads the
+    installed table (``presets_file`` "" = auto-locate through
+    ``$AMENT_PREFIX_PATH`` / ``~/ros2_ws/install``) and passes the choice as
+    ``sea_*`` launch arguments — to ``full_mission_launch.py`` directly in a
+    personalized world, and through a companion
+    ``ros2 launch blueboat_sss_sim sea_state_launch.py world_name:=ocean``
+    process next to ``Sim_launch.py`` in the empty Gazebo world (that
+    launch file declares no sea arguments). A null choice (no current,
+    calm) starts no companion at all.
+    """
+
+    presets_file: str = ""
+    schedules_dir: str = str(Path.home() / ".config" / "blueboat_mcs" / "sea_states")
+    default_current: str = "none"
+    default_waves: str = "calm"
+    companion_package: str = "blueboat_sss_sim"
+    companion_launch_file: str = "sea_state_launch.py"
+    stock_world_name: str = "ocean"
+    ramp_s: float = 20.0          # live changes ramp over this many seconds
 
 
 @dataclass
@@ -215,6 +257,7 @@ class AppConfig:
     geo: GeoConfig = field(default_factory=GeoConfig)
     sim_gps: SimGpsConfig = field(default_factory=SimGpsConfig)
     designer: DesignerConfig = field(default_factory=DesignerConfig)
+    sea: SeaConfig = field(default_factory=SeaConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
 

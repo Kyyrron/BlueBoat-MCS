@@ -55,6 +55,17 @@ no GPS). Only the
 vehicle icon rotates, exactly like QGroundControl. A briefly empty map right
 after a real-water launch is expected, not a fault; manual-target clicks
 during that window are refused rather than sent somewhere wrong.
+**Sea state (sim)** — a floating box in the **top-left corner of the
+map**, the mirror of the mission-statistics box in the top-right. It
+appears only while a Gazebo mission runs and shows the current (preset,
+from-bearing, instantaneous speed), the waves (preset, Hs, Tp,
+from-bearing, and the wake / swell group currently passing, with its
+height and the seconds left), the surface elevation at the boat, the next
+scheduled change and a live/stale status, all read back from the
+simulator. **Modify situation…** opens the same dialog as at launch in
+live mode: pick new presets / directions (or a timeline) and a ramp time,
+**Apply now** sends it and the simulator blends over the ramp.
+
 **Clear Paths** in MAP TOOLS wipes the robot
 and pinger trails without touching live data. A simple click
 anywhere shows, in the status bar: world coordinates, GPS coordinates (once
@@ -126,25 +137,113 @@ random `spawn_yaw` (shown in the status bar and the console command line). On OK
 orange while nodes come up and green once the required ones report
 (FCU connected + odometry flowing). Launch output streams to the console line.
 
+**Personalized Gazebo worlds.** After OK on a GPS-anchored custom path in
+simulation, a second small dialog lists every generated world
+(`~/worlds/<path>/<world>/`, made with the SSS-Sim World Builder) whose
+limit rectangle contains at least one point of the selected path — any
+matching world qualifies, not only those built from this exact path.
+**Launch in World** runs the mission inside it (simulated seabed,
+side-scan sonar and GPS from the world's own anchor); **Empty Gazebo**
+launches exactly as before; **Cancel** aborts the launch. In a
+personalized world the boat spawns at the world's origin heading east and
+the controller drives it onto the path. When no world matches (or
+`~/worlds` doesn't exist) the dialog is skipped entirely.
+
+**Sea state.** After the world step, every Gazebo launch shows a third
+dialog: **Current** (No current / Weak 0.1 m/s / Moderate 0.25 / Strong
+0.5 / Very strong 0.8 — the stress level) with the compass direction it
+comes *from* (a 16-point combo synced with a degrees box; "from N (→ S)"
+pushes the boat south), **Waves** (Calm / Rippled Hs 0.05 m / Smooth 0.15
+/ Slight 0.35 / Rough 0.60 — the stress level) with their direction, a
+seed, a **Custom** wave entry (Hs, Tp, spectrum peakedness γ, wake groups
+per hour with their height and period — written as a one-keyframe timeline
+file so the launch can carry explicit numbers), and an optional
+**Timeline**: rows of (time, current, from, waves,
+from) that make the sea change over the mission, saved as a named file
+and reloadable from the "Saved" combo. Each preset shows a one-sentence
+explanation and its literature reference. "No current" + "Calm" (the
+default) changes nothing about the simulation. **Launch** starts the
+mission; in the empty Gazebo world a companion `sea_state_launch.py`
+process carries the choice (its output is prefixed `[sea]` in the
+console); in a personalized world it is part of the world launch.
+
 **Stop Mission** first publishes `default` on `/blueboat/input_str` and
 waits for confirmed transmission (the same guarantee as the Emergency Stop),
 then shuts every launched node down gracefully (SIGINT first) and releases
 the process; the station remains open and the mission can be relaunched.
 
-**E-STOP + Stop Override** and **E-STOP** are two direct, one-click
-emergency buttons (no confirmation dialog). Both first publish `default` on
-`/blueboat/input_str` and wait until the command is confirmed transmitted
-(the `param_mode` echo, with a graph-verified reliable-delivery fallback).
-**E-STOP** stops there — nodes keep running with safe parameters restored.
-**E-STOP + Stop Override** additionally terminates every launched node once
-transmission is confirmed, stopping whatever is driving the motors. The
-label next to the buttons reports each phase, and the Default/Override
-toggle is resynchronized automatically (after either E-STOP the mode is
-`default`, so its next command is `override`).
+**E-STOP** and **E-STOP + Stop Override** are two direct, one-click emergency
+buttons (no confirmation dialog). **Neither ends the mission** — that is Stop
+Mission's job alone.
+
+**E-STOP** publishes `stop`. On the boat that zeroes the thrust, closes the
+motor gate, disarms, and **latches**: nothing moves again until an explicit
+`enable`, even though the controller keeps commanding. It stays in override and
+leaves every node running, so the mission can be resumed rather than restarted.
+Confirmation comes back as the robot withdrawing its readiness, and the label
+beside the buttons reports each phase.
+
+**E-STOP + Stop Override** does the same `stop` first — motors dead before
+anything else changes — and only then publishes `default` to hand the servo
+mapping back to QGC / the RC receiver, waiting for the `param_mode` echo. Use it
+when you want the boat drivable from the transmitter again. It does not stop the
+mission either.
+
+Why they are separate: leaving override *transfers* control rather than removing
+it — the thruster channels go back to whatever else is transmitting. An
+emergency stop should take authority away from everyone, so it does not touch
+the mode. The Default/Override toggle is resynchronized only by the action that
+actually moves the mode.
 
 **Publish Default Control Mode** publishes the same `default` command
 immediately; the button then alternates to **Publish Override Control Mode**
 (publishing `override`) and back on each click.
+
+**After an E-STOP**, the boat ignores all thrust until it is released. Publish
+`enable` on `/blueboat/input_str` to clear the latch:
+
+```bash
+ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: enable"
+```
+
+## Post-mission report
+
+Every mission produces one picture, automatically. When the launch is torn down,
+`robot_interface` closes its position CSV and files the whole run into its own
+folder beside the others:
+
+```
+<workspace>/data/Robot_data/2026_09_04-14_18_19-poslog/
+    2026_09_04-14_18_19-poslog.csv      the log, moved here
+    2026_09_04-14_18_19-origin.yaml     its world-frame origin
+    2026_09_04-14_18_19-poslog.png      the report
+```
+
+The picture is laid out for a quick read: the GPS track of the robot against the
+target (no tiles, true metric aspect, no-fix rows dropped, with a metre scale
+bar), the robot→target distance over the mission, ground speed, the commanded
+thrust for both motors, a coloured strip saying whether that thrust could
+actually reach the water (`motors disabled` / `live` / `not in override` /
+`watchdog zeroing`), and a summary table — mission time, distance travelled,
+mean/median/max distance to target, mean and max speed, mean thrust per side and
+their imbalance, the fraction of the run with thrust live, GPS fix count and the
+run's origin.
+
+Speed is differenced from the logged pose (there is no speed column). Samples
+implying more than 5 m/s are pose jumps, not motion — an odom re-origin or a GPS
+glitch — so they are **excluded from the statistics and counted in the table**
+rather than quietly clipped; the speed plot marks each one along its baseline.
+
+To re-render an older log, or one the boat could not process itself:
+
+```bash
+ros2 run blueboat_control poslog_report.py ~/ros2_ws/data/Robot_data/<name>-poslog.csv
+ros2 run blueboat_control poslog_report.py ~/ros2_ws/data/Robot_data --all
+ros2 run blueboat_control poslog_report.py <file.csv> --no-archive   # picture only
+```
+
+A run that has already been filed is never re-filed or overwritten, and the CSV
+is only ever moved, never rewritten — it is primary field data.
 
 ## Closing
 
@@ -175,9 +274,18 @@ geographically fixed and are never realigned (the boat turns toward them
 instead). If the robot is
 connected, its position sets the initial view and the live robot arrow and
 pinger overlays can be toggled from the toolbar; otherwise **Set GPS
-Origin…** accepts Google-Maps-format coordinates (`33.660196, 130.657780`)
-to define world (0,0) — the origin remains optional, and without one the
-editor simply works in the local world frame. A mission saved with a GPS
+Origin…** offers two ways to define world (0,0): **Enter Coordinates…**
+accepts Google-Maps-format coordinates (`33.660196, 130.657780`), and
+**From a Gazebo World…** browses `~/worlds/` for a world's
+`metadata.yaml` — the world's GPS anchor becomes the design origin (the
+design frame then coincides with the world's local frame) and its limit
+rectangle is drawn on the map as a dashed read-only reference, so the
+path can be laid out inside it. Saving such a mission also copies the
+world folder to `~/worlds/<mission name>/<world name>/` with its
+provenance updated to the new path, so the launch dialog finds it grouped
+with this mission; an already-existing copy is never overwritten (the
+status bar says which happened). The origin remains optional, and without
+one the editor simply works in the local world frame. A mission saved with a GPS
 reference remembers it: reopening the mission restores the origin (and the
 satellite layer), every waypoint is linked to real-world GPS coordinates,
 and the launch dialog labels it “(GPS)”. Launching such a mission uses
