@@ -71,7 +71,6 @@ class RosManager:
             target=self._spin, name="ros-executor", daemon=True
         )
         self._thread.start()
-        self._bus.ros_started.emit()
         _LOG.info("ROS executor thread started")
 
     def stop(self) -> None:
@@ -89,7 +88,6 @@ class RosManager:
         if self._thread:
             self._thread.join(timeout=3.0)
         self._thread = None
-        self._bus.ros_stopped.emit()
         _LOG.info("ROS executor stopped")
 
     # ------------------------------------------------------------- internal

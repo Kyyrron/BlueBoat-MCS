@@ -581,8 +581,9 @@ print("worlds ok")
 
 # --- Launch dialog: sim + GPS-anchored path arms the simulated-GPS flow ---
 # In simulation an anchored mission takes the SAME deferred-deploy branch as
-# on real water, plus gps_simulated and a random spawn heading; non-anchored
-# paths change nothing.
+# on real water, plus gps_simulated and a FIXED spawn heading (two runs of one
+# mission must start identically); non-anchored paths change nothing. The log
+# note reaches every branch, sanitised, 'sim'-tagged in simulation.
 from mcs.gui.dialogs.launch_dialog import LaunchDialog
 
 _ld_dir = Path(tempfile.mkdtemp())
@@ -611,12 +612,24 @@ try:
         f"from_yaml:{io_yaml.deployed_path(_ld_dir, 'anchored_sim')}"
     assert _p.spawn_yaw_rad is not None
     assert -math.pi <= _p.spawn_yaw_rad <= math.pi
+    # Deterministic spawn: the configured heading, and the same every call.
+    assert abs(_p.spawn_yaw_rad
+               - math.radians(_cfg2.launch.sim_spawn_yaw_deg)) < 1e-12
+    assert _dlg.parameters().spawn_yaw_rad == _p.spawn_yaw_rad
     # The personalized-world choice happens AFTER the dialog (bottom
     # toolbar); parameters() itself never sets it.
     assert _p.world_dir == ""
     _cli = " ".join(_p.to_cli())
     assert "spawn_yaw:=" in _cli and "robot_file:=" in _cli \
         and "controller_type:=" in _cli, _cli
+    # Log note: simulation carries the 'sim' marker with no operator note...
+    assert "note:=sim" in _cli, _cli
+    _dlg._note.setText("dam run/2")
+    _pn = _dlg.parameters()
+    assert _pn.note == "dam run/2"                      # raw text is kept
+    assert _pn.wire_note() == "sim-dam-run-2"           # one safe CLI token
+    assert f"note:={_pn.wire_note()}" in _pn.to_cli()
+    _dlg._note.clear()
 
     _i = _dlg._trajectory.findData(str(_ld_plain))
     _dlg._trajectory.setCurrentIndex(_i)
@@ -627,11 +640,20 @@ try:
     assert "spawn_yaw:=" not in " ".join(_p2.to_cli())
 
     _dlg._mode.setCurrentText("Real robot")
+    # The log note exists in both modes (simulation_interface names its poslog
+    # from it exactly as robot_interface does), so the field stays visible.
+    assert _dlg._note.isVisibleTo(_dlg) and _dlg._note_label.isVisibleTo(_dlg)
     _i = _dlg._trajectory.findData(str(_ld_anch))
     _dlg._trajectory.setCurrentIndex(_i)
     _p3 = _dlg.parameters()
     assert not _p3.simulation and not _p3.gps_simulated
     assert _p3.spawn_yaw_rad is None
+    assert "note:=" not in " ".join(_p3.to_cli())   # empty note: no argument
+    _dlg._note.setText(" field test ")
+    _p3n = _dlg.parameters()
+    assert _p3n.wire_note() == "field-test"        # no 'sim' tag on real water
+    assert "note:=field-test" in _p3n.to_cli()
+    _dlg._note.clear()
     assert _p3.gps_anchored_source == str(_ld_anch)   # real branch unchanged
     _dlg.deleteLater()
 finally:
@@ -656,6 +678,7 @@ _wjoin = " ".join(_wcli)
 assert "world_dir:=/w/pA/w1" in _wjoin and "with_control:=true" in _wjoin
 assert "trajectory_file:=/tmp/d.yaml" in _wjoin
 assert "controller_type:=PID" in _wjoin
+assert "note:=sim" in _wjoin          # full_mission_launch.py declares it too
 assert "robot_file:=" not in _wjoin and "spawn_yaw:=" not in _wjoin
 assert "trajectory:=" not in _wjoin      # trajectory_file:= only
 assert _wcli[-1] == "with_mavros_shim:=false"   # extra args stay last
@@ -837,6 +860,12 @@ w = MainWindow(cfg)  # RosManager connects, or degrades if rclpy is absent
 # tautology that could never fail.
 assert w.ros.available in (True, False)
 
+# Battery: nothing has arrived yet, so the row must say so rather than
+# render a number. /mavros/battery exists only on the real boat.
+w._on_tick(); app.processEvents()
+assert w.store.robot.battery_pct is None
+assert w.left_panel.robot_grid._values["Battery"].text() == "no data"
+
 t0 = time.monotonic()
 for i in range(200):
     tm = t0 + i * 0.05
@@ -849,6 +878,37 @@ for i in range(200):
     # fix): on_gps pairs each fix with the concurrent odom pose.
     w.bus.gps_received.emit(tm, *local_en_to_latlon(x, y, 43.1, 5.9))
 app.processEvents()
+
+# --- Battery read-out (/mavros/battery, sensor_msgs/BatteryState) ---
+# percentage is a 0..1 FRACTION on the wire; the panel shows percent.
+_bt = time.monotonic()
+w.bus.battery_received.emit(_bt, 15.62, 0.82)
+w._on_tick(); app.processEvents()
+assert w.store.robot.battery_pct == 0.82 and w.store.robot.battery_v == 15.62
+_batt_txt = w.left_panel.robot_grid._values["Battery"].text()
+assert "82.0 %" in _batt_txt and "15.62 V" in _batt_txt, _batt_txt
+# A field the FCU does not report arrives as None and must not wipe the
+# last good reading -- only the stamp advances.
+w.bus.battery_received.emit(time.monotonic(), None, None)
+w._on_tick(); app.processEvents()
+assert w.store.robot.battery_pct == 0.82 and w.store.robot.battery_v == 15.62
+# Colour follows the charge, and a stale row is greyed rather than trusted.
+from mcs.gui import theme
+from mcs.gui.left_panel import _battery_text as _bat_txt
+from mcs.models.store import RobotState as _RS
+
+assert _bat_txt(_RS(battery_pct=0.82, battery_t=time.monotonic()))[1] == theme.OK
+assert _bat_txt(_RS(battery_pct=0.30, battery_t=time.monotonic()))[1] == theme.WARN
+assert _bat_txt(_RS(battery_pct=0.05, battery_t=time.monotonic()))[1] == theme.ERR
+assert _bat_txt(_RS(battery_pct=0.82,
+                    battery_t=time.monotonic() - 60.0))[1] == theme.TEXT_DIM
+assert _bat_txt(_RS())[0] == "no data"
+# Voltage alone (no percentage reported) still renders.
+assert "12.10 V" in _bat_txt(_RS(battery_v=12.1, battery_t=time.monotonic()))[0]
+# The topic is registered for diagnostics purely by living in TopicsConfig.
+assert cfg.topics.battery == "/mavros/battery"
+assert cfg.topics.battery in cfg.diagnostics.warn_age_s
+print("battery ok")
 
 assert w.store.robot.has_odom
 assert len(w.store.robot_track) == 200
@@ -1170,6 +1230,114 @@ w._on_launch_state("idle")
 assert not w.store.mission.gps_simulated
 assert not w.store.mission.launch_running
 print("georef reset ok")
+
+# --- The Pattern Designer never adopts the station's live georeference ---
+# Regression: _active_fit() used to prefer store.geo.fit whenever the app
+# held a GPS lock, silently replacing the mission's own anchor with the
+# boat's launch point. Everything geographic then translated by the distance
+# between the two (the "every path is shifted" symptom), and saving re-wrote
+# geo_anchor from it, corrupting the file on disk. The window is built here
+# against a store with a VALID live fit — the exact condition that used to
+# break it.
+from mcs.designer.designer_window import DesignerWindow
+
+_dsn_win_dir = Path(tempfile.mkdtemp())
+# A live fit anchored far from the design site: 43.1/5.9 vs 33.66/130.65 is
+# most of the planet, so a leak could not pass as rounding.
+w.store.reset_georeference()
+_t_live = time.monotonic()
+for i in range(20):
+    _tm = _t_live + i * 0.05
+    w.bus.odom_received.emit(_tm, [0.0, 0.0, 0, 0, 0, 0.0], [0, 0, 0, 0, 0, 0])
+    w.bus.gps_received.emit(_tm, *local_en_to_latlon(0.0, 0.0, 43.1, 5.9))
+app.processEvents()
+assert w.store.geo.is_valid, "the regression condition itself must hold"
+
+_dw = DesignerWindow(cfg, w.store)
+_dw._dir = _dsn_win_dir   # keep the real library out of the way
+try:
+    # 1. A fresh window is un-anchored despite the valid live fit.
+    assert _dw._manual_fit is None
+    assert _dw._active_fit() is None
+    assert "none" in _dw._anchor_label.text()
+    # ... so a non-GPS mission still reaches the Align-to-Start offer, whose
+    # whole guard is `_active_fit() is None`.
+    assert not _dw._sat_box.isEnabled()
+
+    # 2. An explicit anchor is the one in force, and stays in force.
+    _dw._set_anchor(_GeoFit(tx=0.0, ty=0.0, lat0=33.660196,
+                                lon0=130.657780, rms_m=0.0, n_pairs=0),
+                    "typed")
+    _fit = _dw._active_fit()
+    assert (_fit.lat0, _fit.lon0) == (33.660196, 130.657780), _fit
+    assert "33.660196" in _dw._anchor_label.text()
+    # More live fixes must not move it (the old code re-latched every 250 ms
+    # AND crept with each refit of the rolling window).
+    for i in range(20):
+        _tm = time.monotonic() + i * 0.05
+        w.bus.odom_received.emit(_tm, [5.0, 5.0, 0, 0, 0, 0.0], [0]*6)
+        w.bus.gps_received.emit(_tm, *local_en_to_latlon(5.0, 5.0, 43.1, 5.9))
+    app.processEvents()
+    assert _dw._active_fit().lat0 == 33.660196
+
+    # 3. Saving writes THAT anchor, not a live-derived one.
+    _dw.model.add_waypoint(0.0, 0.0)
+    _dw.model.add_waypoint(20.0, 0.0)
+    _dw._write("anchor_test")
+    _saved = _yaml.safe_load(
+        io_yaml.runtime_path(_dsn_win_dir, "anchor_test").read_text())
+    assert _saved["geo_anchor"]["lat0"] == 33.660196, _saved["geo_anchor"]
+    assert _saved["geo_anchor"]["lon0"] == 130.657780
+
+    # 4. The anchor is a property of the mission: New clears it, so the next
+    # mission cannot inherit an origin it was never drawn at.
+    _dw._dirty = False
+    _dw._file_new()
+    assert _dw._manual_fit is None and _dw._active_fit() is None
+
+    # 5. The robot snapshot is one-off and explicit. It reads the CURRENT fix.
+    _dw._set_gps_origin_from_robot()
+    _rf = _dw._active_fit()
+    assert _rf is not None and "robot" in _dw._anchor_label.text()
+    assert abs(_rf.lat0 - w.store.robot.lat) < 1e-9
+    assert abs(_rf.lon0 - w.store.robot.lon) < 1e-9
+    # ... and it does not track the boat afterwards.
+    _lat_before = _rf.lat0
+    for i in range(20):
+        _tm = time.monotonic() + i * 0.05
+        w.bus.gps_received.emit(_tm, *local_en_to_latlon(500.0, 500.0, 43.1, 5.9))
+    app.processEvents()
+    assert _dw._active_fit().lat0 == _lat_before
+    # With no fix at all it refuses rather than anchoring on nothing — and
+    # says so, instead of failing silently. The modal is stubbed because an
+    # offscreen QMessageBox still blocks on input.
+    from PySide6.QtWidgets import QMessageBox as _QMB
+
+    _warned = []
+    _real_warning = _QMB.warning
+    _QMB.warning = staticmethod(lambda *a, **k: _warned.append(a))
+    try:
+        _no_gps = DesignerWindow(cfg, None)
+        try:
+            _no_gps._set_gps_origin_from_robot()
+            assert _no_gps._active_fit() is None
+            assert len(_warned) == 1, "the refusal must be reported"
+        finally:
+            _no_gps._dirty = False
+            _no_gps.close()
+    finally:
+        _QMB.warning = _real_warning
+
+    # 6. No live overlay is drawn in the designer at all.
+    assert not hasattr(_dw.map, "robot_item")
+    assert not hasattr(_dw.map, "pinger_marker")
+    assert not hasattr(_dw.map, "refresh_overlays")
+    assert not hasattr(_dw, "_refresh_overlays")
+finally:
+    _dw._dirty = False
+    _dw.close()
+    shutil.rmtree(_dsn_win_dir, ignore_errors=True)
+print("designer anchor ok")
 
 # --- N1 / root CM-15: 'default' is published and confirmed BEFORE any kill ---
 # Terminating the launch first can leave the motors in override. The sequence

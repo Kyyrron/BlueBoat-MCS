@@ -1,4 +1,4 @@
-"""Mission Pattern Designer — side panels and auto-generated dialogs.
+"""Survey Pattern Designer — side panels and auto-generated dialogs.
 
 * :class:`MissionTree` — the structured mission view (groups → waypoints)
   with reorder / lock / rename, synchronized with the map selection.

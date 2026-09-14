@@ -11,7 +11,8 @@ defaults below match the stack as provided.
 | `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | World pose in **local ENU** (origin = launch point, axes East/North, yaw **absolute** ENU — 0 = East, CCW+), heading fallback, speed, trajectory, travelled distance, georeference input |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS | Robot GPS read-out, georeference input (BEST_EFFORT QoS) |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **Robot glyph heading (preferred source)** — degrees clockwise from north (0=N, 90=E), converted to the app convention (radians CCW from east) as `radians(90 - hdg)`. The fallback is the odom yaw directly, which is absolute ENU too. BEST_EFFORT QoS |
-| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU connected / armed / mode. Only subscribed when `mavros_msgs` imports; absent in simulation |
+| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connected** flag (one of the three readiness inputs); `armed`/`mode` arrive on the same message but nothing displays them. Only subscribed when `mavros_msgs` imports; absent in simulation |
+| `/mavros/battery` | `sensor_msgs/BatteryState` | MAVROS (`sys_status`) | Battery charge in the left panel's ROBOT section. `percentage` is a **0..1 fraction** (MAVROS divides the MAVLink percent by 100); `percentage`/`voltage` arrive NaN when the FCU reports neither and are then shown as "no data" rather than as a number. BEST_EFFORT QoS. Real boat only — no simulation graph publishes it |
 | `/blueboat/pinger_coordinates` | `Float32MultiArray[3]` | `robot_interface.py` | Pinger in **robot/body frame** (sensor-fused); distance; world position computed once per message, with the pose concurrent with it, and held fixed in between (§3 N4) |
 | `/uw_gps_data` | `Float32MultiArray[19]` | `uwgps_log.py` | Timestamp of the last raw USBL packet ("Last update" field) |
 | `/monitoring_data` | `Float32MultiArray[9]` `[t,x,y,ψ,x_d,y_d,ψ_d,u1,u2]` | `master_control.py` | **Current path target** `(x_d, y_d)` → target line and robot↔path distance; no recomputation of the controller's target |
@@ -24,10 +25,11 @@ defaults below match the stack as provided.
 
 | Topic | Type | Payload | Effect (robot side) |
 |---|---|---|---|
-| `/blueboat/input_str` | `std_msgs/String` | `"default"` | `robot_interface.str_input_callback` → forwarded to `param_set` → safe parameters; echoed on `/blueboat/param_mode`. Published by **Emergency Stop** and by the mode-toggle button. |
+| `/blueboat/input_str` | `std_msgs/String` | `"default"` | `robot_interface.str_input_callback` → forwarded to `param_set` → safe parameters; echoed on `/blueboat/param_mode`. Published by **Stop Mission** / app exit (the safe-shutdown sequence), by **E-STOP + Stop Override**, and by the Default/Override toggle. **Not** by E-STOP alone. |
 | `/blueboat/input_str` | `std_msgs/String` | `"override"` | Direct-control parameters; the other state of the toggle button. |
+| `/blueboat/input_str` | `std_msgs/String` | `"stop"` | **The emergency primitive.** `robot_interface.full_stop()` zeroes the thrust, closes the motor gate, disarms and **latches** until an explicit `enable`. Stays in override and terminates nothing. Published by both E-STOP buttons. |
 | `/blueboat/manual_target` | `Float32MultiArray[2]` | `[x, y]` world metres | `master_control` steers to it with LoS, overriding the mission. |
-| `/blueboat/manual_target` | `Float32MultiArray[2]` | `[0.0, 0.0]` | Sentinel: `master_control` resumes the original mission. Published automatically when Manual Target mode is deactivated. |
+| `/blueboat/manual_target` | `Float32MultiArray[2]` | `[0.0, 0.0]` | Sentinel: `master_control` resumes the original mission. Published **only** by the explicit **Continue Original Mission** action (`main_window._on_continue_mission`); arming or disarming Manual Target publishes nothing, and a genuine origin click is nudged by `1e-3` (N2). |
 | `/sim/sea_state/command` | `std_msgs/String` (JSON) | `{"current": {"preset": "strong", "from_deg": 90}, "waves": {"preset": "slight", "from_deg": 45}, "ramp_s": 20}` or `{"schedule": <blueboat_sea_schedule/1>, "t0": "now"}` | **Simulation only.** "Modify situation…" in the floating SEA STATE box; the simulator ramps to the new situation, never steps. |
 
 Equivalent shell commands (what the buttons do):
@@ -55,7 +57,13 @@ The request is **held until the map frame is anchored**
 immediately in simulation. A briefly empty map right after a real-water
 launch is expected, not a fault.
 The horizon is `launch.path_preview_total_time_s` (120 s by default); a
-designer trajectory's own `duration_s` replaces it automatically.
+designer trajectory's own `duration_s` replaces it automatically, so long custom
+missions are previewed completely.
+
+The station calls the service itself rather than subscribing to `/set_path`,
+because `path_publisher.py` is started only by `Sim_launch.py` and by the
+simulator's `full_mission_launch.py` — there is no `/set_path` on the real boat,
+so depending on it would break every real-robot run (`CLAUDE.md` §3 N7).
 
 ## Mission launch
 
@@ -71,8 +79,17 @@ runs instead:
 ```
 ros2 launch blueboat_control Sim_launch.py \
     robot_file:=<name> trajectory:=<name> controller_type:=<PID|LoS|MPC> \
-    [spawn_yaw:=<radians>]
+    note:=<str> [spawn_yaw:=<radians>]
 ```
+
+`note:=` is the same argument as on the real boat and the dialog's **Log
+note** field feeds it in both modes: `simulation_interface` names its
+position log `{date}-{note}-poslog.csv` exactly as `robot_interface` does.
+A simulated run's note always carries the `sim` marker — `note:=sim` with
+an empty field (`Sim_launch.py`'s own default, so that case is unchanged),
+`note:=sim-<note>` with one — and the text is sanitised into a single
+filename-safe token (`LaunchParameters.wire_note` /
+`launch_manager.sanitize_note`).
 
 That graph consists of the Gazebo world, `simulation_interface.py`
 (publishes `/blueboat/controller_ready` and `/monitoring_data`, consumes
@@ -87,14 +104,21 @@ arrive (the command is still published; the publish-before-terminate
 ordering is preserved).
 
 **GPS-anchored missions in simulation** take the same deferred-deploy path
-as on real water: the dialog passes a random `spawn_yaw` (boat spawns at
-Gazebo (0, 0) with an arbitrary heading) and the station's own bridge node
+as on real water: the dialog passes a **fixed** `spawn_yaw`
+(`LaunchConfig.sim_spawn_yaw_deg`, 0° = east by default; the boat always
+spawns at Gazebo (0, 0)) and the station's own bridge node
 synthesises the GPS feed — a 5 Hz timer converts the sim odom (world
 metres) to lat/lon about a receiver origin placed
 `SimGpsConfig.offset_north_m` (10 m) north of the mission's first point,
 publishing `sensor_msgs/NavSatFix` on `/mavros/global_position/global`
 (nothing else publishes it in the sim graph) with configurable Gaussian
-noise. Its own subscription receives the fixes back, so anchoring,
+noise drawn from a **seeded** generator (`SimGpsConfig.noise_seed`).
+Spawn pose and fix noise are both deterministic deliberately: the boat
+starts at the same pose and the anchor converges to the same translation
+on every run of a mission, so two simulated runs are comparable and a
+difference between them is the change under test. One run can still be
+started from another heading with `spawn_yaw:=<radians>` in Extra args,
+which is appended last and therefore wins. Its own subscription receives the fixes back, so anchoring,
 satellite tiles, diagnostics and the deferred deployment run identically
 to a field trial — which is the point: an offline-planned GPS path can be
 rehearsed in sim before the real-world session. Non-anchored sim missions
@@ -110,7 +134,7 @@ selected path. Choosing one runs, instead of `Sim_launch.py`:
 ros2 launch blueboat_sss_sim full_mission_launch.py \
     world_dir:=<abs world folder> with_control:=true \
     trajectory_file:=<trajectories>/.deployed/<name>.yaml \
-    controller_type:=<PID|LoS|MPC>
+    controller_type:=<PID|LoS|MPC> note:=<str>
 ```
 
 With `with_control:=true` that launch starts the same control graph as
@@ -127,8 +151,10 @@ world frame at its true GPS location. Limitations: `full_mission_launch.py`
 declares no spawn arguments, so the boat always spawns at world (0, 0)
 (the first waypoint of the path the world was built from) heading east —
 launching a *different* path in a world means a controller transit to its
-start — and the random `spawn_yaw` of the empty-Gazebo mode does not
-apply. Requires `blueboat_sss_sim` built in the sourced workspace;
+start — and the `spawn_yaw` of the empty-Gazebo mode does not apply (that
+spawn is deterministic too). It does declare `note` and `data_dir`
+(added 2026-09-13 in `BlueBoat-SSS-Sim`, forwarded to
+`simulation_interface`), so the **Log note** reaches this target as well. Requires `blueboat_sss_sim` built in the sourced workspace;
 `ros2 launch` fails fast otherwise and the launch manager returns to idle.
 
 **Sea state (2026-09-03).** Every Gazebo launch — empty world or
@@ -223,147 +249,63 @@ Node termination is never initiated before steps 1–4 complete.
 
 ## Observations on the existing stack (flagged, not silently patched)
 
-Verified against `BlueBoat-Control` on 2026-08-28; frame item 00 added
-2026-08-31. Robot-side code lives in the `BlueBoat-Control` submodule and is
-built there — nothing is copied from this repo (`CLAUDE.md` §6, §3 N9).
+Robot-side code lives in the `BlueBoat-Control` submodule and is built there;
+nothing is copied from this repo (`CLAUDE.md` §6, §3 N9). Anchor on symbol
+names, not line numbers — they drift with that module.
 
-000. **`param_set` could latch `busy` forever — fixed (2026-09-04).**
-   Observed in the field as an override that never locks: `robot_interface`
-   logging `Waiting for param mode 'override' (current: ''), re-requesting…`
-   once a second forever, against `blueboat_parameter_control` answering
-   `Parameter sequence in progress, ignoring request` just as often.
-   `param_set` set `self.busy = True` before its first MAVROS call and cleared
-   it **only inside a `call_async` done-callback**, with no timeout on any of
-   the four calls. A `/mavros/param/pull` that never returned — link drop,
-   mavros restart, a lost ACK — left `busy` True permanently, so every later
-   request was discarded while the requester retried forever. Nothing gave up
-   and nothing said so. Compounding it, `publish_state()` published
-   `param_mode` only when a mode had already been applied, so before the first
-   success the topic was silent and `current` read `''` — indistinguishable
-   from a dead node.
-   Fixed in `BlueBoat-Control`: a wall-clock watchdog abandons a sequence held
-   longer than `param_sequence_timeout_s` (new declared parameter, default
-   20 s — a cold `ParamPull` is genuinely slow); a generation counter fences
-   off futures belonging to an abandoned sequence so a late completion cannot
-   clobber the one that replaced it; `publish_state()` always publishes (`''`
-   meaning "alive, no mode locked"); a 1 Hz heartbeat lets a late station see
-   the mode; and failures schedule a bounded internal retry instead of
-   stopping. **Station-side consequence:** the heartbeat is why the
-   safe-shutdown echo now requires a transition (see above).
+**Open — world-frame pinger is not published.** `robot_interface` computes
+`corrected_pinger` but only writes it to the CSV and the pinger-GPS
+conversion; `/blueboat/pinger_coordinates` carries the **body-frame** vector.
+The station derives the world position itself, once per pinger message, from
+`/blueboat/pinger_coordinates` + `/blueboat/odom` (§3 N4). To make it a single
+source of truth, publish it robot-side on a new topic and point `TopicsConfig`
+at it. Residual marker sluggishness is inherent to the source, not to that
+choice: with `fixed_pinger=False` the vector is seeded from the Waterlinked
+*filtered* acoustic position (seconds of smoothing) and dead-reckoned with odom
+twist between USBL updates.
 
-00b. **Motors could spin with `enable_motors:=False` — fixed (2026-09-04).**
-   The gate itself was sound: `robot_interface.manualMove` returns before every
-   thrust-bearing write to `/mavros/rc/override`. But returning meant
-   publishing **nothing**, and by that point `robot_interface` had already
-   requested `override` *unconditionally*, so `param_set` had mapped
-   `SERVO1_FUNCTION`/`SERVO3_FUNCTION` to RCIN1/RCIN3 passthrough. In that
-   state the ESCs follow RC channels 1 and 3 from *any* source — a hand
-   transmitter, a QGC joystick, ArduPilot's RC failsafe — and nothing was
-   feeding `RC_OVERRIDE_TIME` to keep those channels ours.
-   Fixed by making the closed gate **hold neutral** rather than go silent:
-   while in override with motors disabled, `manualMove` streams 1500/1500 at
-   the loop rate (0 N is an exact knot of the calibration table, and the
-   reversed side is `3000 − 1500 = 1500`). No commanded thrust reaches the
-   water — which is all the gate ever promised — and the CSV's
-   `actuation_state` still reports `0` for the whole run. Superproject **CM-16
-   is reworded accordingly**: the gate now means "only neutral PWM may be
-   written while disabled", not "nothing may be written".
+**Carried deliberately — keep-position semantics.** YAML trajectories clamp at
+their final pose forever, so every controller station-keeps at the end of a
+custom path. A **manual** target is held the same way: `master_control` gives it
+its own arrival state (`manual_keep_location`, hold/reacquire radii) and consults
+neither `safety_distance` nor `stopping_sequence` for it. Those two govern the
+**pinger branch alone** — `safety_distance` defaults to `-1.0` on the real boat
+(arrival check off) and `+1.0` in simulation, and the `stopping_sequence` latch
+it arms is cleared on every new manual target. **Do not raise `safety_distance`
+without reading `CLAUDE.md` §6 first.**
 
-00c. **No shutdown hook on `robot_interface` or `param_set` — fixed
-   (2026-09-04).** Both ended in a bare `rclpy.spin(node)`, so `KeyboardInterrupt`
-   skipped straight past `destroy_node()`: the boat was left in RC passthrough
-   with nobody streaming, and the position CSV was never closed. Both now run a
-   `try/except KeyboardInterrupt/finally` (the pattern `master_control.py`
-   already used). `robot_interface` stops the motors, releases the RC channels,
-   requests `default`, closes the CSV and then writes the post-mission report;
-   `param_set` restores the default servo mapping, bounded to ~3 s so teardown
-   cannot hang. Both are best-effort and independent — mavros is usually dying
-   in the same process group — so an operator `default` before shutdown remains
-   the reliable route (CM-15).
+**Carried deliberately — MPC self-orbits on `fsin`.** Under MPC on the `fsin`
+trajectory the boat locks into a circle near the start while the reference runs
+ahead. The `fsin` reference is a chain of near-closed ~2 m loops (364.75°
+heading swing per half-cycle) and the MPC cost/governor settles into a
+self-orbit once displaced. Mechanism and remedies:
+`BlueBoat-Control/.claude/TODO.md` §0.3 ("MPC on `fsin` — orbit limit
+cycle"). The map is displaying the truth — nothing to compensate here.
 
-00. **`/blueboat/odom` frame — fixed to local ENU (2026-08-31).**
-   `robot_interface.odom_callback` used to translate the MAVROS position to
-   the launch point but ALSO re-zero yaw (`yaw − yaw0`) without rotating the
-   position axes — a hybrid frame (ENU axes, launch-relative heading) that
-   was self-consistent only when the boat launched facing East. This was the
-   root cause of the field symptoms "trajectory following only works starting
-   East", wrong manual-target behaviour and broken GPS anchoring. The fix
-   (committed in `BlueBoat-Control`) drops the yaw re-zeroing: the frame is
-   now **local ENU** — origin = launch point, +x = East, yaw absolute — the
-   same frame kind the simulator publishes. The station's rotation-estimation
-   machinery (Kabsch fit, `heading_aligned`, two scene regimes) was removed
-   with it; see `GPS_MAP_ARCHITECTURE.md`. **A boat running a stale build
-   reintroduces the hybrid frame silently** — rebuild `/blueboat_ws` before
-   trusting the map.
+**Cosmetic.** `robot_interface` publishes monitoring on the *relative*
+`blueboat/monitoring_data` while `master_control` uses the global
+`/monitoring_data`; the station follows `master_control`.
 
-0. **Monitoring target frame — uniform WORLD in every branch.**
-   `master_control.py` captures the world target *before* its
-   `inRobotFrame(...)` conversion and monitors that, in all four controller
-   branches (the `# --- world-frame monitoring target ---` markers), so
-   `/monitoring_data`'s `x_d/y_d` no longer mix frames per branch. Control
-   behaviour and `/controller_target` are untouched. **The station's display
-   and `robot_interface`'s no-pinger CSV both rely on this**, and the app
-   applies no frame fixup of its own — re-adding one would double-convert
-   (§3 N3).
-   *Residual risk is deployment, not source:* a boat running a **stale build**
-   that predates the capture sends robot-frame LoS/manual/pinger targets, so
-   `store.active_target_world()` — which in path mode is `/monitoring_data[4:5]`
-   — draws the robot→target line at a meaningless point while the boat still
-   tracks its path correctly. The symptom looks cosmetic; the fix is to rebuild
-   the boat workspace at the SHA the superproject records (`TODO.md` A3), never
-   to compensate in the station.
-   Frame answer for the record: the manual target is WORLD-frame on the wire
-   (converted by `inRobotFrame` before `solve_LoS`); the pinger target is
-   ROBOT-frame on the wire (passed directly) — both reach `solve_LoS` in the
-   robot frame, so LoS is consistent.
+### Fixed in `BlueBoat-Control` — but only if the boat is rebuilt
 
-0b. **Keep-position semantics** — YAML trajectories clamp at their final pose
-   forever, so every controller station-keeps at the end of a custom path; the
-   hard-coded shapes already "default to last known point". For the manual
-   target, the default `safety_distance = -1.0` disables the LoS arrival check,
-   so the boat naturally station-keeps on the fixed target. **Do not raise
-   `safety_distance` without reading `CLAUDE.md` §6 first** — it owns the
-   current-state fact about the `stopping_sequence` latch that follows from it.
+These four are fixed at the source. There is no version handshake on a ROS
+topic, so a boat running a **stale build** reintroduces each one silently.
+Rebuild `/blueboat_ws` at the SHA the superproject records before any field
+session, and never compensate for them in the station.
 
-1. ~~Manual-target resume comparison~~ — **fixed** in `BlueBoat-Control`. The
-   guard is now `list(self.manual_target) != [0.0, 0.0]`
-   (`master_control.py:406`), so the `array('f')`-vs-`list` mismatch is
-   gone and the `[0,0]` resume sentinel is recognised. "Continue Original
-   Mission" needs no robot-side change.
-2. ~~Pinger branch publishes the target on `/thruster_input`~~ — **fixed**. The
-   "Publish controller target (for data recording)" block uses
-   `self.target_publisher.publish(msg)` (`master_control.py:517`); the thrust
-   stream carries thrust only.
-3. **World-frame pinger not published** — still open. `robot_interface`
-   computes `corrected_pinger` (`:599`) but only writes it to the CSV and the
-   pinger-GPS conversion; `/blueboat/pinger_coordinates` carries the body-frame
-   vector. The station derives the world position itself, once per pinger
-   message, from `/blueboat/pinger_coordinates` + `/blueboat/odom` (§3 N4). If
-   you prefer a single source of truth, publish it robot-side on a new topic
-   and point `TopicsConfig` at it.
-4. Cosmetic: `robot_interface` publishes monitoring on
-   `blueboat/monitoring_data` (relative) while `master_control` uses the
-   global `/monitoring_data` — the station follows `master_control`.
-5. **MPC on `fsin` orbits — expected from the current construction, not a
-   station bug (2026-09-01).** Observed on the station map: under MPC on the
-   `fsin` trajectory the boat locks into a perfect circle near the start
-   while the reference runs ahead (live-distance plot oscillating at the
-   loop period, growing). The `fsin` reference itself is a chain of
-   near-closed ~2 m loops (364.75° heading swing per half-cycle), and the
-   MPC's cost/governor combination settles into a self-orbit once displaced.
-   Full mechanism and the sim-only remedies:
-   `BlueBoat-Control/blueboat_control/src/CONTROLLERS.md` finding **C10**
-   and that module's `TODO.md` §0.3. Nothing to compensate in the station —
-   the map is displaying the truth.
+| Was | Symptom on a stale build |
+|---|---|
+| `/blueboat/odom` published a **hybrid frame** (ENU axes, launch-relative yaw) — the yaw re-zeroing is gone, the frame is now local ENU | GPS map, manual targets and trajectory following all break for any launch heading but East. This was the root cause of "trajectory following only works starting East" |
+| `/monitoring_data`'s `x_d/y_d` mixed frames per controller branch — `master_control` now captures the **world** target before `inRobotFrame()` in all five branches | The robot→target line is drawn at a meaningless point (and the no-pinger CSV `target_*` columns are corrupted) while the boat still tracks its path correctly. Looks cosmetic; is not |
+| `param_set` could latch `busy` forever when a MAVROS call never returned — now watchdogged, generation-fenced, and heartbeating `param_mode` at 1 Hz | Override never locks: `Waiting for param mode 'override' (current: '')` against `Parameter sequence in progress, ignoring request`, forever. The heartbeat is also why the safe-shutdown echo now requires a *transition* |
+| A closed motor gate published **nothing** while `robot_interface` had already requested `override`, so `SERVO1/3_FUNCTION` sat on RCIN passthrough — the gate now streams neutral 1500/1500 | With `enable_motors:=False`, the ESCs follow RC channels 1 and 3 from any transmitter or QGC joystick |
+| `robot_interface` / `param_set` ended in a bare `rclpy.spin()` — both now have `try/finally` teardown | Ctrl-C leaves the boat in RC passthrough with nobody streaming, and the position CSV unclosed |
 
-**Path-following speed.** The old "LoS crawls in path-following mode" analysis
-that used to sit here is superseded: path following now uses `los_guidance()`
-(canonical Fossen lookahead with a path-parameter governor,
-`master_control.py:648-697`) at a 20 Hz loop, and `solve_LoS` — whose thrust
-law is `v = 5·ln(0.15·d + 1)`, doubled to `10·ln(v + 1)` for manual targets
-(`:426`, `:429`) — is reached only for pinger and manual point targets. What
-remains is a field measurement, tracked as `TODO.md` C5. Never compensate for
-it in the station.
+**Path-following speed** is a field measurement, not a defect: path following
+uses `los_guidance()` (Fossen lookahead with a path-parameter governor) at
+20 Hz, and `solve_LoS` — thrust law `v = 5·ln(0.15·d + 1)`, doubled for manual
+targets — is reached only for pinger and manual point targets. Never
+compensate for it in the station.
 
 ## QoS
 
@@ -386,43 +328,21 @@ covered by `robot_interface`'s periodic re-publish (every 1 s) rather than by
 durability.
 
 
-## CSV logging layout (`robot_interface.py`)
+## Controller rate
 
-Columns are reorganised **important-first, names unchanged**: date fields,
-`relative_x/y/psi`, `target_x/y[/psi]`, [`corrected_pinger_x/y`, GPS,
-pinger GPS,] `right_thr_in`,`left_thr_in`, then raw sensors (and raw USBL
-fields in pinger mode). Rows are filled **by column name**, the swapped
-thruster columns are fixed (`thruster_input` is `[right, left]`), and the
-no-pinger target now logs the world-frame `/monitoring_data` target for
-every controller (empty buffer → zeros, no debug spam). In **pinger mode**
-the duplicated `target_x/y/psi` columns were removed: they held
-`/controller_target`, i.e. the same pinger vector as `corrected_pinger_x/y`
-but in the robot frame — redundant. The world-frame `corrected_pinger_x/y`
-columns are kept; the no-pinger CSV still logs `target_x/y` (its only
-target source).
+The `master_control` loop runs at **20 Hz** — `self.dt = dbl('control_dt', 0.05)`,
+a declared ROS parameter, so it is settable per launch. `/monitoring_data` follows
+that rate, which is why `diagnostics.expected_hz` is `20.0`.
 
-The `master_control` loop runs at **20 Hz** — `self.dt = dbl('control_dt',
-0.05)` (`master_control.py:263`), now a declared ROS parameter; the file header
-(`:1-15`) records the move off the old 1 Hz loop. `/monitoring_data` and the
-target-column refresh follow that rate, so the station's
-`diagnostics.expected_hz` of `20.0` is correct and needs no change.
-
-## Pinger latency (field observation explained)
-
-The marker used to trail the robot because the station re-anchored the
-latest body-frame pinger vector to *every new robot pose*; it now computes
-the world position once per `/blueboat/pinger_coordinates` message, with
-the pose concurrent with that message, and holds it fixed in between.
-Residual sluggishness is robot-side and inherent: with
-`fixed_pinger=False` the published vector is seeded from the Waterlinked
-*filtered* acoustic position (seconds of smoothing) and dead-reckoned with
-odom twist between USBL updates — drift there shows up as slow marker
-convergence, not as robot-following.
+The position CSV the boat writes is **not** a station artefact: its column layout
+is defined by `BlueBoat-Control/blueboat_control/src/_custom_libraries/robot_log_schema.py`
+(`COLUMNS_PINGER` / `COLUMNS_NO_PINGER`), a ROS-free module — read that to consume
+the CSV offline.
 
 ## Designer trajectories — how `path_generation.py` loads them
 
 The Survey Pattern Designer exports `blueboat_trajectory/1` YAML files
-(specification: `08_trajectory_format.md`). The YAML path affects **only the
+(specification: `05_trajectory_format.md`). The YAML path affects **only the
 loading mechanism** of `path_generation.py`; `generate_path()` and every
 hard-coded trajectory are untouched.
 
@@ -437,13 +357,9 @@ Nothing is copied from this repo. Both files are committed in the
   — carries the loader in `__init__` (parses `trajectory:=from_yaml:<path>` or
   the optional `yaml_path` parameter, falls back to `station_keeping` with an
   error log on failure), the `from_yaml` branch at the top of `single_pose()`,
-  and an **mtime watcher** that reloads when the file appears or changes:
-
-  ```python
-  if path_shape.startswith('from_yaml') and self.yaml_traj is not None:
-      x, y, z, roll, pitch, yaw = yt.read_yaml(self.yaml_traj, t)
-      ...
-  ```
+  and an **mtime watcher** that reloads when the file appears or changes. Until
+  the file exists the branch returns a zero pose, which is the station-keeping
+  hold that makes deferred GPS deployment possible.
 
 To change either one: edit it in the `BlueBoat-Control` submodule, commit
 there, and `colcon build` the boat's workspace. No launch-file modification is
@@ -454,36 +370,9 @@ needed — the YAML path rides inside the existing `trajectory` argument
 Station side, saved missions appear automatically in **Launch Mission →
 Trajectory → custom paths**; selecting one builds the `from_yaml:` string.
 GPS-anchored missions are labelled **“(GPS)”** and follow the deferred
-deployment flow of `08_trajectory_format.md`: the node holds a station-keeping
+deployment flow of `05_trajectory_format.md`: the node holds a station-keeping
 pose at the origin until the station writes the deployed file, which the mtime
 watcher then picks up on its next path request. That hold is what makes
-deferred, GPS-anchored deployment possible — it is not a hang; see
-`07_getting_started.md` for what the operator does about it.
-
-## Mission-path preview and `path_publisher.py`
-
-The station previews the mission path by calling the **`/path_request`
-service directly** (the same request `path_publisher.py` makes at startup),
-so the preview works identically on the real robot and in simulation and
-never depends on `path_publisher`. The request horizon is
-`launch.path_preview_total_time_s` (default 120 s, configurable); for
-designer trajectories the YAML's own `duration_s` replaces it
-automatically, so long custom missions are previewed completely.
-
-`path_publisher.py` itself is only started by `Sim_launch.py`. It is not
-simulation-specific code — it merely was never added to the real-robot
-launch. To make it available in the real world (e.g. to keep RViz support),
-add to `BlueBoat_launch.py` inside the `controller_type != ''` /
-`use_pinger == False` branch, next to `path_generation.py`:
-
-```python
-sl.node('blueboat_control',
-        'path_publisher.py',
-        parameters={'total_time': 300.0,   # horizon in seconds
-                    'dt': 0.5})
-```
-
-Its 120 s "time limit" is just the default of its declared `total_time`
-parameter — override it as above (match the mission duration; for YAML
-trajectories, the `duration_s` field of the file). Note it also busy-waits
-for the service at startup, which is harmless in this launch ordering.
+deferred, GPS-anchored deployment possible — it is not a hang, and the
+operator does nothing: the deploy lands within seconds of the first fixes,
+with no driving needed.

@@ -1,4 +1,4 @@
-"""Mission Pattern Designer — main window.
+"""Survey Pattern Designer — main window.
 
 A small application inside the Mission Control Station: file toolbar
 (New / Open / Save / Save As / Duplicate / Rename / Delete), editing toolbar
@@ -6,10 +6,14 @@ A small application inside the Mission Control Station: file toolbar
 undo / redo), the interactive :class:`~mcs.designer.designer_map.
 DesignerMapView`, and a right column with the mission tree, the properties
 panel, the pattern library and the mission settings (speed / loop /
-comment). Live robot / pinger overlays and the satellite layer come from
-the main station's :class:`~mcs.models.store.DataStore` when available; a
-manual **Set GPS Origin** (Google-Maps format) provides georeferencing
-otherwise.
+comment).
+
+Georeferencing is **always explicit**: **Set GPS Origin** takes typed
+coordinates, a Gazebo world's anchor, or a one-off snapshot of the robot's
+current fix, and opening a mission restores its own ``geo_anchor``. The
+station's live georeference is never adopted, and no live robot or pinger
+is drawn -- see :meth:`DesignerWindow._active_fit` for what that used to
+cost.
 
 Undo/redo is snapshot-based (see :mod:`mcs.designer.model`); every mutating
 entry point calls :meth:`_push_undo` first.
@@ -66,12 +70,21 @@ _LOG = logging.getLogger(__name__)
 
 
 class DesignerWindow(QMainWindow):
-    """The Survey Pattern editor window (non-modal)."""
+    """The Survey Pattern editor window (non-modal).
+
+    Deliberately **independent of live telemetry**. The editor's georeference
+    is whatever anchor the operator set or the opened file carries, and the
+    only thing the station's :class:`~mcs.models.store.DataStore` is used for
+    is :meth:`_set_gps_origin_from_robot`, a one-off snapshot of the boat's
+    current fix. Nothing here reacts to a GPS lock arriving, changing or being
+    lost, so a mission drawn or edited at any moment is the same mission.
+    """
 
     def __init__(self, cfg: AppConfig, store=None, parent=None) -> None:
         super().__init__(parent)
         self._cfg = cfg
-        self._store = store            # main DataStore | None (overlays, geo)
+        # Read once, by the "From the Robot's Current Position" action only.
+        self._store = store            # main DataStore | None
         self._dir = Path(cfg.designer.trajectories_dir)
         self.setWindowTitle("Survey Pattern Designer")
         self.resize(1250, 800)
@@ -82,7 +95,10 @@ class DesignerWindow(QMainWindow):
         self._redo: list[dict] = []
         self._clipboard: list[dict] = []
         self._dirty = False
+        # The design anchor and where it came from. Always set through
+        # _set_anchor; never derived from live telemetry (see _active_fit).
         self._manual_fit: GeoFit | None = None
+        self._anchor_source = ""
         # Gazebo world the anchor was taken from (Set GPS Origin ▸ From a
         # Gazebo World): (world dir, parsed metadata). Transient window
         # state — never on the model, never in undo, never in the saved
@@ -101,6 +117,8 @@ class DesignerWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self._build_toolbar()
+        self._anchor_label = QLabel("")
+        self.statusBar().addPermanentWidget(self._anchor_label)
         self._stats = QLabel("")
         self.statusBar().addPermanentWidget(self._stats)
 
@@ -121,10 +139,6 @@ class DesignerWindow(QMainWindow):
         self._resample_timer.setSingleShot(True)
         self._resample_timer.setInterval(60)
         self._resample_timer.timeout.connect(self._resample)
-
-        self._overlay_timer = QTimer(self)
-        self._overlay_timer.timeout.connect(self._refresh_overlays)
-        self._overlay_timer.start(250)
 
         self._on_structure_changed()
         self._update_geo_fit(center=True)
@@ -207,6 +221,8 @@ class DesignerWindow(QMainWindow):
         gps_menu.addAction("Enter Coordinates…", self._set_gps_origin)
         gps_menu.addAction("From a Gazebo World…",
                            self._set_gps_origin_from_world)
+        gps_menu.addAction("From the Robot's Current Position…",
+                           self._set_gps_origin_from_robot)
         gps_btn.setMenu(gps_menu)
         files.addWidget(gps_btn)
         files.addSeparator()
@@ -218,18 +234,11 @@ class DesignerWindow(QMainWindow):
         self._grid_box.setChecked(True)
         self._grid_box.toggled.connect(self._on_grid)
         files.addWidget(self._grid_box)
-        self._robot_box = QCheckBox("Robot")
-        self._robot_box.setChecked(True)
-        files.addWidget(self._robot_box)
-        self._pinger_box = QCheckBox("Pinger")
-        self._pinger_box.setChecked(True)
-        files.addWidget(self._pinger_box)
 
         edit = QToolBar("Edit")
         edit.setMovable(False)
         self.addToolBar(edit)
-        self._add_action = act(edit, "✚ Add Waypoints", self._toggle_add,
-                               "A", checkable=True)
+        act(edit, "✚ Add Waypoints", self._toggle_add, "A", checkable=True)
         edit.addSeparator()
         act(edit, "Align ─", lambda: self._simple_edit(
             lambda: self.model.align(self._selection(), "y")), "Ctrl+Shift+H")
@@ -530,35 +539,35 @@ class DesignerWindow(QMainWindow):
         self.map.grid_visible = on
         self.map.viewport().update()
 
-    # =============================================================== overlays
-    def _refresh_overlays(self) -> None:
-        robot = pinger = None
-        if self._store is not None:
-            r = self._store.robot
-            if r.has_odom:
-                robot = (r.x, r.y, r.yaw)
-            pinger = self._store.pinger.world
-        self.map.refresh_overlays(robot, pinger,
-                                  self._robot_box.isChecked(),
-                                  self._pinger_box.isChecked())
-        # Keep the georeference live: a fix arriving after the window opened
-        # must enable the satellite layer, and refits must reach the tiles /
-        # GPS read-outs (the fit used to be a construction-time snapshot).
-        self._update_geo_fit()
-
+    # ============================================================ georeference
     def _active_fit(self):
         """The design frame's georeference: a translation-free GeoFit whose
         ``(lat0, lon0)`` is the GPS of the design origin, so that a design
         point ``(x, y)`` maps to GPS exactly as :func:`io_yaml.deploy_mission`
-        will map it (design frame == local ENU about the anchor). Derived
-        from the station's live fit when valid (the design origin is then the
-        robot's world origin), else the manual GPS origin, else None."""
-        if self._store is not None and self._store.geo.is_valid:
-            live = self._store.geo.fit
-            lat0, lon0 = live.world_to_latlon(0.0, 0.0)
-            return GeoFit(tx=0.0, ty=0.0, lat0=lat0, lon0=lon0,
-                          rms_m=live.rms_m, n_pairs=live.n_pairs)
+        will map it (design frame == local ENU about the anchor).
+
+        It is **only ever** the anchor an operator set explicitly, or the one
+        carried by the file being edited -- see :meth:`_set_anchor`. The
+        station's live georeference is deliberately NOT consulted: it used to
+        be preferred here whenever the app held a GPS lock, which silently
+        replaced the mission's own anchor with the boat's launch point. Every
+        geographic thing in the editor (tiles, per-waypoint GPS read-outs, the
+        world-limits rectangle) then translated by the distance between the
+        two, and saving re-wrote ``geo_anchor`` from it, corrupting the file
+        on disk. ``None`` means an un-anchored mission, whose design frame is
+        the robot's local-ENU world frame by convention (see Align to Start).
+        """
         return self._manual_fit
+
+    def _set_anchor(self, fit, source: str) -> None:
+        """Adopt *fit* as the design anchor, recording where it came from.
+
+        The single entry point for all four sources (a typed origin, a Gazebo
+        world, the robot's current fix, an opened mission), so the read-out and
+        the map can never disagree about which anchor is in force."""
+        self._manual_fit = fit
+        self._anchor_source = source
+        self._update_geo_fit()
 
     def _update_geo_fit(self, center: bool = False) -> None:
         fit = self._active_fit()
@@ -566,11 +575,25 @@ class DesignerWindow(QMainWindow):
         self._sat_box.setEnabled(fit is not None)
         if fit is None:
             self._sat_box.setChecked(False)
+        self._update_anchor_label(fit)
         if center:
-            if self._store is not None and self._store.robot.has_odom:
-                self.map.centerOn(self._store.robot.x, self._store.robot.y)
-            else:
-                self.map.centerOn(0.0, 0.0)
+            self.map.centerOn(0.0, 0.0)
+
+    def _update_anchor_label(self, fit) -> None:
+        if fit is None:
+            self._anchor_label.setText(
+                "Anchor: none — design frame = the boat's launch point")
+            self._anchor_label.setToolTip(
+                "This mission is not GPS-anchored: its coordinates are metres "
+                "in the robot's local-ENU world frame, whose origin is wherever "
+                "the boat is launched. Set a GPS origin to pin it to the ground.")
+            return
+        self._anchor_label.setText(
+            f"Anchor: {fit.lat0:.6f}, {fit.lon0:.6f} ({self._anchor_source})")
+        self._anchor_label.setToolTip(
+            "GPS of design (0, 0). Saved into the mission as geo_anchor and "
+            "used to deploy it into whatever world frame the boat comes up "
+            "with. It never follows the station's live GPS.")
 
     def _set_gps_origin(self) -> None:
         text, ok = QInputDialog.getText(
@@ -586,15 +609,48 @@ class DesignerWindow(QMainWindow):
                                 "'lat, lon' e.g. 33.660196, 130.657780")
             return
         # Design (0,0) := the entered GPS point; axes aligned with east/north.
-        self._manual_fit = GeoFit(tx=0.0, ty=0.0,
-                                  lat0=latlon[0], lon0=latlon[1],
-                                  rms_m=0.0, n_pairs=0)
-        self._update_geo_fit()
+        self._set_anchor(GeoFit(tx=0.0, ty=0.0,
+                                lat0=latlon[0], lon0=latlon[1],
+                                rms_m=0.0, n_pairs=0), "typed")
         self._sat_box.setChecked(True)   # imagery is what the origin is for
         self.map.centerOn(0.0, 0.0)
         self.statusBar().showMessage(
             f"GPS origin set: {latlon[0]:.6f}, {latlon[1]:.6f} — satellite "
             "layer available.", 6000)
+
+    def _set_gps_origin_from_robot(self) -> None:
+        """Snapshot the boat's CURRENT GPS fix as the design origin, once.
+
+        This is the only place the designer reads live telemetry. The anchor
+        it produces is then an ordinary fixed property of the mission -- it
+        never re-latches, and a later fix does not move the design frame under
+        the operator (which is exactly the failure this window used to have).
+
+        The boat's current position is used rather than its world origin
+        because it needs only a raw fix, not a converged georeference, and
+        "design (0, 0) = where the boat is now" is what the operator means.
+        Which point is chosen does not change where the mission executes: an
+        anchored mission is deployed through GPS either way.
+        """
+        robot = self._store.robot if self._store is not None else None
+        if robot is None or robot.lat is None or robot.lon is None:
+            QMessageBox.warning(
+                self, "From the Robot's Current Position",
+                "No GPS fix from the robot.\n\nThe station needs a "
+                "/mavros/global_position/global fix before its position can "
+                "be used as a design origin. Enter coordinates manually "
+                "instead, or wait for a fix.")
+            return
+        lat, lon = float(robot.lat), float(robot.lon)
+        self._clear_world_ref()
+        self._set_anchor(GeoFit(tx=0.0, ty=0.0, lat0=lat, lon0=lon,
+                                rms_m=0.0, n_pairs=0), "robot")
+        self._sat_box.setChecked(True)
+        self.map.centerOn(0.0, 0.0)
+        self.statusBar().showMessage(
+            f"GPS origin set from the robot: {lat:.6f}, {lon:.6f} — this is a "
+            "one-off snapshot; the design frame will not follow the boat.",
+            8000)
 
     def _set_gps_origin_from_world(self) -> None:
         """Anchor the design frame on a generated Gazebo world.
@@ -621,16 +677,16 @@ class DesignerWindow(QMainWindow):
                 "'blueboat_world_meta/1' with geo_anchor and limits).")
             return
         anchor = meta["geo_anchor"]
-        # Design (0,0) := the world's origin; axes aligned with east/north.
-        self._manual_fit = GeoFit(tx=0.0, ty=0.0,
-                                  lat0=float(anchor["lat0"]),
-                                  lon0=float(anchor["lon0"]),
-                                  rms_m=0.0, n_pairs=0)
         self._world_ref = (mp.parent, meta)
         self.map.set_world_limits(
             (meta.get("limits") or {}).get("corners_gps"),
             f"{mp.parent.parent.name}/{mp.parent.name}")
-        self._update_geo_fit()
+        # Design (0,0) := the world's origin; axes aligned with east/north.
+        self._set_anchor(GeoFit(tx=0.0, ty=0.0,
+                                lat0=float(anchor["lat0"]),
+                                lon0=float(anchor["lon0"]),
+                                rms_m=0.0, n_pairs=0),
+                         f"world: {mp.parent.name}")
         self._sat_box.setChecked(True)
         self.map.centerOn(0.0, 0.0)
         self.statusBar().showMessage(
@@ -662,6 +718,9 @@ class DesignerWindow(QMainWindow):
         self.model.from_dict({"speed": self._cfg.designer.default_speed_mps,
                               "items": []})
         self._clear_world_ref()
+        # The anchor belongs to the mission, so a new one starts un-anchored
+        # rather than silently inheriting the previous mission's origin.
+        self._set_anchor(None, "")
         self._undo.clear()
         self._redo.clear()
         self._dirty = False
@@ -702,7 +761,7 @@ class DesignerWindow(QMainWindow):
         # design frame is local ENU, so theta_deg is always 0 (kept for
         # legacy readers). This is what links every waypoint to real GPS
         # coordinates and lets the station deploy the mission into the
-        # robot's per-run world frame (docs/08).
+        # robot's per-run world frame (docs/05_trajectory_format.md).
         fit = self._active_fit()
         anchor = None
         if fit is not None:
@@ -734,14 +793,18 @@ class DesignerWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected:
             self._clear_world_ref()
             anchor = io_yaml.load_mission(self._dir, dialog.selected, self.model)
+            # Whatever the file declares wins, including "nothing": an
+            # un-anchored mission must not pick up the previous file's origin
+            # and be saved as GPS-anchored to a place it was never drawn at.
+            self._set_anchor(None, "")
             if anchor is not None:
                 # The GPS origin the mission was designed with is remembered:
                 # restore it so satellite imagery and GPS readouts are
                 # immediately available for further editing.
-                self._manual_fit = GeoFit(
+                self._set_anchor(GeoFit(
                     tx=0.0, ty=0.0, lat0=float(anchor["lat0"]),
-                    lon0=float(anchor["lon0"]), rms_m=0.0, n_pairs=0)
-                self._update_geo_fit()
+                    lon0=float(anchor["lon0"]), rms_m=0.0, n_pairs=0),
+                    "mission")
                 self._sat_box.setChecked(True)
                 if float(anchor.get("theta_deg", 0.0)) != 0.0:
                     # Legacy anchor: points are in a rotated design frame.
@@ -759,7 +822,6 @@ class DesignerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._confirm_discard():
-            self._overlay_timer.stop()
             self._resample_timer.stop()
             event.accept()
         else:

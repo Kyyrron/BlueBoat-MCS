@@ -88,7 +88,6 @@ class MapView(QGraphicsView):
         self._store = store
         self._mode = MapMode.NORMAL
         self._window: tuple[float, float] | None = None  # timeline (rel t0, t1)
-        self._follow_robot = True
         self._did_initial_center = False
 
         # ---- Scene & view behaviour --------------------------------------
@@ -219,7 +218,6 @@ class MapView(QGraphicsView):
 
     def set_time_window(self, rel_t0: float, rel_t1: float, live: bool) -> None:
         self._window = None if live else (rel_t0, rel_t1)
-        self._window_bounds = (rel_t0, rel_t1)
 
     # ============================================================ visibility
     def set_layer_visible(self, layer: str, visible: bool) -> None:
@@ -430,10 +428,9 @@ class MapView(QGraphicsView):
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
         if self._grid_visible:
-            draw_scale_bar(painter, self.viewport().width(),
-                           self.viewport().height(), self._px_per_m(),
+            draw_scale_bar(painter, self.viewport().height(), self._px_per_m(),
                            getattr(self, "_grid_spacing", 0.0))
-        draw_north_indicator(painter, self.viewport().width(), True)
+        draw_north_indicator(painter, self.viewport().width())
 
     def _px_per_m(self) -> float:
         # The view is never rotated (north-up fixed), so the horizontal

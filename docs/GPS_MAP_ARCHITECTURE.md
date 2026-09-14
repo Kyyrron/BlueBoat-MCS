@@ -44,7 +44,8 @@ The whole architecture rests on the vehicle publishing its odometry in a
 **local-ENU** frame: origin anywhere (typically the power-on/launch point),
 but axes East/North and yaw **absolute** (0 = East, counter-clockwise
 positive). MAVROS `/mavros/local_position/odom` is already exactly this;
-Gazebo's world frame is too.
+Gazebo's world frame is too. (Portable advice — this station subscribes
+`/blueboat/odom`, which `robot_interface` republishes in that same frame.)
 
 If your vehicle republishes odometry through any node, audit that node first.
 Ours re-zeroed yaw at boot (`yaw − yaw0`) while only *translating* the
@@ -154,8 +155,11 @@ north = radians(lat − lat0) · R
     it back — anchor gating, tiles (real imagery of the planned location),
     diagnostics and deferred deployment then run the identical real-water
     path, which is what makes offline-planned GPS missions rehearsable
-    before a field trial. Spawn the vehicle with a random heading to also
-    rehearse anchoring at arbitrary orientations.
+    before a field trial. Seed that noise and fix the spawn heading: the noise
+    feeds the anchor estimate, so an unseeded run deploys the path slightly
+    differently every time and two runs stop being comparable. Rehearse
+    anchoring at other orientations by *choosing* another spawn heading, not
+    by drawing one at random.
 
 ## 6. Interaction inverse (reading things back)
 
@@ -213,16 +217,3 @@ Regression-test the round trip with a **non-trivial `t`** (ours asserts
    hybrid frame — there is no version handshake on a ROS topic. Rebuild and
    redeploy the vehicle workspace, and verify heading behaviour on the
    water before trusting the map.
-
-## 8. What this bought us
-
-- Manual target clicks land where clicked (pure translation, exact inverse).
-- GPS-anchored missions deploy within seconds of the first fix, stationary —
-  the deploy transform is design-EN → lat/lon → world-EN, translations only.
-- Trajectory following works from any launch heading (vehicle-side fix).
-- The map is north-up with correctly-aligned imagery from the moment it
-  appears, and it never rotates, slides, or switches modes afterwards.
-- Real water and simulation run the identical drawing code; a non-GPS sim is
-  just the identity anchor with tiles off, and a GPS-anchored mission can be
-  rehearsed end-to-end in sim through a synthesised receiver (Section 5) —
-  anchor, tiles, deferred deployment and all.

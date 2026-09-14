@@ -32,7 +32,6 @@ from mcs.core.geo import (
 )
 
 _LOG = logging.getLogger(__name__)
-_TILE_PX = 256
 
 
 class TileLayer:

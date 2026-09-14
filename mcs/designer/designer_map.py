@@ -1,8 +1,8 @@
-"""Mission Pattern Designer — interactive editing map.
+"""Survey Pattern Designer — interactive editing map.
 
 Reuses the station's map building blocks (adaptive grid, satellite
-:class:`~mcs.gui.map.tile_layer.TileLayer`, robot/pinger glyphs, theme) and
-adds CAD-style waypoint editing:
+:class:`~mcs.gui.map.tile_layer.TileLayer`, markers, theme) and adds
+CAD-style waypoint editing:
 
 * click-to-add mode with **fixed-distance creation** (Ctrl snaps the
   distance from the previous waypoint to the grid step) and axis
@@ -15,7 +15,9 @@ adds CAD-style waypoint editing:
   numbering, START / END markers.
 
 The view owns no mission logic: it reads/writes the
-:class:`~mcs.designer.model.MissionModel` and emits editing intents.
+:class:`~mcs.designer.model.MissionModel` and emits editing intents. It
+draws no live vehicle either -- the editor is independent of station
+telemetry, deliberately (see :mod:`mcs.designer.designer_window`).
 """
 
 from __future__ import annotations
@@ -42,7 +44,6 @@ from mcs.gui import theme
 from mcs.gui.map.map_items import (
     MarkerItem,
     PolylineItem,
-    RobotItem,
     draw_grid,
     draw_scale_bar,
 )
@@ -140,12 +141,6 @@ class DesignerMapView(QGraphicsView):
         self._decor = QGraphicsItemGroup()      # chevrons + START/END
         self._decor.setZValue(25)
         self._scene.addItem(self._decor)
-        self.robot_item = RobotItem()
-        self.robot_item.setVisible(False)
-        self._scene.addItem(self.robot_item)
-        self.pinger_marker = MarkerItem(theme.C_PINGER, 6.0, "pinger", z=42)
-        self.pinger_marker.setVisible(False)
-        self._scene.addItem(self.pinger_marker)
         # Read-only Gazebo-world limits reference (Set GPS Origin ▸ From a
         # Gazebo World): corners kept in GPS, re-projected through the
         # active fit on every set_geo_fit push so the rectangle stays
@@ -314,8 +309,7 @@ class DesignerMapView(QGraphicsView):
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
         if self.grid_visible:
-            draw_scale_bar(painter, self.viewport().width(),
-                           self.viewport().height(),
+            draw_scale_bar(painter, self.viewport().height(),
                            abs(self.transform().m11()),
                            getattr(self, "_grid_spacing", 0.0))
 
@@ -480,16 +474,14 @@ class DesignerMapView(QGraphicsView):
             self.mapToScene(self.viewport().rect()).boundingRect(),
             abs(self.transform().m11()))
 
-    def refresh_overlays(self, robot=None, pinger=None,
-                         show_robot=True, show_pinger=True) -> None:
-        if robot is not None and show_robot:
-            self.robot_item.set_pose(*robot)
-            self.robot_item.setVisible(True)
-        else:
-            self.robot_item.setVisible(False)
-        if pinger is not None and show_pinger:
-            self.pinger_marker.set_world_pos(*pinger)
-            self.pinger_marker.setVisible(True)
-        else:
-            self.pinger_marker.setVisible(False)
+    def resizeEvent(self, event) -> None:
+        """Refetch tiles for the new viewport.
+
+        The visible span in scene metres changes with the widget size, and
+        nothing else here covers a resize -- pan, zoom and set_geo_fit each
+        refresh on their own. It used to be papered over by a 250 ms overlay
+        tick that also pushed the (live) geo fit; that tick is gone with the
+        robot/pinger overlays, so the resize case is handled explicitly.
+        """
+        super().resizeEvent(event)
         self._update_tiles()

@@ -139,6 +139,7 @@ class MainWindow(QMainWindow):
         bus.gps_received.connect(store.on_gps)
         bus.compass_received.connect(store.on_compass)
         bus.mavros_state_received.connect(store.on_mavros_state)
+        bus.battery_received.connect(store.on_battery)
         bus.pinger_body_received.connect(store.on_pinger_body)
         bus.uw_gps_raw_received.connect(store.on_uw_gps_raw)
         bus.monitoring_received.connect(store.on_monitoring)
@@ -326,8 +327,12 @@ class MainWindow(QMainWindow):
         lat, lon = local_en_to_latlon(
             e0, n0 + self.cfg.sim_gps.offset_north_m,
             float(anchor["lat0"]), float(anchor["lon0"]))
+        # Seeded: the fix noise feeds the anchor estimate, so an unseeded
+        # generator would deploy the same mission a little differently every
+        # run (see SimGpsConfig.noise_seed).
         self.commands.arm_sim_gps(
-            SimGpsModel(lat, lon, self.cfg.sim_gps.noise_sigma_m))
+            SimGpsModel(lat, lon, self.cfg.sim_gps.noise_sigma_m,
+                        self.cfg.sim_gps.noise_seed))
         yaw_deg = math.degrees(params.spawn_yaw_rad or 0.0)
         self._status.showMessage(
             f"Sim GPS armed: first fix at {lat:.6f}, {lon:.6f} "
@@ -551,8 +556,11 @@ class MainWindow(QMainWindow):
             self._status.showMessage("ROS is not running — sea state not sent", 8000)
 
     def _open_designer(self) -> None:
-        """Open the Survey Pattern Designer (one shared, non-modal instance
-        with live robot/pinger overlays and the station's georeference)."""
+        """Open the Survey Pattern Designer (one shared, non-modal instance).
+
+        The store is passed for the single explicit "anchor on the robot's
+        current fix" action only -- the editor is otherwise independent of
+        live telemetry, deliberately (see DesignerWindow._active_fit)."""
         from mcs.designer.designer_window import DesignerWindow  # lazy import
         if getattr(self, "_designer", None) is None:
             self._designer = DesignerWindow(self.cfg, self.store, parent=self)

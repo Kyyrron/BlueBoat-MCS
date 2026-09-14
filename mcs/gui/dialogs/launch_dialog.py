@@ -7,15 +7,20 @@ Two mission types, matching the two launch files of the stack:
   (disabled when ``use_pinger`` is set, since the launch file then skips
   ``path_generation``) and ``use_pinger``.
 * **Gazebo simulation** — ``Sim_launch.py`` with ``robot_file``,
-  ``trajectory``, ``controller_type`` (and ``spawn_yaw`` for GPS-anchored
-  missions). The simulation launch always starts ``master_control``, so an
-  empty controller is not offered; motors / note / pinger do not exist in
-  that graph and their fields are hidden to keep the dialog coherent with
-  what will actually run. A GPS-anchored custom path takes the SAME
-  deferred-deploy pipeline as on real water: the station synthesises the
-  GPS feed itself (first fix lands north of the path's first point) and
-  spawns the boat with a random heading, so anchoring, deployment and
-  hot-reload are exercised exactly as at sea.
+  ``trajectory``, ``controller_type``, ``note`` (and ``spawn_yaw`` for
+  GPS-anchored missions). The simulation launch always starts
+  ``master_control``, so an empty controller is not offered; motors and
+  pinger do not exist in that graph and their fields are hidden to keep the
+  dialog coherent with what will actually run. The **log note** does exist
+  there — ``simulation_interface`` names its poslog CSV from it exactly as
+  ``robot_interface`` does on the boat — so that field stays visible in both
+  modes; a simulated run's note always carries the ``sim`` marker
+  (:meth:`LaunchParameters.wire_note`). A GPS-anchored custom path takes the
+  SAME deferred-deploy pipeline as on real water: the station synthesises the
+  GPS feed itself (first fix lands north of the path's first point) and spawns
+  the boat at a **fixed** heading (``LaunchConfig.sim_spawn_yaw_deg``), so
+  anchoring, deployment and hot-reload are exercised exactly as at sea and two
+  runs of the same mission remain comparable.
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -24,7 +29,6 @@ The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 from __future__ import annotations
 
 import math
-import random
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -117,7 +121,11 @@ class LaunchDialog(QDialog):
         form.addRow(self._motors_label, self._enable_motors)
 
         self._note = QLineEdit()
-        self._note.setPlaceholderText("appended to robot-side log file names")
+        self._note.setPlaceholderText("added to the run's log file names")
+        self._note.setToolTip(
+            "Free text put into the poslog CSV name, {date}-{note}-poslog.csv "
+            "— robot_interface on the boat, simulation_interface in Gazebo. A "
+            "simulated run is always tagged 'sim' (sim-<note>).")
         self._note_label = QLabel("Log note")
         form.addRow(self._note_label, self._note)
 
@@ -187,8 +195,7 @@ class LaunchDialog(QDialog):
                 "controller node).")
         # Field gating
         for w in (self._use_pinger, self._use_pinger_label,
-                  self._enable_motors, self._motors_label,
-                  self._note, self._note_label):
+                  self._enable_motors, self._motors_label):
             w.setVisible(not sim)
         for w in (self._robot_file, self._robot_file_label):
             w.setVisible(sim)
@@ -263,21 +270,27 @@ class LaunchDialog(QDialog):
                 # water and in simulation. On real water MAVROS provides the
                 # fixes; in simulation the station synthesises them (the
                 # boat's first fix lands offset_north_m north of the path's
-                # first point) and spawns the boat with a random heading, so
-                # anchoring, deployment and hot-reload run exactly as at sea.
+                # first point) and spawns the boat at the configured fixed
+                # heading, so anchoring, deployment and hot-reload run exactly
+                # as at sea, repeatably.
                 gps_src = str(src)
                 gps_dst = str(io_yaml.deployed_path(src.parent, src.stem))
                 trajectory = f"from_yaml:{gps_dst}"
                 if sim:
                     gps_simulated = True
-                    spawn_yaw = random.uniform(-math.pi, math.pi)
+                    # Fixed, not random: the spawn heading is the only spawn
+                    # degree of freedom here, and two runs of one mission must
+                    # start from the same pose to be comparable. Extra args
+                    # may still override it for a single run.
+                    spawn_yaw = math.radians(
+                        self._cfg.launch.sim_spawn_yaw_deg)
             else:
                 trajectory = f"from_yaml:{custom}"
         else:
             trajectory = self._trajectory.currentText()
         return LaunchParameters(
             enable_motors=(not sim) and self._enable_motors.isChecked(),
-            note="" if sim else self._note.text().strip(),
+            note=self._note.text().strip(),
             controller_type=self._controller.currentText(),
             trajectory=trajectory,
             use_pinger=(not sim) and self._use_pinger.isChecked(),

@@ -3,9 +3,19 @@ data/
 *.svlog
 *.mcap
 metadata.yaml
+.ruff_cache/
+
+# colcon artefacts: this module has no colcon build, but running `colcon build`
+# from the repo root once created these here.
+build/
+install/
+log/
+
+# acados/MPC scratch, only if a launch ever falls back to inheriting our cwd
+# (normally it runs in ~/.config/blueboat_mcs/launch_cwd)
 acados_ocp.json
 c_generated_code/
-.ruff_cache/
+
 .claude/specs/
 .claude/tools/
 .claude/settings.json

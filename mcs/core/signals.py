@@ -22,6 +22,10 @@ class SignalBus(QObject):
     compass_received = Signal(float, float)   # (t, heading_deg CW-from-north)
     #: t_mono, connected, armed, mode string
     mavros_state_received = Signal(float, bool, bool, str)
+    #: t_mono, pack voltage (V) or None, charge fraction 0..1 or None.
+    #: Both are ``object`` because either is legitimately absent -- MAVROS
+    #: sends NaN on a field the FCU does not report.
+    battery_received = Signal(float, object, object)
     #: t_mono, pinger position in robot/body frame [x, y, z]
     pinger_body_received = Signal(float, object)
     #: t_mono (wall reception time) — raw underwater-GPS packet seen
@@ -47,8 +51,6 @@ class SignalBus(QObject):
     topic_stats_updated = Signal(object)
     #: informational message from the ROS layer
     ros_log = Signal(str)
-    ros_started = Signal()
-    ros_stopped = Signal()
 
     # ---- Mission launch process -------------------------------------------
     launch_state_changed = Signal(str)      # 'idle' | 'starting' | 'running' | 'stopping'

@@ -33,6 +33,26 @@ from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
 
+#: Marker every simulated run's log note carries, so a Gazebo poslog can never
+#: be mistaken for a field record. Matches ``Sim_launch.py``'s own ``note``
+#: default, which is what an empty operator note still resolves to.
+SIM_NOTE_PREFIX = "sim"
+
+
+def sanitize_note(note: str) -> str:
+    """The operator's log note, safe to put in a filename and on a CLI.
+
+    The note goes verbatim into ``{date}-{note}-poslog.csv`` on both the real
+    boat (``robot_interface``) and in simulation (``simulation_interface``),
+    and rides there as one ``note:=`` token — so whitespace would split the
+    token and a path separator would scatter the log. Runs of anything that
+    is not a letter, digit, dot or underscore collapse to a single '-'.
+    """
+    out = "".join(c if (c.isalnum() or c in "._") else "-" for c in note)
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out.strip("-")
+
 
 @dataclass
 class LaunchParameters:
@@ -43,15 +63,21 @@ class LaunchParameters:
     * ``BlueBoat_launch.py`` (real robot): ``enable_motors``, ``note``,
       ``controller_type``, ``trajectory``, ``use_pinger``.
     * ``Sim_launch.py`` (empty Gazebo): ``robot_file``, ``trajectory``,
-      ``controller_type``, ``data_dir``, ``spawn_yaw`` — it always starts
-      ``master_control`` (so the controller must be non-empty) and never
-      MAVROS / robot_interface / param_set / pinger nodes.
+      ``controller_type``, ``data_dir``, ``note``, ``spawn_yaw`` — it always
+      starts ``master_control`` (so the controller must be non-empty) and
+      never MAVROS / robot_interface / param_set / pinger nodes.
     * ``blueboat_sss_sim full_mission_launch.py`` (personalized world,
       selected when ``world_dir`` is set): ``world_dir``, ``with_control``,
-      ``trajectory_file``, ``controller_type`` — same control graph as
-      ``Sim_launch.py`` plus the simulated sonar and a mavros shim that
+      ``trajectory_file``, ``controller_type``, ``note`` — same control graph
+      as ``Sim_launch.py`` plus the simulated sonar and a mavros shim that
       publishes the GPS fixes from the world's own anchor. It declares NO
       ``robot_file``/``trajectory``/``spawn_yaw``.
+
+    ``note`` is the operator's free-text log tag and reaches all three: it is
+    what ``{date}-{note}-poslog.csv`` is named after, on the boat and in
+    Gazebo alike. :meth:`wire_note` is the effective value — sanitised, and
+    prefixed with ``sim`` for a simulated run so the two sets of logs stay
+    distinguishable.
 
     ``to_cli`` emits exactly the arguments the chosen file declares; passing
     another target's arguments would abort ``ros2 launch``.
@@ -88,6 +114,18 @@ class LaunchParameters:
     sea: SeaChoice | None = None
     extra_args: dict[str, str] = field(default_factory=dict)
 
+    def wire_note(self) -> str:
+        """The ``note:=`` value, or "" when no argument should be emitted.
+
+        Simulated runs always carry the ``sim`` marker — ``sim`` alone with
+        no operator note (exactly ``Sim_launch.py``'s default, so the empty
+        case stays byte-identical to before), ``sim-<note>`` with one.
+        """
+        note = sanitize_note(self.note)
+        if not self.simulation:
+            return note
+        return f"{SIM_NOTE_PREFIX}-{note}" if note else SIM_NOTE_PREFIX
+
     def sea_args(self) -> list[str]:
         return self.sea.launch_args() if (self.sea and not self.sea.is_null) else []
 
@@ -101,6 +139,7 @@ class LaunchParameters:
                 "with_control:=true",
                 f"trajectory_file:={self.gps_deployed_target}",
                 f"controller_type:={self.controller_type}",
+                f"note:={self.wire_note()}",
                 *self.sea_args(),          # before extra_args: an override wins
             ]
         elif self.simulation:
@@ -108,6 +147,7 @@ class LaunchParameters:
                 f"robot_file:={self.robot_file}",
                 f"trajectory:={self.trajectory}",
                 f"controller_type:={self.controller_type}",
+                f"note:={self.wire_note()}",
             ]
             if self.spawn_yaw_rad is not None:
                 args.append(f"spawn_yaw:={self.spawn_yaw_rad:.6f}")
@@ -119,8 +159,8 @@ class LaunchParameters:
             ]
             if self.controller_type != "":
                 args += [f"controller_type:={self.controller_type}"]
-            if self.note != "":
-                args += [f"note:={self.note}"]
+            if self.wire_note() != "":
+                args += [f"note:={self.wire_note()}"]
         args += [f"{k}:={v}" for k, v in self.extra_args.items()]
         return args
 

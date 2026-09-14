@@ -15,7 +15,7 @@ from the repo root; ROS2 comes from the sourced workspace, never from pip.
 
 ---
 
-## 1. Layout
+## 1. Layout & internals
 
 ```
 <repo root>/
@@ -25,18 +25,19 @@ from the repo root; ROS2 comes from the sourced workspace, never from pip.
 │   ├── core/              signals.py (thread boundary), series.py
 │   │                      (append-only growable series, never wrapped —
 │   │                      recording is unbounded), geo.py (odom↔GPS),
-│   │                      los_predictor.py, worlds.py (Gazebo world
-│   │                      folders ~/worlds/<path>/<world>/: list, filter
-│   │                      by limits, duplicate — reimplements the SSS-Sim
-│   │                      contract locally, never imports it, per CM-3)
+│   │                      los_predictor.py, sim_gps.py, sea.py, worlds.py
+│   │                      (Gazebo world folders ~/worlds/<path>/<world>/:
+│   │                      list, filter by limits, duplicate — reimplements
+│   │                      the SSS-Sim contract locally, never imports it,
+│   │                      per CM-3)
 │   ├── models/store.py    DataStore: the single in-memory state snapshot
 │   ├── ros/               ros_manager (rclpy thread), bridge_node (all
 │   │                      subs/pubs/service), launch_manager, command_center
 │   ├── gui/               main_window, left/right/bottom panels, console,
-│   │                      mission_stats, theme, widgets, map/, plot/, dialogs/
-│   ├── designer/          Survey Pattern Designer (widget-free logic + Qt UI)
-│   └── utils/             empty package (no modules)
-├── docs/                  01..08 + HEADING_AND_MAP_ALIGNMENT.md
+│   │                      mission_stats, sea_state_box, theme, widgets,
+│   │                      map/, plot/, dialogs/
+│   └── designer/          Survey Pattern Designer (widget-free logic + Qt UI)
+├── docs/                  03, 04, 05 + GPS_MAP_ARCHITECTURE.md (see §8)
 ├── smoke_test.py          headless regression script (see §7)
 ├── build.sh               colcon build in ~/ros2_ws, then `python3 run.py`
 ├── ruff.toml              lint config (see §7)
@@ -67,6 +68,122 @@ If `rclpy` is not importable the app still starts, GUI-only (this is what makes
 `smoke_test.py` possible without ROS). Keep new ROS imports lazy or guarded so
 this keeps working.
 
+### Layer diagram
+
+```
+┌────────────────────────────  GUI thread  ────────────────────────────┐
+│  gui/            main_window · left_panel · right_panel · toolbar    │
+│                  map (view, items, tiles) · plot · dialogs · designer│
+│        reads on 10 Hz tick                 emits user intents        │
+│  models/store    DataStore: live states + full-experiment histories  │
+│  core/           SignalBus · TimeSeries · GeoReferencer · predictor  │
+├───────────────────────  Qt queued signals  ──────────────────────────┤
+│  ros/            RosManager (thread) → BridgeNode (subs/pubs/service)│
+│                  LaunchManager (ros2 launch subprocess)              │
+│                  CommandCenter (stop actions, mode toggle)           │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+`core/` and `models/` import no widgets and no rclpy (only `QObject` for
+signals) — that is what makes the offline smoke test possible.
+
+### Module inventory
+
+| Module | Responsibility |
+|---|---|
+| `main.py` | bootstrap: logging, `AppConfig.load`, `QApplication`, `MainWindow` |
+| `config/settings.py` | every topic name, threshold, gain; JSON overrides |
+| `core/signals.py` | the thread boundary |
+| `core/series.py` | append-only growable series (never wrapped) |
+| `core/geo.py` | odom↔GPS translation fit, equirectangular helpers |
+| `core/los_predictor.py` | display-only LoS path sketch |
+| `core/sim_gps.py` | synthetic NavSatFix model for GPS-anchored sim runs |
+| `core/sea.py` | sea-state presets, timelines, readback parsing (sim) |
+| `core/worlds.py` | `~/worlds/` enumeration, limits filter, duplication |
+| `models/store.py` | states, histories, derived stats |
+| `designer/` | Survey Pattern Designer (Qt-free model + Qt UI) |
+| `ros/ros_manager.py` | rclpy lifecycle |
+| `ros/bridge_node.py` | subs, pubs, path service, topic stats — **the only file that knows message types** |
+| `ros/launch_manager.py` | `ros2 launch` subprocess + sea companion |
+| `ros/command_center.py` | E-STOP / safe-shutdown sequences, mode toggle |
+| `gui/main_window.py` | the 10 Hz tick, signal wiring, launch orchestration |
+| `gui/{left,right}_panel.py`, `bottom_toolbar.py`, `console.py` | panels and toolbar |
+| `gui/map/` | `map_view` (scene + modes), `map_items` (drawing), `tile_layer` |
+| `gui/sea_state_box.py`, `gui/mission_stats.py` | the two floating map overlays |
+| `gui/dialogs/` | `launch_dialog`, `world_dialog`, `sea_state_dialog` |
+| `gui/plot/distance_plot.py` | robot↔target distance plot |
+
+### Data flow, end to end
+
+Odometry, the canonical example:
+
+1. `BridgeNode._on_odom` (ROS thread) converts the message to plain Python
+   lists, stamps `time.monotonic()`, updates its `TopicStats` via `_mark`, and
+   emits `SignalBus.odom_received`.
+2. Qt queues the signal into the GUI thread; `DataStore.on_odom` updates
+   `RobotState`, appends to `robot_track` / `speed_hist`, integrates travelled
+   distance, feeds the `GeoReferencer`, refreshes the pinger world position.
+3. Nothing repaints yet. At the next 10 Hz tick `MainWindow._on_tick` calls
+   `left_panel.refresh()`, `right_panel.refresh()`, `map_view.refresh()`, which
+   *pull* from the store and repaint once.
+
+User intents flow the other way: widget → signal → `MainWindow` slot →
+`CommandCenter` → `BridgeNode.publish_*` (thread-safe) → ROS graph.
+
+### Clocks
+
+All history timestamps are `time.monotonic()` at **reception**, one clock for
+everything. Experiment-relative time (what the timeline shows) is `t − store.t0`,
+`t0` being the first odometry sample. The controller's own `t` inside
+`/monitoring_data` is **never** used as a clock — reception time is, which keeps
+every series mutually consistent even if a node restarts.
+
+### Repaint bounds
+
+`TimeSeries.decimated_window` bounds every repaint: at most
+`map.trajectory_max_points_drawn` (20 000) vertices per polyline and 2000 per
+plot. `PolylineItem.set_points` rebuilds a `QPainterPath` per tick from the
+decimated window — measured adequate at 10 Hz well past 10⁵ stored points. The
+tile layer refuses to populate more than 64 tiles per viewport instead of
+hammering the tile server.
+
+### Map rendering
+
+Constant-pixel glyphs (`ItemIgnoresTransformations`) for the boat and markers,
+cosmetic pens for lines, an adaptive 1/2/5-decade metric grid painted in
+`drawBackground`, and the satellite `TileLayer` at z = −100. Interaction modes
+(`NORMAL` / `MANUAL_TARGET` / `MEASURE`) are a small state machine inside
+`MapView`; the view emits intents (`target_clicked`, `point_inspected`) and
+never publishes anything itself.
+
+### How to add…
+
+**A subscribed topic.** Name it in `TopicsConfig`; add thresholds to
+`DiagnosticsConfig` (it then appears in the diagnostics panel automatically);
+add a `Signal` to `SignalBus`; create the subscription + `_on_x` callback in
+`BridgeNode` (call `self._mark(topic)` first); add a `DataStore.on_x` slot and
+connect it in `MainWindow._connect_signals`. Display it from any `refresh()`.
+
+**A published command.** Add a publisher in `BridgeNode.__init__` and a
+`publish_x` wrapper (keep the `self._pub_lock` pattern and the `command_sent`
+emission), expose a semantic method on `CommandCenter`, call it from the GUI.
+
+**A map layer.** Create an item in `gui/map/map_items.py` (`_cosmetic_pen` for
+constant-pixel lines, `ItemIgnoresTransformations` for constant-pixel glyphs),
+add it to the scene in `MapView.__init__`, update it in `MapView.refresh()`,
+register a key in `MapView.set_layer_visible`, add one entry to `_LAYERS` in
+`left_panel.py`. That is the whole checklist.
+
+**A plot.** Follow `DistancePlot`: a `QWidget` reading one `TimeSeries`, honouring
+`set_time_window`, painting in `paintEvent`. Add it to a `CollapsibleSection` in
+the right panel and call its `refresh()` from `RightPanel.refresh()`.
+
+**A launch argument.** Four sites, all in `mcs/ros/launch_manager.py` plus the
+dialog: `LaunchParameters.to_cli()` (the main argument list, which splices in
+`params.sea_args()`), `companion_command()` (the empty-world sea companion),
+`launch_target()` (which of the three launch files runs), and
+`gui/dialogs/launch_dialog.py` for the widget.
+
 ---
 
 ## 2. ROS2 interface — the exact contract
@@ -80,10 +197,11 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 
 | Topic | Type | Produced by | Used for | Notes |
 |---|---|---|---|---|
-| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | pose, yaw, speed, trail | **Local ENU**: position translated at that node's first callback (world origin = boat position at launch), axes East/North, yaw **absolute ENU** (0 = East, CCW+; NOT re-zeroed). Same frame kind as the simulator's Gazebo-bridged odom — only the origin differs. The pre-2026-08-31 hybrid (translated position, launch-relative yaw) is gone; see `docs/03_ros_integration.md` item 00. |
+| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | pose, yaw, speed, trail | **Local ENU**: position translated at that node's first callback (world origin = boat position at launch), axes East/North, yaw **absolute ENU** (0 = East, CCW+; NOT re-zeroed). Same frame kind as the simulator's Gazebo-bridged odom — only the origin differs. The pre-2026-08-31 hybrid (translated position, launch-relative yaw) is gone; see `docs/03_ros_integration.md` §Observations. |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS (real) · **the station's own bridge node** (Gazebo run of a GPS-anchored mission: a 5 Hz timer synthesises fixes from the sim odom — world metres → lat/lon about a receiver origin placed `SimGpsConfig.offset_north_m` north of the mission's first point — received back through its own subscription, so the whole pipeline incl. diagnostics runs as on real water) | georeference, GPS read-out | BEST_EFFORT QoS. `lat==0 and lon==0` means no fix and is discarded. |
-| `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **robot glyph heading (preferred)** | Degrees **clockwise from north** (0=N, 90=E). Converted to the app-wide convention (radians CCW from east) as `radians(90 - hdg)`. Fallback: the odom yaw directly (absolute ENU). Subscribed **BEST_EFFORT** — this and the GPS fix are the only two; every other subscription uses the default reliable depth-10 profile. |
-| `/mavros/state` | `mavros_msgs/State` | MAVROS | armed / connected / flight mode | Only subscribed when `mavros_msgs` imports; absent in simulation. |
+| `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **robot glyph heading (preferred)** | Degrees **clockwise from north** (0=N, 90=E). Converted to the app-wide convention (radians CCW from east) as `radians(90 - hdg)`. Fallback: the odom yaw directly (absolute ENU). Subscribed **BEST_EFFORT** — this, the GPS fix and the battery are the three sensor streams that are; every other subscription uses the default reliable depth-10 profile. |
+| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connection** flag, one of the three inputs to the readiness count | Only subscribed when `mavros_msgs` imports; absent in simulation. `armed` and `mode` ride the same message but nothing displays them, so the store does not keep them. |
+| `/mavros/battery` | `sensor_msgs/BatteryState` | MAVROS (`sys_status`) | battery charge read-out (left panel, ROBOT) | BEST_EFFORT QoS. `percentage` is a **0..1 fraction**, not a percent — MAVROS divides the MAVLink value by 100. A field the FCU does not report arrives NaN, is passed on as `None` and never overwrites the last good reading; the row greys out after 15 s of silence. No simulation graph publishes this topic. |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface.py` | USBL pinger marker | **ROBOT/BODY frame.** With `fixed_pinger=False` (the default) it is seeded from the Waterlinked *filtered* (`filaco`) position and dead-reckoned at odom rate between USBL updates. |
 | `/uw_gps_data` | `std_msgs/Float32MultiArray` | `uwgps_log.py` | raw USBL freshness | 19 values: date(7), aco xyz, ant xyz, lat/lon/dep, filaco xyz. |
 | `/monitoring_data` | `std_msgs/Float32MultiArray` | `master_control.py` | target display, distance plot | `[t, x, y, psi, x_d, y_d, psi_d, u1, u2]`, published at the controller's 20 Hz loop rate. `x_d/y_d/psi_d` are **WORLD frame for every controller branch** (§6, non-negotiable N3). |
@@ -135,7 +253,7 @@ the floating box's button.
 - Yaw everywhere in the app: radians, CCW-positive about +z, y-up world.
 - Odometry yaw is **absolute ENU** (0 = East). `DataStore.robot_true_heading()`
   prefers the compass and falls back to the odom yaw directly — there is no
-  rotation correction anywhere (see `GPS_MAP_ARCHITECTURE.md`).
+  rotation correction anywhere (see `docs/GPS_MAP_ARCHITECTURE.md`).
 
 ---
 
@@ -216,8 +334,9 @@ with **no vehicle motion** (the world frame is local ENU, so only a
 translation is estimated — the old heading-alignment requirement and its
 station-keeping deadlock are gone). Deferred deployment runs on real water
 **and** in Gazebo runs of GPS-anchored missions (`gps_simulated`: the
-station synthesises the fixes itself and spawns the boat with a random
-heading via `spawn_yaw:=`) — only a sim launch of a *non-anchored* mission
+station synthesises the fixes itself and spawns the boat at the **fixed**
+`LaunchConfig.sim_spawn_yaw_deg` via `spawn_yaw:=`) — only a sim launch of a
+*non-anchored* mission
 skips it and executes design-frame points directly. A GPS-anchored sim
 launch may instead target a **personalized world**
 (`LaunchParameters.world_dir` set → `blueboat_sss_sim
@@ -228,6 +347,17 @@ publisher on `/mavros/global_position/global` with an arbitrary origin and
 deploy the path into the wrong frame relative to the world geometry. That
 launch file declares no `spawn_yaw`; the boat spawns at world (0, 0)
 heading east.
+
+**N8b — A simulated run is reproducible: same spawn pose, same fix noise.**
+The spawn heading is a configured constant (`LaunchConfig.sim_spawn_yaw_deg`,
+0° = east; the position is always Gazebo (0, 0)) and `SimGpsModel` is
+constructed with `SimGpsConfig.noise_seed`, never an unseeded generator.
+Both used to be random — the heading drawn per launch, the noise per
+process — and since the fix noise feeds the anchor estimate, the *deployed*
+path landed a little differently every run, so two sim runs of one mission
+could not be compared and a difference could not be attributed to the change
+under test. Rehearsing another orientation is a *choice*: `spawn_yaw:=` in
+Extra args (appended last, so it wins) or the config value.
 
 **N9 — Keep `mcs/` free of robot-side code.** Robot-side changes belong in the
 `BlueBoat-Control` submodule (§6); nothing under `mcs/` imports robot-side
@@ -243,7 +373,7 @@ seriously, and simulation-derived results are stated as model-conditional.
 ## 4. Map & georeferencing (current model)
 
 **One scene regime, GPS-frame-only** (`mcs/gui/map/map_view.py`; full
-rationale and the portable recipe in the root `GPS_MAP_ARCHITECTURE.md`):
+rationale and the portable recipe in `docs/GPS_MAP_ARCHITECTURE.md`):
 
 - The scene is **local east/north metres about the latched GPS origin**
   `(lat0, lon0)` — the first accepted fix. North-up, east-right, view never
@@ -338,6 +468,39 @@ action and the badge, with its tolerance in `DesignerConfig`
 the same file. `mcs/designer/{sampling,io_yaml,interpolation,patterns}.py`
 import no Qt at runtime; only `model.py` and the UI modules do.
 
+### The design anchor is explicit, and never live (2026-09-09)
+
+**The designer reads no live telemetry.** Its georeference — `_manual_fit`,
+returned by `_active_fit()` and set only through `_set_anchor()` — comes from
+exactly four places, all of them deliberate: typed coordinates, a Gazebo world,
+a one-off snapshot of the robot's current fix (**Set GPS Origin ▸ From the
+Robot's Current Position**), or the `geo_anchor` of the mission being opened.
+`New` and `Open` reset it, so the anchor is a property of the mission rather
+than of the session, and an un-anchored mission can never inherit an origin it
+was not drawn at. A permanent status-bar read-out names the anchor in force and
+where it came from.
+
+*Why this is a non-negotiable and not a preference:* `_active_fit()` used to
+prefer `store.geo.fit` whenever the station held a GPS lock, deriving the design
+origin from the boat's launch point and discarding whatever anchor the operator
+or the file had set. Waypoint `x/y` were untouched, so satellite tiles, the
+per-waypoint GPS read-outs and the world-limits rectangle all translated
+rigidly by the distance between the mission's real anchor and the boat — the
+"every path is shifted, restart the app and it's fine" symptom (a fresh app has
+no lock, so the real anchor won). Worse, `_write()` re-derived `geo_anchor` from
+it, so `Ctrl+S` on an opened mission silently repointed it at the boat on disk
+and `deploy_mission` then ran the survey that far off. It also broke
+`worlds.duplicate_world_for_path`'s documented "`design_offset` is [0,0] when
+the anchor came from the world" invariant, and made `_maybe_offer_alignment`
+treat every mission as GPS-anchored. `smoke_test.py`'s `designer anchor ok`
+block pins all of it against a store with a *valid* live fit.
+
+Consequently the designer draws **no robot and no pinger overlay** — a live
+glyph placed at raw world `(x, y)` is only correct while the design frame is
+the robot's world frame, which is precisely the assumption that was wrong. The
+250 ms overlay timer that re-pushed the live fit is gone with them;
+`DesignerMapView.resizeEvent` now carries the tile refresh that tick provided.
+
 **Set GPS Origin ▸ From a Gazebo World** anchors the design frame on a
 generated world's `metadata.yaml` (`core/worlds.py::read_world_meta`): the
 world's `geo_anchor` becomes the design origin (design frame == world local
@@ -370,7 +533,7 @@ there, and `colcon build`.
 |---|---|
 | `src/_custom_libraries/path_generation.py` | The `from_yaml` branch + a file **watcher** that reloads when the file appears/changes, holding a station-keeping pose until it does (this is what makes deferred GPS deployment possible). `generate_path()` and every hardcoded trajectory are unchanged. |
 | `src/_custom_libraries/yaml_trajectory.py` | Loads `blueboat_trajectory/1` and evaluates at time `t`. Depends only on PyYAML + numpy. |
-| `src/master_control.py` | Captures the **world-frame** target before the `inRobotFrame()` conversion so `/monitoring_data` is uniform across branches (`# --- world-frame monitoring target ---`, five capture sites: manual, the MPC / PID / LoS path branches, and the pinger branch). 20 Hz loop — `self.dt = dbl('control_dt', 0.05)` (`master_control.py:264`), a committed **declared ROS parameter**, so the rate the station's `DiagnosticsConfig.expected_hz` assumes is settable per launch (see the ⚠ below). `/controller_target` unchanged. |
+| `src/master_control.py` | Captures the **world-frame** target before the `inRobotFrame()` conversion so `/monitoring_data` is uniform across branches (`# --- world-frame monitoring target ---`, five capture sites: manual, the MPC / PID / LoS path branches, and the pinger branch). 20 Hz loop — `self.dt = dbl('control_dt', 0.05)`, a committed **declared ROS parameter**, so the rate the station's `DiagnosticsConfig.expected_hz` assumes is settable per launch (see the ⚠ below). `/controller_target` unchanged. |
 | `src/robot_interaction/robot_interface.py` | CSV logging: important columns first (names unchanged), rows filled **by column name**, `[right, left]` thruster order, and the no-pinger target logged from `/monitoring_data`. Also the producer of `/blueboat/odom`, `/blueboat/pinger_coordinates` and `/blueboat/controller_ready`. |
 | `src/_custom_libraries/robot_log_schema.py` | The position-CSV column layouts themselves (`COLUMNS_PINGER` / `COLUMNS_NO_PINGER`, selected by `columns_for(use_UWgps)`). ROS-free data module — read this, not the node, to learn the CSV format offline analysis consumes. |
 
@@ -378,27 +541,33 @@ Trajectory selection needs **no launch-file change** — the path rides inside t
 existing argument: `trajectory:=from_yaml:/abs/path.yaml`.
 
 ### Robot-side behaviours the station does not compensate for
-Point-LoS arrival checking is **off by default** — `safety_distance = -1.0`, a
-declared ROS parameter on `master_control` (`:314`). If it is enabled,
-`stopping_sequence` latches on arrival (set `:478`, guarded `:472`, initialised
-`False` at `:180`) and is never reset, so every later manual or pinger target
-yields zero thrust with nothing on screen saying why. Pinger-marker lag is
-inherent to the source — the filtered seed plus dead reckoning described in §2
-(`robot_interface.py:529-536`); N4 is what keeps it from *also* dragging behind
-the robot. Neither is corrected in `mcs/` — see
-`.claude/specs/robot-side-limitations-watchlist.SPEC.md`.
+**Point-LoS arrival checking is the pinger branch's alone.** `safety_distance`
+is a declared ROS parameter on `master_control`, defaulting to `-1.0` on the
+real boat (arrival check off) and `+1.0` in simulation. When it is positive,
+`stopping_sequence` latches on arrival and the boat brakes to zero thrust with
+nothing on screen saying why. A **manual** target no longer goes through either:
+it has its own arrival state (`manual_keep_location`, hold / reacquire radii),
+`stopping_sequence` is not consulted for it, and `manual_target_callback` clears
+the latch on every new target — so the old "one reached target mutes every later
+one" failure mode is gone from that path.
+
+Pinger-marker lag is inherent to the source — the filtered seed plus dead
+reckoning described in §2 (`robot_interface.odom_callback`); N4 is what keeps it
+from *also* dragging behind the robot. Neither is corrected in `mcs/`: the
+station supervises, and a station-side workaround would hide a robot-side defect
+behind a display that looks right.
 
 **⚠ Line numbers into `BlueBoat-Control` are volatile, and which version the
 boat runs cannot be settled from this repository.** `control_dt`
-(`self.dt = dbl('control_dt', 0.05)`, `master_control.py:264`) and
-`safety_distance` (`:319`) are **committed** declared parameters now — the
-old working-tree-only caveat no longer applies — but the boat's own
-`/blueboat_ws` build may still be older. That matters doubly since the
-2026-08-31 local-ENU odom fix (`docs/03_ros_integration.md` item 00): a
+(`self.dt = dbl('control_dt', 0.05)`) and `safety_distance` are **committed**
+declared parameters now — the old working-tree-only caveat no longer applies —
+but the boat's own `/blueboat_ws` build may still be older. That matters doubly
+since the 2026-08-31 local-ENU odom fix (`docs/03_ros_integration.md` §Observations): a
 stale boat build publishes the old hybrid frame (launch-relative yaw over
 ENU axes) and silently breaks the GPS map and trajectory following from
-non-East headings. Anchor on the symbol name, not the line, and treat the
-deployment question as `TODO.md` A3 (needs the boat's workspace).
+non-East headings. Anchor on the symbol name, not the line, and confirm before
+a field session that `/blueboat_ws` is built at the SHA the superproject
+records — that check needs the boat's own workspace and cannot be made here.
 
 ### CSV logs (written by `robot_interface.py` on the robot)
 Two layouts. With pinger: date, `relative_*`, `corrected_pinger_*`, GPS, pinger
@@ -434,11 +603,12 @@ ros2 launch blueboat_control BlueBoat_launch.py \
 ros2 launch blueboat_control BlueBoat_launch.py \
     controller_type:=LoS trajectory:=from_yaml:/abs/path/mission.yaml
 ros2 launch blueboat_control Sim_launch.py \
-    robot_file:=thrusters_ur controller_type:=MPC trajectory:=circle
+    robot_file:=thrusters_ur controller_type:=MPC trajectory:=circle \
+    note:=sim-tuning   # note:= names the poslog CSV, as on the real boat
 ros2 launch blueboat_sss_sim full_mission_launch.py \
     world_dir:=$HOME/worlds/<path>/<world> with_control:=true \
     trajectory_file:=$HOME/.config/blueboat_mcs/trajectories/.deployed/<name>.yaml \
-    controller_type:=PID   # personalized-world launch (needs blueboat_sss_sim built)
+    controller_type:=PID note:=sim-dam   # personalized-world launch (needs blueboat_sss_sim built)
 
 # field debugging
 ros2 topic echo /mavros/global_position/compass_hdg
@@ -459,7 +629,7 @@ suppressions are configured rather than fixed: `RUF046` project-wide (the
 `int(math.floor(...))` casts in the tile and pattern geometry are correct as
 written) and `RUF012` for `mcs/designer/{interpolation,patterns}.py` plus
 `smoke_test.py` (the `schema` class attribute is the §5 extension point). The
-eight broad `except Exception` clauses in the ROS-facing and logging paths carry
+ten broad `except Exception` clauses in the ROS-facing and logging paths carry
 inline `# noqa: BLE001` with a reason each and stay broad.
 
 **No type-checker is configured, deliberately.** A mypy survey of `mcs/` found
@@ -473,13 +643,13 @@ this only with new evidence, not from scratch.
 `smoke_test.py` is a linear script — not a test framework — that imports every
 module, builds the full window offscreen and drives synthetic telemetry through
 the `SignalBus`.
-It prints twenty-two checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
+It prints twenty-four checkpoints (`TimeSeries ok`, `GeoReferencer ok`,
 `sim gps model ok`, `LoS predictor ok`, `start alignment ok`, `designer ok`,
 `deploy guard ok`, `worlds ok`, `launch dialog sim-gps ok`,
-`world launch ok`, `sea state ok`, `store ok`, `stats ok`,
+`world launch ok`, `sea state ok`, `battery ok`, `store ok`, `stats ok`,
 `pinger anchor ok`, `map frame ok`, `sentinel ok`, `georef reset ok`,
-`safe shutdown ok`, `path preview ok`, `launch crash ok`, `sea box ok`,
-`window ok`, `SMOKE TEST PASSED`) and aborts on the first failed assertion. It passes on this tree, exit status 0, and runs identically
+`designer anchor ok`, `safe shutdown ok`, `path preview ok`,
+`launch crash ok`, `sea box ok`, `window ok`, `SMOKE TEST PASSED`) and aborts on the first failed assertion. It passes on this tree, exit status 0, and runs identically
 across all three environment shapes: no `rclpy` (GUI-only); `rclpy` importable
 but the overlay unsourced, so `blueboat_interfaces` is missing and the bridge
 node comes up with its `/path_request` client disabled; and a fully sourced
@@ -515,7 +685,11 @@ inconsistency flips `is_valid` off. `sim gps model ok` pins the simulated
 receiver's translation mapping, first-call origin latch and seeded-noise
 reproducibility; `launch dialog sim-gps ok` proves a sim launch of an
 anchored mission takes the deferred-deploy branch with `gps_simulated` and
-a bounded random `spawn_yaw:=` (and that non-anchored/real launches are
+a **fixed, repeated** `spawn_yaw:=` equal to the configured heading (N8b),
+plus the log note on every branch — raw text kept in `LaunchParameters.note`,
+`wire_note()` sanitising it into one CLI token and tagging a simulated run
+`sim`/`sim-<note>`, an empty real-water note emitting no argument at all, and
+the field visible in both modes (and that non-anchored/real launches are
 untouched, and that `parameters()` never sets `world_dir`); the map-frame
 block's 0c section asserts the anchor gate holds
 in GPS-sim until synthetic fixes arrive; `georef reset ok` proves every
@@ -526,7 +700,7 @@ filter including a legacy `theta_deg` anchor rotated with `deploy_mission`'s
 convention, and duplication (provenance patched, geometry byte-identical,
 an existing target never touched). `world launch ok` pins the
 `full_mission_launch.py` CLI branch (exactly `world_dir` / `with_control` /
-`trajectory_file` / `controller_type`; no `robot_file`/`trajectory`/
+`trajectory_file` / `controller_type` / `note`; no `robot_file`/`trajectory`/
 `spawn_yaw` leak), the three-way `launch_target` choice, the headless
 `WorldChoiceDialog` (world vs Empty Gazebo), and the designer overlay
 (rectangle only under a fit, hidden on clear); the `path preview ok` block
@@ -561,7 +735,17 @@ layer — sampling invariants, the save/load/resample round trip, every stock
 pattern and interpolation from its own `schema` defaults, and both extension
 registries.
 
-Still uncovered: the designer UI (`designer_map.py`, `panels.py`,
+`designer anchor ok` builds a real `DesignerWindow` offscreen against a store
+whose live fit **is** valid — the exact condition of the old shift bug — and
+asserts that a fresh window is un-anchored, that an explicit anchor survives
+twenty further GPS fixes, that `_write` serialises *that* anchor and not a
+live-derived one, that `New` clears it, that the robot snapshot is one-off and
+refuses (visibly) with no fix, and that no overlay item exists on the designer
+map. `battery ok` pins the 0..1 → percent conversion, the "no data" state
+before any message, that a `None` field does not wipe the last good reading,
+and the charge/staleness colour bands.
+
+Still uncovered: the rest of the designer UI (`designer_map.py`, `panels.py`,
 `designer_window.py`, including the `_push_undo` contract). And because the
 script runs offscreen on synthetic telemetry, a green run is not field
 readiness — it cannot catch QoS mismatches, real message-type drift or
@@ -577,23 +761,26 @@ publish `/mavros/global_position/global`, `compass_hdg` and `imu/data`.
 
 ## 8. Documentation set
 
-The root **`GPS_MAP_ARCHITECTURE.md`** is the authoritative, self-contained
-description of the GPS-only map model (§4) — written for reuse in any other
-application that draws a GPS vehicle on a real-world map.
-`docs/HEADING_AND_MAP_ALIGNMENT.md` is a stub pointing at it (the rotation
-model it used to describe is deleted; its history section explains why).
-`README.md` and `docs/01`–`08` cover the rest: the compass heading source of
-§2, the 20 Hz `master_control` loop, and the robot-side file locations of §6.
-`docs/03_ros_integration.md` §Observations is the running list of robot-side
-findings, each marked open or fixed against `BlueBoat-Control` — item 00 is
-the 2026-08-31 local-ENU frame fix; §6 above owns the limitations carried
-deliberately.
+Four documents, all under `docs/`. Architecture, data flow, the module
+inventory and the "how to add X" checklists live in §1 of this file, not in
+`docs/` — there is no separate architecture or developer guide.
 
-Line citations into `BlueBoat-Control` have been re-anchored against its
-current working tree and verified to land on the code they describe. They drift
-whenever that module is edited; `BlueBoat-Control` owns them, and its own
-`CLAUDE.md` §2.1.1 records the section layout they point into. Prefer the symbol
-name over the line number when following one.
+| Doc | Content |
+|---|---|
+| `03_ros_integration.md` | every topic / command / service, the launch targets, the stop actions and the safe-shutdown sequence, open robot-side observations |
+| `04_user_guide.md` | every screen and control, including the Survey Pattern Designer |
+| `05_trajectory_format.md` | the `blueboat_trajectory/1` YAML contract and deferred GPS deployment |
+| `GPS_MAP_ARCHITECTURE.md` | the authoritative, self-contained description of the GPS-only map model (§4), written for reuse in any application that draws a GPS vehicle on a real-world map |
+
+`03_ros_integration.md` §Observations carries what is still open or carried
+deliberately on the robot side, plus the table of `BlueBoat-Control` fixes that
+a stale boat build silently reintroduces. §6 above owns the station-side half.
+
+Line citations into `BlueBoat-Control` drift whenever that module is edited;
+`BlueBoat-Control` owns them, and its own `CLAUDE.md` §2.1.1 records the
+section layout they point into. Prefer the symbol name over the line number.
 
 This file stays authoritative where it and `docs/` disagree — `docs/` is the
-long-form explanation, not a second source of truth.
+long-form explanation, not a second source of truth. There is no `TODO.md`:
+the module is feature-complete, and what remains is field verification, which
+this repository cannot settle.

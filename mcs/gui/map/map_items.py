@@ -187,31 +187,22 @@ class MissionPathItem(PolylineItem):
         self.setOpacity(0.9)
 
 
-def draw_north_indicator(painter, viewport_w: int, north_up: bool) -> None:
-    """Small compass hint: 'N ^'. The scene is ENU by construction so the map
-    is always north-up and callers pass True; the world-up notice branch is
-    kept only for API compatibility."""
+def draw_north_indicator(painter, viewport_w: int) -> None:
+    """Small compass hint: 'N ^'. The scene is ENU by construction, so the map
+    is always north-up (CLAUDE.md N5) and there is no other case to draw."""
     painter.save()
     painter.resetTransform()
     painter.setFont(QFont("DejaVu Sans", 9, QFont.Weight.Bold))
-    if north_up:
-        painter.setPen(QColor(230, 235, 240))
-        painter.drawText(QPointF(viewport_w - 34.0, 20.0), "N")
-        painter.setPen(_cosmetic_pen(QColor(230, 235, 240), 2.0))
-        painter.drawLine(QLineF(viewport_w - 22.0, 22.0,
-                                viewport_w - 22.0, 8.0))
-        painter.drawLine(QLineF(viewport_w - 26.0, 12.0,
-                                viewport_w - 22.0, 8.0))
-        painter.drawLine(QLineF(viewport_w - 18.0, 12.0,
-                                viewport_w - 22.0, 8.0))
-    else:
-        painter.setPen(QColor(150, 158, 168))
-        painter.drawText(QPointF(viewport_w - 150.0, 20.0),
-                         "world-up (north unknown)")
+    painter.setPen(QColor(230, 235, 240))
+    painter.drawText(QPointF(viewport_w - 34.0, 20.0), "N")
+    painter.setPen(_cosmetic_pen(QColor(230, 235, 240), 2.0))
+    painter.drawLine(QLineF(viewport_w - 22.0, 22.0, viewport_w - 22.0, 8.0))
+    painter.drawLine(QLineF(viewport_w - 26.0, 12.0, viewport_w - 22.0, 8.0))
+    painter.drawLine(QLineF(viewport_w - 18.0, 12.0, viewport_w - 22.0, 8.0))
     painter.restore()
 
 
-def draw_scale_bar(painter, viewport_w: int, viewport_h: int,
+def draw_scale_bar(painter, viewport_h: int,
                    px_per_m: float, spacing_m: float) -> None:
     """Draw the grid-scale indicator (bar + label) in device coordinates.
 

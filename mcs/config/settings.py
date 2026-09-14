@@ -32,6 +32,7 @@ class TopicsConfig:
     gps: str = "/mavros/global_position/global"
     compass_hdg: str = "/mavros/global_position/compass_hdg"
     mavros_state: str = "/mavros/state"
+    battery: str = "/mavros/battery"
     pinger_body: str = "/blueboat/pinger_coordinates"
     uw_gps_raw: str = "/uw_gps_data"
     monitoring: str = "/monitoring_data"
@@ -66,6 +67,7 @@ class DiagnosticsConfig:
         "/mavros/state": 2.0,
         "/mavros/global_position/global": 2.0,
         "/mavros/global_position/compass_hdg": 2.0,
+        "/mavros/battery": 5.0,
         "/blueboat/pinger_coordinates": 1.0,
         "/uw_gps_data": 3.0,
         "/monitoring_data": 0.5,
@@ -80,6 +82,7 @@ class DiagnosticsConfig:
         "/mavros/state": 1.0,
         "/mavros/global_position/global": 5.0,
         "/mavros/global_position/compass_hdg": 5.0,
+        "/mavros/battery": 1.0,
         "/blueboat/pinger_coordinates": 20.0,
         "/uw_gps_data": 2.0,
         "/monitoring_data": 20.0,
@@ -113,6 +116,15 @@ class LaunchConfig:
     worlds_root: str = str(Path.home() / "worlds")
     sim_robot_files: list[str] = field(default_factory=lambda: ["thrusters_ur"])
     sim_default_controller: str = "MPC"
+    # Gazebo spawn heading, DEGREES ENU (0 = east), emitted as Sim_launch.py's
+    # spawn_yaw:= (radians) for a simulated GPS-anchored mission. The boat
+    # always spawns at world (0, 0); this is the only spawn degree of freedom
+    # the station controls, and it is FIXED rather than random so two runs of
+    # the same mission start identically. full_mission_launch.py declares no
+    # spawn_yaw (world (0, 0), heading east). To start from another heading
+    # for one run, pass spawn_yaw:=<radians> in Extra args — it is appended
+    # after this one and ros2 launch takes the last occurrence.
+    sim_spawn_yaw_deg: float = 0.0
     controllers: list[str] = field(default_factory=lambda: ["", "PID", "LoS", "MPC"])
     trajectories: list[str] = field(default_factory=lambda: [
         "station_keeping", "circle", "straight_line", "sin",
@@ -222,11 +234,17 @@ class SimGpsConfig:
     offset_north_m: float = 10.0   # first fix this far north of the path start
     noise_sigma_m: float = 0.4     # Gaussian noise per EN axis, metres
     rate_hz: float = 5.0           # matches the real MAVROS fix rate
+    # Seed of that noise. FIXED, never None: the fix noise feeds the anchor
+    # estimate, which is where the deployed path lands relative to the boat,
+    # so an unseeded generator would make the same mission start a metre or
+    # so away from one run to the next. Change it to draw a different (still
+    # repeatable) realisation.
+    noise_seed: int = 20260913
 
 
 @dataclass
 class DesignerConfig:
-    """Mission Pattern Designer settings."""
+    """Survey Pattern Designer settings."""
 
     trajectories_dir: str = str(DEFAULT_CONFIG_DIR / "trajectories")
     grid_snap_m: float = 1.0          # Ctrl-drag / fixed-distance creation step

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R  # same dependency as the stack
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import BatteryState, NavSatFix
 from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 
 from mcs.config.settings import AppConfig
@@ -119,6 +120,11 @@ class BridgeNode(Node):
         self.create_subscription(Odometry, t.odom, self._on_odom, 10)
         self.create_subscription(NavSatFix, t.gps, self._on_gps, best_effort)
         self.create_subscription(Float64, t.compass_hdg, self._on_compass, best_effort)
+        # /mavros/battery is a sensor stream like the two above: subscribe
+        # BEST_EFFORT, which is compatible with either publisher policy
+        # (a RELIABLE subscriber against a BEST_EFFORT publisher receives
+        # nothing at all -- CM-4).
+        self.create_subscription(BatteryState, t.battery, self._on_battery, best_effort)
         self.create_subscription(Float32MultiArray, t.pinger_body, self._on_pinger, 10)
         self.create_subscription(Float32MultiArray, t.uw_gps_raw, self._on_uw_gps, 10)
         self.create_subscription(Float32MultiArray, t.monitoring, self._on_monitoring, 10)
@@ -210,6 +216,23 @@ class BridgeNode(Node):
     def _on_gps(self, msg: NavSatFix) -> None:
         t = self._mark(self._cfg.topics.gps)
         self._bus.gps_received.emit(t, float(msg.latitude), float(msg.longitude))
+
+    def _on_battery(self, msg: BatteryState) -> None:
+        """/mavros/battery (sys_status plugin).
+
+        ``percentage`` is a **0..1 fraction** in sensor_msgs/BatteryState --
+        MAVROS divides the MAVLink ``battery_remaining`` percent by 100. Both
+        it and ``voltage`` are NaN (or negative) when the FCU does not report
+        them, which is passed on as ``None`` rather than displayed as a number.
+        """
+        t = self._mark(self._cfg.topics.battery)
+        volts = float(msg.voltage)
+        pct = float(msg.percentage)
+        self._bus.battery_received.emit(
+            t,
+            volts if math.isfinite(volts) and volts > 0.0 else None,
+            pct if math.isfinite(pct) and pct >= 0.0 else None,
+        )
 
     def _on_state(self, msg) -> None:
         t = self._mark(self._cfg.topics.mavros_state)

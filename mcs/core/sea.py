@@ -18,7 +18,6 @@ arguments and the JSON command carry them unchanged.
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -313,7 +312,6 @@ class SeaReadout:
     eta_m: float = 0.0
     events_per_hour: float = 0.0
     event: dict | None = None        # the live wake / swell group, if any
-    schedule_name: str = ""
     next_t_sim: float | None = None
     next_text: str = ""
     summary: str = ""
@@ -376,7 +374,6 @@ def parse_readback(payload: str | dict, received_mono: float = 0.0
             eta_m=float(wav.get("eta_m", 0.0)),
             events_per_hour=float(wav.get("events_per_hour", 0.0) or 0.0),
             event=(dict(wav["event"]) if isinstance(wav.get("event"), dict) else None),
-            schedule_name=str(sch.get("name", "")),
             next_t_sim=(None if sch.get("next_t_sim") is None
                         else float(sch["next_t_sim"])),
             next_text=str(sch.get("next") or ""),
@@ -385,7 +382,3 @@ def parse_readback(payload: str | dict, received_mono: float = 0.0
         )
     except (ValueError, TypeError, AttributeError):
         return None
-
-
-def wrap_deg(deg: float) -> float:
-    return float(deg) % 360.0 if math.isfinite(deg) else 0.0

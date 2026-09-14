@@ -55,8 +55,9 @@ class RobotState:
     lon: float | None = None
     compass_heading: float | None = None    # true heading, rad CCW-from-east
     fcu_connected: bool = False
-    armed: bool = False
-    fcu_mode: str = "—"
+    battery_v: float | None = None          # pack voltage, None = not reported
+    battery_pct: float | None = None        # charge fraction 0..1
+    battery_t: float | None = None          # reception time of the last message
     param_mode: str = "—"                   # 'default' / 'override'
     controller_ready: bool = False
     thrust_right: float = 0.0
@@ -194,9 +195,21 @@ class DataStore:
             self.geo.add_pair(t, r.x, r.y, lat, lon)
 
     def on_mavros_state(self, t: float, connected: bool, armed: bool, mode: str) -> None:
+        # Only the connection flag is consumed (the readiness count in the left
+        # panel). `armed` and `mode` are kept in the signal signature because
+        # they ride the same mavros_msgs/State message, but nothing displays
+        # them -- storing them would be state no widget ever reads.
         self.robot.fcu_connected = connected
-        self.robot.armed = armed
-        self.robot.fcu_mode = mode
+
+    def on_battery(self, t: float, volts, pct) -> None:
+        """A field the FCU does not report arrives as None and must not
+        overwrite the last good reading -- only the stamp always advances,
+        so the panel can grey the row out when the stream dies."""
+        self.robot.battery_t = t
+        if volts is not None:
+            self.robot.battery_v = volts
+        if pct is not None:
+            self.robot.battery_pct = pct
 
     def on_pinger_body(self, t: float, xyz) -> None:
         """Pinger message received: THIS is the only place the pinger's world

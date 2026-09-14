@@ -6,7 +6,7 @@ Two files per mission, in ``designer.trajectories_dir``:
   (format tag, speed, loop, time-stamped ``[t, x, y, yaw]`` samples plus
   informative length/duration). Consumed on the robot side by
   ``BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py``;
-  documented in ``docs/08_trajectory_format.md``.
+  documented in ``docs/05_trajectory_format.md``.
 * ``<name>.meta.yaml`` — **editor** metadata: the full designer model
   (groups, locks, segment interpolation settings, comments). The runtime
   never reads it; without it a runtime file can still be re-imported as
@@ -61,7 +61,7 @@ def save_mission(directory: Path, name: str, model: MissionModel,
     # for legacy files, which deploy_mission still honours. With an anchor
     # present every waypoint is linked to real-world GPS, and the station
     # deploys the mission into the robot's CURRENT world frame at run time
-    # (see deploy_mission and docs/08).
+    # (see deploy_mission and docs/05_trajectory_format.md).
     directory.mkdir(parents=True, exist_ok=True)
     points = [[round(float(t), 3), round(float(x), 4), round(float(y), 4),
                round(float(psi), 5)]

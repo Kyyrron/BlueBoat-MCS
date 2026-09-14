@@ -1,8 +1,10 @@
-# 8 — YAML Trajectory Format Specification
+# 5 — YAML Trajectory Format Specification
 
-Format tag: **`blueboat_trajectory/1`**. Produced by the Mission Pattern
-Designer, consumed by `yaml_trajectory.py` next to `path_generation.py`.
-Two files per mission; the runtime never needs the second one.
+Format tag: **`blueboat_trajectory/1`**. Produced by the Survey Pattern
+Designer, consumed on the boat by
+`BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py`
+next to `path_generation.py`. Two files per mission; the runtime never needs
+the second one.
 
 ## 1. Runtime file — `<name>.yaml`
 
@@ -54,25 +56,31 @@ Semantics:
 geo_anchor:
   lat0: 33.660196      # GPS of the design frame's (0, 0)
   lon0: 130.657780
-  theta_deg: 25.0      # rotation of the design frame vs local east/north
+  theta_deg: 0.0       # always 0 — the design frame IS local east/north
 ```
+
+`theta_deg` is retained for backward compatibility only. The designer has
+always drawn in a local ENU frame, so every anchor it writes carries `0.0`; a
+legacy file with a non-zero value is still honoured (its points are rotated
+about its own anchor at deploy time, and the designer warns when it opens one).
 
 `points` stay in the design frame. Because the robot's world origin is
 created wherever `robot_interface` starts, an anchored mission is **never
 executed directly**: at launch the station points `path_generation` at a
 *deployed* file (`<dir>/.deployed/<name>.yaml`) that does not exist yet;
-the patched node holds position (station-keeping fallback) and re-checks
-the file on every path request. Once the run's odom↔GPS fit is established
-(a few metres of motion), the station converts every sample design-frame →
-GPS → today's world frame (yaw rotated by `θ_fit − θ_anchor`), writes the
-deployed file (with `deployed_from` / `deployed_fit_rms_m` provenance
-fields and no `geo_anchor`), and the robot transitions onto the true-GPS
-path — every waypoint lands on its real-world coordinates regardless of
-where the robot was switched on. The anchor also serves the editor: it is
-the remembered GPS origin restored when the mission is reopened.
-
-Segment metadata note: `seg_out` in the metadata file additionally carries
-`speed` (m/s, `0` = mission speed).
+`path_generation` holds position (station-keeping fallback) and re-checks the
+file on every path request. Once the run's odom↔GPS fit is established — a
+second or so of fixes, **no vehicle motion needed**, since only a translation
+is estimated — the station converts every sample design-frame → GPS → today's
+world frame, writes the deployed file (with `deployed_from` /
+`deployed_fit_rms_m` provenance fields and no `geo_anchor`), and the robot
+transitions onto the true-GPS path. Every waypoint lands on its real-world
+coordinates regardless of where the robot was switched on. The anchor also serves the editor: it is
+the remembered GPS origin restored when the mission is reopened, and — since
+2026-09-09 — the *only* origin the editor uses for that file. The designer
+does not consult the station's live georeference, so opening and re-saving an
+anchored mission while the boat has a GPS lock leaves `geo_anchor` byte-for-byte
+unchanged.
 
 Start-alignment note: a non-GPS runtime file is normally *start-aligned* —
 its first sample is `(0,0)` and the first tangent is `+x` — so that on
@@ -101,17 +109,22 @@ model:
       locked: false
       children:
         - {type: waypoint, uid: 5, name: Lawnmower.1, x: 0.0, y: 0.0,
-           locked: false, seg_out: {kind: straight, params: {}}}
+           locked: false,
+           seg_out: {kind: straight, params: {}, speed: 0.0}}
         # ...
     - {type: waypoint, uid: 12, name: WP9, x: 14.0, y: -6.0, locked: false,
-       seg_out: {kind: bezier, params: {c1_frac: 0.33, c1_angle_deg: 30, ...}}}
+       seg_out: {kind: bezier, params: {c1_frac: 0.33, c1_angle_deg: 30, ...},
+                 speed: 0.35}}
 ```
 
 `seg_out` is the interpolation of the segment **leaving** that waypoint
 (kinds: `straight`, `sine`, `arc`, `spline`, `bezier`; registry in
-`mcs/designer/interpolation.py`). If the metadata file is missing, the
-editor re-imports the runtime samples as plain waypoints (decimated) so a
-mission is never unopenable.
+`mcs/designer/interpolation.py`), plus its `speed` in m/s — `0.0` means "use the
+mission cruise speed". Per-segment speeds are already baked into the runtime
+file's `t` column, which is why the robot never reads this.
+
+If the metadata file is missing, the editor re-imports the runtime samples as
+plain waypoints (decimated), so a mission is never unopenable.
 
 ## 3. Selecting a YAML trajectory at launch
 

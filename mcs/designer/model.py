@@ -1,4 +1,4 @@
-"""Mission Pattern Designer — data model.
+"""Survey Pattern Designer — data model.
 
 Qt-free except for the two change signals. A :class:`MissionModel` is an
 ordered list of top-level items, each either a :class:`Waypoint` or a

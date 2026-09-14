@@ -14,8 +14,9 @@ Buttons (left → right):
   running: it used to terminate them, which made "give the mapping back" and
   "end the mission" impossible to ask for separately.
 * **Publish Default/Override Control Mode** — alternates the two commands.
-* **Manual Target** / **Continue Original Mission** — toggles the map's
-  manual-target mode; deactivation publishes ``[0.0, 0.0]``.
+* **Manual Target** / **Continue Original Mission** — Manual Target arms the
+  next map click and publishes nothing by itself; only Continue Original
+  Mission publishes the ``[0.0, 0.0]`` resume sentinel (CLAUDE.md N2).
 * **Measure** — toggles the distance tool.
 * A one-line launch console + launch state LED.
 """
