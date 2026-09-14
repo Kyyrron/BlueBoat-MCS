@@ -1,8 +1,8 @@
-"""Mission Pattern Designer — interactive editing map.
+"""Survey Pattern Designer — interactive editing map.
 
 Reuses the station's map building blocks (adaptive grid, satellite
-:class:`~mcs.gui.map.tile_layer.TileLayer`, robot/pinger glyphs, theme) and
-adds CAD-style waypoint editing:
+:class:`~mcs.gui.map.tile_layer.TileLayer`, markers, theme) and adds
+CAD-style waypoint editing:
 
 * click-to-add mode with **fixed-distance creation** (Ctrl snaps the
   distance from the previous waypoint to the grid step) and axis
@@ -15,7 +15,9 @@ adds CAD-style waypoint editing:
   numbering, START / END markers.
 
 The view owns no mission logic: it reads/writes the
-:class:`~mcs.designer.model.MissionModel` and emits editing intents.
+:class:`~mcs.designer.model.MissionModel` and emits editing intents. It
+draws no live vehicle either -- the editor is independent of station
+telemetry, deliberately (see :mod:`mcs.designer.designer_window`).
 """
 
 from __future__ import annotations
@@ -27,22 +29,31 @@ import numpy as np
 from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (
-    QGraphicsEllipseItem, QGraphicsItem, QGraphicsItemGroup, QGraphicsScene,
-    QGraphicsSimpleTextItem, QGraphicsView,
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsItemGroup,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
 )
 
 from mcs.config.settings import AppConfig
-from mcs.designer.model import MissionModel, Waypoint
+from mcs.designer.model import MissionModel
 from mcs.designer.sampling import SampledMission
 from mcs.gui import theme
 from mcs.gui.map.map_items import (
-    MarkerItem, PolylineItem, RobotItem, draw_grid, draw_scale_bar)
+    MarkerItem,
+    PolylineItem,
+    draw_grid,
+    draw_scale_bar,
+)
 from mcs.gui.map.tile_layer import TileLayer
 
 C_WAYPOINT = QColor("#e3b341")
 C_WAYPOINT_SEL = QColor("#2f81f7")
 C_WAYPOINT_LOCK = QColor("#8a949e")
 C_PREVIEW = QColor("#3fb950")
+C_WORLD = QColor("#d29922")     # Gazebo-world limits reference rectangle
 
 
 class EditMode(Enum):
@@ -55,7 +66,7 @@ class WaypointItem(QGraphicsEllipseItem):
 
     R = 7.0
 
-    def __init__(self, uid: int, host: "DesignerMapView") -> None:
+    def __init__(self, uid: int, host: DesignerMapView) -> None:
         super().__init__(-self.R, -self.R, 2 * self.R, 2 * self.R)
         self.uid = uid
         self._host = host
@@ -130,12 +141,21 @@ class DesignerMapView(QGraphicsView):
         self._decor = QGraphicsItemGroup()      # chevrons + START/END
         self._decor.setZValue(25)
         self._scene.addItem(self._decor)
-        self.robot_item = RobotItem()
-        self.robot_item.setVisible(False)
-        self._scene.addItem(self.robot_item)
-        self.pinger_marker = MarkerItem(theme.C_PINGER, 6.0, "pinger", z=42)
-        self.pinger_marker.setVisible(False)
-        self._scene.addItem(self.pinger_marker)
+        # Read-only Gazebo-world limits reference (Set GPS Origin ▸ From a
+        # Gazebo World): corners kept in GPS, re-projected through the
+        # active fit on every set_geo_fit push so the rectangle stays
+        # geographically honest under any later anchor change. Not movable /
+        # selectable by construction (no item flags; selection code filters
+        # WaypointItem), z below the preview (20) and waypoints (60).
+        self._world_corners: list | None = None   # [[lat, lon] SW,SE,NE,NW]
+        self._world_name = ""
+        self._world_rect = PolylineItem(C_WORLD, 1.5,
+                                        Qt.PenStyle.DashLine, z=10)
+        self._world_rect.setVisible(False)
+        self._scene.addItem(self._world_rect)
+        self._world_marker = MarkerItem(C_WORLD, 4.0, "", z=10)
+        self._world_marker.setVisible(False)
+        self._scene.addItem(self._world_marker)
 
         self._wp_items: dict[int, WaypointItem] = {}
         self._scene.selectionChanged.connect(self._on_scene_selection)
@@ -289,8 +309,7 @@ class DesignerMapView(QGraphicsView):
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         super().drawForeground(painter, rect)
         if self.grid_visible:
-            draw_scale_bar(painter, self.viewport().width(),
-                           self.viewport().height(),
+            draw_scale_bar(painter, self.viewport().height(),
                            abs(self.transform().m11()),
                            getattr(self, "_grid_spacing", 0.0))
 
@@ -420,6 +439,34 @@ class DesignerMapView(QGraphicsView):
     def set_geo_fit(self, fit) -> None:
         self.geo_fit = fit
         self._update_tiles()
+        self._update_world_limits()
+
+    def set_world_limits(self, corners_latlon, name: str = "") -> None:
+        """Show a Gazebo world's limit rectangle as a read-only reference.
+
+        *corners_latlon* are the ``[lat, lon]`` corners from the world's
+        ``metadata.yaml`` (SW, SE, NE, NW); ``None`` hides the overlay.
+        Scene positions derive from the active geo fit, so the rectangle is
+        only drawn once an anchor exists.
+        """
+        self._world_corners = list(corners_latlon) if corners_latlon else None
+        self._world_name = name
+        self._update_world_limits()
+
+    def _update_world_limits(self) -> None:
+        if self.geo_fit is None or not self._world_corners:
+            self._world_rect.setVisible(False)
+            self._world_marker.setVisible(False)
+            return
+        ring = self._world_corners + self._world_corners[:1]
+        pts = np.array([self.geo_fit.latlon_to_world(float(la), float(lo))
+                        for la, lo in ring])
+        self._world_rect.set_points(pts)
+        self._world_rect.setVisible(True)
+        # Label at the NW corner (last of SW,SE,NE,NW).
+        self._world_marker.set_world_pos(*pts[3])
+        self._world_marker.set_label(self._world_name)
+        self._world_marker.setVisible(True)
 
     def _update_tiles(self) -> None:
         self.tiles.update_view(
@@ -427,16 +474,14 @@ class DesignerMapView(QGraphicsView):
             self.mapToScene(self.viewport().rect()).boundingRect(),
             abs(self.transform().m11()))
 
-    def refresh_overlays(self, robot=None, pinger=None,
-                         show_robot=True, show_pinger=True) -> None:
-        if robot is not None and show_robot:
-            self.robot_item.set_pose(*robot)
-            self.robot_item.setVisible(True)
-        else:
-            self.robot_item.setVisible(False)
-        if pinger is not None and show_pinger:
-            self.pinger_marker.set_world_pos(*pinger)
-            self.pinger_marker.setVisible(True)
-        else:
-            self.pinger_marker.setVisible(False)
+    def resizeEvent(self, event) -> None:
+        """Refetch tiles for the new viewport.
+
+        The visible span in scene metres changes with the widget size, and
+        nothing else here covers a resize -- pan, zoom and set_geo_fit each
+        refresh on their own. It used to be papered over by a 250 ms overlay
+        tick that also pushed the (live) geo fit; that tick is gone with the
+        robot/pinger overlays, so the resize case is handled explicitly.
+        """
+        super().resizeEvent(event)
         self._update_tiles()

@@ -7,10 +7,20 @@ Two mission types, matching the two launch files of the stack:
   (disabled when ``use_pinger`` is set, since the launch file then skips
   ``path_generation``) and ``use_pinger``.
 * **Gazebo simulation** — ``Sim_launch.py`` with ``robot_file``,
-  ``trajectory`` and ``controller_type`` only. The simulation launch always
-  starts ``master_control``, so an empty controller is not offered; motors /
-  note / pinger do not exist in that graph and their fields are hidden to
-  keep the dialog coherent with what will actually run.
+  ``trajectory``, ``controller_type``, ``note`` (and ``spawn_yaw`` for
+  GPS-anchored missions). The simulation launch always starts
+  ``master_control``, so an empty controller is not offered; motors and
+  pinger do not exist in that graph and their fields are hidden to keep the
+  dialog coherent with what will actually run. The **log note** does exist
+  there — ``simulation_interface`` names its poslog CSV from it exactly as
+  ``robot_interface`` does on the boat — so that field stays visible in both
+  modes; a simulated run's note always carries the ``sim`` marker
+  (:meth:`LaunchParameters.wire_note`). A GPS-anchored custom path takes the
+  SAME deferred-deploy pipeline as on real water: the station synthesises the
+  GPS feed itself (first fix lands north of the path's first point) and spawns
+  the boat at a **fixed** heading (``LaunchConfig.sim_spawn_yaw_deg``), so
+  anchoring, deployment and hot-reload are exercised exactly as at sea and two
+  runs of the same mission remain comparable.
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -18,11 +28,19 @@ The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
-    QLineEdit, QVBoxLayout,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
 )
 
 from mcs.config.settings import AppConfig
@@ -83,9 +101,12 @@ class LaunchDialog(QDialog):
             self._trajectory.addItem("── custom paths ──")
             self._trajectory.model().item(header).setEnabled(False)
             for name, path in customs:
-                anchored = io_yaml.read_geo_anchor(path) is not None
-                label = f"custom: {name}" + (" (GPS)" if anchored else "")
-                self._trajectory.addItem(label, str(path))
+                badge, tip = self._custom_badge(cfg, path)
+                self._trajectory.addItem(f"custom: {name}{badge}", str(path))
+                if tip:
+                    self._trajectory.setItemData(
+                        self._trajectory.count() - 1, tip,
+                        Qt.ItemDataRole.ToolTipRole)
         form.addRow("Trajectory", self._trajectory)
 
         # ---- Real-robot-only fields ----------------------------------------------
@@ -100,7 +121,11 @@ class LaunchDialog(QDialog):
         form.addRow(self._motors_label, self._enable_motors)
 
         self._note = QLineEdit()
-        self._note.setPlaceholderText("appended to robot-side log file names")
+        self._note.setPlaceholderText("added to the run's log file names")
+        self._note.setToolTip(
+            "Free text put into the poslog CSV name, {date}-{note}-poslog.csv "
+            "— robot_interface on the boat, simulation_interface in Gazebo. A "
+            "simulated run is always tagged 'sim' (sim-<note>).")
         self._note_label = QLabel("Log note")
         form.addRow(self._note_label, self._note)
 
@@ -170,8 +195,7 @@ class LaunchDialog(QDialog):
                 "controller node).")
         # Field gating
         for w in (self._use_pinger, self._use_pinger_label,
-                  self._enable_motors, self._motors_label,
-                  self._note, self._note_label):
+                  self._enable_motors, self._motors_label):
             w.setVisible(not sim)
         for w in (self._robot_file, self._robot_file_label):
             w.setVisible(sim)
@@ -186,6 +210,37 @@ class LaunchDialog(QDialog):
             f"The station runs: ros2 launch {self._cfg.launch.package} "
             f"{launch_file} …\n{extra}")
         self.adjustSize()
+
+    @staticmethod
+    def _custom_badge(cfg: AppConfig, path: Path) -> tuple[str, str]:
+        """Suffix + tooltip for one custom-path entry.
+
+        A GPS-anchored mission is geographically fixed and is never
+        realigned (the boat turns toward it instead), so it is exempt from
+        the start-alignment check -- the same exemption
+        DesignerWindow._maybe_offer_alignment makes. Everything else is
+        checked against its own samples: the world frame is local ENU
+        (origin = launch point, +x = east), so a mission that does not
+        start at (0,0) along +x makes the boat cut across to its start.
+
+        Informational only: the launch path never rewrites a mission file.
+        """
+        if io_yaml.read_geo_anchor(path) is not None:
+            return (" (GPS)",
+                    ("GPS-anchored: relocated into this run's world frame at "
+                     "launch."))
+        if io_yaml.read_start_misalignment(
+                path, cfg.designer.start_align_tol_m,
+                cfg.designer.start_align_tol_deg) is not None:
+            return (" (not start-aligned)",
+                    ("This mission does not start at (0,0) heading east "
+                     "(+x). The world frame is local ENU with its origin at "
+                     "the launch point, so the boat will first cut across "
+                     "to the mission start.\n"
+                     "For real water, prefer a GPS-anchored mission; "
+                     "otherwise use Edit \u25b8 Align to Start in the Survey "
+                     "Pattern Designer."))
+        return ("", "")
 
     def _on_pinger_toggled(self, on: bool) -> None:
         # BlueBoat_launch.py only starts path_generation when use_pinger is False.
@@ -206,25 +261,36 @@ class LaunchDialog(QDialog):
                 extra[key] = value
         custom = self._trajectory.currentData()
         gps_src = gps_dst = ""
+        gps_simulated = False
+        spawn_yaw = None
         if custom:
             src = Path(custom)
-            # Deferred GPS deployment only applies to the REAL robot, whose
-            # world origin changes every run. In simulation there is no GPS
-            # (the georeference can never converge, so the deployed file
-            # would never be written and the boat would hold at (0,0)
-            # forever) and Gazebo's world frame is stable — so an anchored
-            # mission executes its design-frame points directly.
-            if (not sim) and io_yaml.read_geo_anchor(src) is not None:
+            if io_yaml.read_geo_anchor(src) is not None:
+                # GPS-anchored: the SAME deferred-deploy pipeline on real
+                # water and in simulation. On real water MAVROS provides the
+                # fixes; in simulation the station synthesises them (the
+                # boat's first fix lands offset_north_m north of the path's
+                # first point) and spawns the boat at the configured fixed
+                # heading, so anchoring, deployment and hot-reload run exactly
+                # as at sea, repeatably.
                 gps_src = str(src)
                 gps_dst = str(io_yaml.deployed_path(src.parent, src.stem))
                 trajectory = f"from_yaml:{gps_dst}"
+                if sim:
+                    gps_simulated = True
+                    # Fixed, not random: the spawn heading is the only spawn
+                    # degree of freedom here, and two runs of one mission must
+                    # start from the same pose to be comparable. Extra args
+                    # may still override it for a single run.
+                    spawn_yaw = math.radians(
+                        self._cfg.launch.sim_spawn_yaw_deg)
             else:
                 trajectory = f"from_yaml:{custom}"
         else:
             trajectory = self._trajectory.currentText()
         return LaunchParameters(
             enable_motors=(not sim) and self._enable_motors.isChecked(),
-            note="" if sim else self._note.text().strip(),
+            note=self._note.text().strip(),
             controller_type=self._controller.currentText(),
             trajectory=trajectory,
             use_pinger=(not sim) and self._use_pinger.isChecked(),
@@ -232,5 +298,7 @@ class LaunchDialog(QDialog):
             robot_file=self._robot_file.currentText().strip() or "thrusters_ur",
             gps_anchored_source=gps_src,
             gps_deployed_target=gps_dst,
+            gps_simulated=gps_simulated,
+            spawn_yaw_rad=spawn_yaw,
             extra_args=extra,
         )

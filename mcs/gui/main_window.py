@@ -9,13 +9,19 @@ is what keeps the UI smooth and flicker-free during long experiments).
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QSplitter, QStatusBar,
-    QVBoxLayout, QWidget,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QSplitter,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from mcs.config.settings import AppConfig
@@ -26,6 +32,7 @@ from mcs.gui.left_panel import LeftPanel
 from mcs.gui.map.map_view import MapMode, MapView
 from mcs.gui.mission_stats import FloatingStatsBox
 from mcs.gui.right_panel import RightPanel
+from mcs.gui.sea_state_box import FloatingSeaBox
 from mcs.models.store import DataStore
 from mcs.ros.command_center import CommandCenter
 from mcs.ros.launch_manager import LaunchManager, LaunchParameters
@@ -76,6 +83,9 @@ class MainWindow(QMainWindow):
         # Floating Mission Stats Box (parented to the map_view so it floats without breaking the splitter)
         self.stats_box = FloatingStatsBox(self.store, self.map_view)
         self.right_panel.time_window_changed.connect(self.stats_box.refresh_stats)
+        # Floating Sea State box — mirror of the stats box, glued to the
+        # top-LEFT of the map view (i.e. right against the left panel).
+        self.sea_box = FloatingSeaBox(self.store, self.map_view)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -129,15 +139,16 @@ class MainWindow(QMainWindow):
         bus.gps_received.connect(store.on_gps)
         bus.compass_received.connect(store.on_compass)
         bus.mavros_state_received.connect(store.on_mavros_state)
+        bus.battery_received.connect(store.on_battery)
         bus.pinger_body_received.connect(store.on_pinger_body)
         bus.uw_gps_raw_received.connect(store.on_uw_gps_raw)
         bus.monitoring_received.connect(store.on_monitoring)
         bus.thruster_received.connect(store.on_thruster)
         bus.controller_ready_received.connect(store.on_controller_ready)
         bus.param_mode_received.connect(store.on_param_mode)
+        bus.sea_state_received.connect(store.on_sea_state)
         bus.mission_path_received.connect(store.on_mission_path)
-        bus.mission_path_failed.connect(
-            lambda err: self._status.showMessage(f"Path request failed: {err}", 5000))
+        bus.mission_path_failed.connect(self._on_mission_path_failed)
 
         # Diagnostics / logs.
         # Each message is fanned out from ONE signal to BOTH sinks — the GUI
@@ -175,6 +186,7 @@ class MainWindow(QMainWindow):
         self.toolbar.measure_mode_changed.connect(self._on_measure_mode)
         self.toolbar.create_pattern_clicked.connect(self._open_designer)
         self.toolbar.mission_launched.connect(self._on_mission_launched)
+        self.sea_box.modify_sea_clicked.connect(self._on_modify_sea)
         self.toolbar.mission_stopped.connect(self._on_mission_stopped)
         bus.launch_state_changed.connect(self._on_launch_state)
 
@@ -186,7 +198,7 @@ class MainWindow(QMainWindow):
         self.left_panel.refresh()
         self.right_panel.refresh()
         self.map_view.refresh()
-        if (hasattr(self, "_pending_preview_trajectory") and self._pending_preview_trajectory is not None and self.store.world_frame_ready()):
+        if (hasattr(self, "_pending_preview_trajectory") and self._pending_preview_trajectory is not None and self.store.map_frame_ready()):
             trajectory = self._pending_preview_trajectory
             self._pending_preview_trajectory = None
             self._request_path_preview(trajectory)
@@ -200,20 +212,29 @@ class MainWindow(QMainWindow):
                 self.stats_box.move(expected_x, expected_y)
                 self.stats_box.raise_()
 
+        # Sea state box: the mirror position, glued to the top-left of the map
+        # view. It hides itself outside a running simulation.
+        if hasattr(self, 'sea_box'):
+            self.sea_box.refresh()
+            if self.sea_box.pos() != QPoint(8, 8):
+                self.sea_box.move(8, 8)
+                self.sea_box.raise_()
+
         # Georeference status + satellite availability
         geo = self.store.geo
         if geo.fit is None:
-            self._geo_label.setText("georef: collecting…")
+            self._geo_label.setText("georef: waiting for GPS fix…")
         else:
-            quality = "ok" if geo.is_valid else "poor"
+            quality = "anchored" if geo.is_valid else "poor"
             color = theme.OK if geo.is_valid else theme.WARN
             self._geo_label.setText(
-                f"georef: {quality} (rms {geo.fit.rms_m:.1f} m)")
+                f"georef: {quality} (rms {geo.fit.rms_m:.1f} m, "
+                f"{geo.fit.n_pairs} fixes)")
             self._geo_label.setStyleSheet(f"color: {color};")
         self.left_panel.set_satellite_available(geo.is_valid)
         # Map orientation is handled inside MapView (QGC-style: north-up
-        # fixed, only the glyph rotates once heading is aligned) — nothing to
-        # drive from here.
+        # fixed, the scene is ENU by construction, only the glyph rotates)
+        # — nothing to drive from here.
         # Mission readiness → launch state promotion. The FCU-connected check
         # only applies to the real-robot graph; Sim_launch.py has no MAVROS.
         if self.launcher.state == "starting":
@@ -229,9 +250,30 @@ class MainWindow(QMainWindow):
         m.controller_type = params.controller_type
         m.use_pinger = params.use_pinger
         m.simulation = params.simulation
+        m.gps_simulated = params.gps_simulated
+        m.world_dir = params.world_dir
+        m.sea_choice = params.sea
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
         self.store.reset_experiment()
+        # Every launch restarts the robot side, which latches a NEW world
+        # origin — the previous run's odom<->GPS pairs are wrong by
+        # construction, so the anchor must start fresh (real and sim alike).
+        self.store.reset_georeference()
+        # Personalized-world runs (world_dir set) get their GPS from the
+        # simulator's mavros shim, anchored on the world's own origin —
+        # arming the station's SimGps too would put a second publisher on
+        # the same topic with an arbitrary receiver origin and deploy the
+        # trajectory into the wrong frame relative to the world geometry.
+        if params.gps_simulated and not params.world_dir:
+            self._arm_sim_gps(params)
+        else:
+            self.commands.disarm_sim_gps()
+            if params.world_dir:
+                self._status.showMessage(
+                    "Personalized world: GPS fixes come from the simulator's "
+                    "mavros shim — the path deploys into the world's own "
+                    "frame.", 10000)
         # Mission-path preview: the station asks the path_generation SERVICE
         # (/path_request) for the whole path — the same call path_publisher
         # makes, but direct, so it works identically on the real robot and
@@ -239,26 +281,86 @@ class MainWindow(QMainWindow):
         # Sim_launch.py always starts path_generation; the real launch only
         # does so with a controller and use_pinger:=False.
 
-        # if params.simulation or (params.controller_type and not params.use_pinger):
-        #     QTimer.singleShot(
-        #         3000, lambda: self._request_path_preview(params.trajectory))
-        self._pending_preview_trajectory = params.trajectory
+        self._preview_retries_left = self.cfg.launch.path_request_max_retries
+        self._last_preview_trajectory = None
+        # For a mission with deferred GPS deployment, params.trajectory points
+        # at the DEPLOYED file, which _start_gps_deployment is about to unlink
+        # — requesting it now would preview a stale/absent file. The
+        # deployment poll requests the preview itself once the file is
+        # written; everything else previews via the pending/tick mechanism
+        # (gated on map_frame_ready).
+        deployment_pending = bool(params.gps_anchored_source) and not (
+            params.simulation and not params.gps_simulated)
+        self._pending_preview_trajectory = (
+            None if deployment_pending else params.trajectory)
         self._start_gps_deployment(params)
+
+    # ========================================================= simulated GPS
+    def _arm_sim_gps(self, params: LaunchParameters) -> None:
+        """Simulated GPS for a Gazebo run of a GPS-anchored mission.
+
+        Receiver origin = the mission's first point + ``offset_north_m``
+        NORTH, in the anchor's EN frame (a legacy ``theta_deg`` anchor is
+        rotated into EN with exactly ``io_yaml.deploy_mission``'s
+        convention). Arms the bridge's NavSatFix timer; the fixes then flow
+        through the identical real-water pipeline (own subscription ->
+        diagnostics -> store -> anchor -> deferred deploy). Never called for
+        a personalized-world run: there the simulator's mavros shim is the
+        one GPS publisher (see _on_mission_launched)."""
+        from mcs.core.geo import local_en_to_latlon
+        from mcs.core.sim_gps import SimGpsModel
+        from mcs.designer import io_yaml
+
+        src = Path(params.gps_anchored_source)
+        anchor = io_yaml.read_geo_anchor(src)
+        first = io_yaml.read_first_point(src)
+        if anchor is None or first is None:
+            _LOG.error("sim GPS not armed: %s has no geo_anchor/points", src)
+            self._status.showMessage(
+                f"Sim GPS NOT armed — {src.name} unreadable; the map will "
+                "wait for a fix forever.", 10000)
+            return
+        theta = math.radians(float(anchor.get("theta_deg", 0.0)))
+        c, s = math.cos(theta), math.sin(theta)
+        e0 = c * first[0] + s * first[1]     # design -> EN, same rotation
+        n0 = -s * first[0] + c * first[1]    # deploy_mission applies
+        lat, lon = local_en_to_latlon(
+            e0, n0 + self.cfg.sim_gps.offset_north_m,
+            float(anchor["lat0"]), float(anchor["lon0"]))
+        # Seeded: the fix noise feeds the anchor estimate, so an unseeded
+        # generator would deploy the same mission a little differently every
+        # run (see SimGpsConfig.noise_seed).
+        self.commands.arm_sim_gps(
+            SimGpsModel(lat, lon, self.cfg.sim_gps.noise_sigma_m,
+                        self.cfg.sim_gps.noise_seed))
+        yaw_deg = math.degrees(params.spawn_yaw_rad or 0.0)
+        self._status.showMessage(
+            f"Sim GPS armed: first fix at {lat:.6f}, {lon:.6f} "
+            f"({self.cfg.sim_gps.offset_north_m:.0f} m N of the path start); "
+            f"spawn heading {yaw_deg:+.0f}°.", 12000)
+        _LOG.info("sim GPS armed: origin=(%.6f, %.6f), spawn_yaw=%.1f deg",
+                  lat, lon, yaw_deg)
 
     # ======================================================== GPS deployment
     def _start_gps_deployment(self, params: LaunchParameters) -> None:
         """GPS-anchored mission: path_generation was pointed at a deployed
         file that does not exist yet (it holds position meanwhile). The
-        robot's world origin is created at power-on, and the odom↔GPS fit
-        for THIS run only becomes observable after a few metres of motion —
-        so deployment is deferred: this watcher polls the georeferencer and,
-        once the fit is valid, converts the anchored mission into today's
-        world frame and writes the deployed file; path_generation reloads it
-        on its next path request and the boat transitions onto the true-GPS
-        path. Every waypoint therefore lands on its real-world GPS
-        coordinates regardless of where the robot was switched on."""
+        robot's world origin is created at power-on; the odom↔GPS anchor is
+        a pure translation (the world frame is local ENU) and converges from
+        the first few GPS fixes with NO vehicle motion required — so this
+        watcher typically fires within seconds: it converts the anchored
+        mission into today's world frame and writes the deployed file;
+        path_generation reloads it on its next path request and the boat
+        transitions onto the true-GPS path. Every waypoint therefore lands
+        on its real-world GPS coordinates regardless of where the robot was
+        switched on. Runs on real water and in GPS-simulated Gazebo runs
+        alike — empty Gazebo (station-synthesised fixes) and personalized
+        worlds (the simulator's mavros shim publishes the fixes) both take
+        this path; only a sim without simulated GPS (non-anchored mission)
+        skips it."""
         self._stop_gps_deployment()
-        if not params.gps_anchored_source or params.simulation:
+        if not params.gps_anchored_source or (
+                params.simulation and not params.gps_simulated):
             return
         from mcs.designer import io_yaml  # lazy: PyYAML machinery
         self._gps_src = Path(params.gps_anchored_source)
@@ -269,9 +371,8 @@ class MainWindow(QMainWindow):
         self._gps_timer.timeout.connect(lambda: self._poll_gps_deployment(io_yaml))
         self._gps_timer.start(1000)
         self._status.showMessage(
-            "GPS-anchored mission: holding position — drive the boat a few "
-            "metres so the georeference converges; the path deploys "
-            "automatically.", 10000)
+            "GPS-anchored mission: waiting for GPS fixes — the path deploys "
+            "automatically (no motion needed).", 10000)
 
     def _poll_gps_deployment(self, io_yaml) -> None:
         if not self.store.mission.launch_running:
@@ -283,13 +384,14 @@ class MainWindow(QMainWindow):
             if self._gps_hint_countdown <= 0:
                 self._gps_hint_countdown = 20
                 self._status.showMessage(
-                    "GPS path pending: georeference not established yet "
-                    "(needs GPS fix + a few metres of motion).", 8000)
+                    "GPS path pending: waiting for GPS fixes to anchor the "
+                    "frame (check /mavros/global_position/global).", 8000)
             return
         try:
             io_yaml.deploy_mission(self._gps_src, geo.fit, self._gps_dst)
         except Exception as exc:  # noqa: BLE001 - surfaced, retried next poll
             _LOG.error("GPS deployment failed: %s", exc)
+            self._status.showMessage(f"GPS deployment failed: {exc}", 8000)
             return
         self._stop_gps_deployment()
         _LOG.info("GPS mission deployed to %s (fit rms %.2f m)",
@@ -316,6 +418,7 @@ class MainWindow(QMainWindow):
         custom missions are previewed completely instead of being cut at the
         legacy 120 s limit.
         """
+        self._last_preview_trajectory = trajectory  # retry target on failure
         total = self.cfg.launch.path_preview_total_time_s
         if trajectory.startswith("from_yaml:"):
             try:
@@ -324,9 +427,36 @@ class MainWindow(QMainWindow):
                     Path(trajectory.partition(":")[2]).read_text()) or {}
                 total = float(data.get("duration_s", total)) + 1.0
             except Exception as exc:  # noqa: BLE001 - preview is best-effort
-                _LOG.warning("Could not read YAML duration: %s", exc)
+                _LOG.warning("Could not read YAML duration (falling back to "
+                             "the %.0f s horizon): %s", total, exc)
         self.commands.request_mission_path(
             total_time=total, dt=self.cfg.launch.path_preview_dt_s)
+
+    def _on_mission_path_failed(self, err: str) -> None:
+        """One failed/timed-out /path_request must not mean 'no path ever':
+        re-arm the pending preview (bounded, spaced) while the mission runs."""
+        retries = getattr(self, "_preview_retries_left", 0)
+        trajectory = getattr(self, "_last_preview_trajectory", None)
+        if (trajectory is not None and retries > 0
+                and self.store.mission.launch_running):
+            self._preview_retries_left = retries - 1
+            _LOG.warning("path preview failed (%s) — retrying, %d attempt(s) "
+                         "left", err, retries)
+            self._status.showMessage(
+                f"Path request failed ({err}) — retrying…", 5000)
+            delay_ms = int(self.cfg.launch.path_request_retry_delay_s * 1000)
+            QTimer.singleShot(
+                delay_ms, lambda t=trajectory: self._rearm_path_preview(t))
+            return
+        _LOG.error("path preview failed: %s", err)
+        self._status.showMessage(
+            f"Path request failed: {err} — mission path preview unavailable.",
+            30000)
+        self.bus.launch_output.emit(f"[station] path preview failed: {err}")
+
+    def _rearm_path_preview(self, trajectory: str) -> None:
+        if self.store.mission.launch_running:
+            self._pending_preview_trajectory = trajectory
 
     def _on_mission_stopped(self) -> None:
         pass  # state cleared on 'idle' launch_state
@@ -336,6 +466,17 @@ class MainWindow(QMainWindow):
             self.store.mission.launch_running = False
             self.store.mission.manual_target = None
             self.store.mission.simulation = False
+            self.store.mission.gps_simulated = False
+            self.commands.disarm_sim_gps()
+            # A finished run's path must not survive onto the next mission's
+            # map (it would silently re-anchor with the next run's frame) —
+            # and neither must a request left in flight by the dead run's
+            # path_generation poison the next mission's preview.
+            self.store.mission_path = None
+            self._pending_preview_trajectory = None
+            self._last_preview_trajectory = None
+            self._preview_retries_left = 0
+            self.commands.cancel_mission_path_request()
             self.commands.set_simulation_mode(False)
             self.map_view.clear_manual_target()
             self.toolbar.set_manual_target_active(False)
@@ -392,9 +533,34 @@ class MainWindow(QMainWindow):
         self.map_view.set_mode(MapMode.MEASURE if on else MapMode.NORMAL)
 
     # ================================================================ designer
+    def _on_modify_sea(self) -> None:
+        """Left panel 'Modify situation…': live sea-state change (sim)."""
+        from mcs.core.sea import SeaCatalog, SeaChoice, find_presets_file
+        from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
+        if not self.store.mission.simulation:
+            return
+        catalog = SeaCatalog.load(find_presets_file(self.cfg.sea.presets_file))
+        last = self.store.mission.sea_choice
+        dlg = SeaStateDialog(catalog, self.cfg.sea,
+                             last if isinstance(last, SeaChoice) else None,
+                             live=True, parent=self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        choice = dlg.choice()
+        if self.commands.send_sea_state(choice.command_json(dlg.ramp_s())):
+            self.store.mission.sea_choice = choice
+            self._status.showMessage(
+                f"Sea state command sent: {choice.summary(catalog)} "
+                f"(ramp {dlg.ramp_s():.0f} s)", 8000)
+        else:
+            self._status.showMessage("ROS is not running — sea state not sent", 8000)
+
     def _open_designer(self) -> None:
-        """Open the Survey Pattern Designer (one shared, non-modal instance
-        with live robot/pinger overlays and the station's georeference)."""
+        """Open the Survey Pattern Designer (one shared, non-modal instance).
+
+        The store is passed for the single explicit "anchor on the robot's
+        current fix" action only -- the editor is otherwise independent of
+        live telemetry, deliberately (see DesignerWindow._active_fit)."""
         from mcs.designer.designer_window import DesignerWindow  # lazy import
         if getattr(self, "_designer", None) is None:
             self._designer = DesignerWindow(self.cfg, self.store, parent=self)

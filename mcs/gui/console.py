@@ -29,8 +29,13 @@ from dataclasses import dataclass
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton,
-    QVBoxLayout, QWidget,
+    QComboBox,
+    QHBoxLayout,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from mcs.gui import theme
@@ -145,9 +150,7 @@ class LaunchConsole(QWidget):
     def _passes(self, entry: _Entry) -> bool:
         if self._category is not None and not self._category.search(entry.text):
             return False
-        if self._keyword and self._keyword not in entry.text.lower():
-            return False
-        return True
+        return not (self._keyword and self._keyword not in entry.text.lower())
 
     def _refilter(self) -> None:
         """Re-render the (bounded) history under the current filters."""

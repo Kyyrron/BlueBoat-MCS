@@ -55,8 +55,9 @@ class RobotState:
     lon: float | None = None
     compass_heading: float | None = None    # true heading, rad CCW-from-east
     fcu_connected: bool = False
-    armed: bool = False
-    fcu_mode: str = "—"
+    battery_v: float | None = None          # pack voltage, None = not reported
+    battery_pct: float | None = None        # charge fraction 0..1
+    battery_t: float | None = None          # reception time of the last message
     param_mode: str = "—"                   # 'default' / 'override'
     controller_ready: bool = False
     thrust_right: float = 0.0
@@ -85,7 +86,13 @@ class MissionState:
     controller_type: str = ""
     use_pinger: bool = False
     simulation: bool = False                # Sim_launch.py graph (no MAVROS/pinger)
+    gps_simulated: bool = False             # sim run with a synthesised NavSatFix
+                                            # feed (GPS-anchored mission): the full
+                                            # GPS pipeline — anchor gate, tiles,
+                                            # deferred deploy — runs as on real water
     manual_target: tuple[float, float] | None = None
+    world_dir: str = ""                     # personalized world folder ("" = empty Gazebo)
+    sea_choice: object = None               # SeaChoice chosen at launch (sim only)
     started_t: float | None = None          # first odom after launch
     path_target: tuple[float, float] | None = None   # x_d, y_d from /monitoring_data
 
@@ -130,6 +137,7 @@ class DataStore:
         self.target_dist_hist = TimeSeries(dim=1)  # robot<->active-target distance
         self.mission_path: np.ndarray | None = None  # (n, 3) x, y, yaw
         self._t0: float | None = None             # experiment time origin
+        self.sea = None                           # SeaReadout | None (sim only)
 
     # -------------------------------------------------------------- updates
     def on_odom(self, t: float, pose, twist) -> None:
@@ -150,14 +158,22 @@ class DataStore:
 
         self.robot_track.append(t, (r.x, r.y, r.yaw))
         self.speed_hist.append(t, (r.speed,))
-        if r.lat is not None and r.lon is not None:
-            self.geo.add_pair(t, r.x, r.y, r.lat, r.lon)
+        # NOTE: geo pairing happens in on_gps (at GPS rate, with a freshness
+        # guard on the odom pose) — pairing here at odom rate re-used one GPS
+        # fix against ~4 different odom positions and biased the estimate.
         # NOTE: the pinger world position is deliberately NOT recomputed here.
         # Re-anchoring a (possibly stale, dead-reckoned) body-frame pinger
         # vector to every new robot pose made the pinger marker follow the
         # robot's motion; it is now computed once per pinger message, with
         # the pose concurrent with that message (see on_pinger_body).
         self._record_target_distance(t)
+
+    def on_sea_state(self, t: float, payload: dict) -> None:
+        """Latest simulator sea state (``/sim/sea_state`` JSON)."""
+        from mcs.core.sea import parse_readback
+        r = parse_readback(payload, received_mono=t)
+        if r is not None:
+            self.sea = r
 
     def on_compass(self, t: float, heading_deg: float) -> None:
         """Absolute heading from /mavros/global_position/compass_hdg
@@ -172,11 +188,28 @@ class DataStore:
         if lat == 0.0 and lon == 0.0:
             return
         self.robot.lat, self.robot.lon = lat, lon
+        # Feed the georeferencer at GPS rate, only when the odom pose is
+        # fresh enough to count as concurrent with this fix.
+        r = self.robot
+        if r.has_odom and (t - r.t) < 0.5:
+            self.geo.add_pair(t, r.x, r.y, lat, lon)
 
     def on_mavros_state(self, t: float, connected: bool, armed: bool, mode: str) -> None:
+        # Only the connection flag is consumed (the readiness count in the left
+        # panel). `armed` and `mode` are kept in the signal signature because
+        # they ride the same mavros_msgs/State message, but nothing displays
+        # them -- storing them would be state no widget ever reads.
         self.robot.fcu_connected = connected
-        self.robot.armed = armed
-        self.robot.fcu_mode = mode
+
+    def on_battery(self, t: float, volts, pct) -> None:
+        """A field the FCU does not report arrives as None and must not
+        overwrite the last good reading -- only the stamp always advances,
+        so the panel can grey the row out when the stream dies."""
+        self.robot.battery_t = t
+        if volts is not None:
+            self.robot.battery_v = volts
+        if pct is not None:
+            self.robot.battery_pct = pct
 
     def on_pinger_body(self, t: float, xyz) -> None:
         """Pinger message received: THIS is the only place the pinger's world
@@ -209,12 +242,13 @@ class DataStore:
     def on_monitoring(self, t: float, data) -> None:
         # [t_ctrl, x, y, psi, x_d, y_d, psi_d, u1, u2]
         # x_d/y_d/psi_d are WORLD-frame for every controller branch —
-        # guaranteed by the patched integration/master_control.py, which
-        # captures the world target before its inRobotFrame() conversion.
-        # (Do NOT re-add a robot->world fixup here: with the patched
-        # controller it would double-convert. If running an UNPATCHED
-        # master_control, LoS-path/manual/pinger targets arrive robot-frame
-        # and will display off-path — deploy the patched file instead.)
+        # guaranteed by BlueBoat-Control/blueboat_control/src/master_control.py,
+        # which captures the world target before its inRobotFrame() conversion
+        # (the '--- world-frame monitoring target ---' markers, all branches).
+        # (Do NOT re-add a robot->world fixup here: it would double-convert.
+        # If the boat is running a STALE build that predates that capture,
+        # LoS-path/manual/pinger targets arrive robot-frame and will display
+        # off-path — rebuild the boat workspace, do not compensate here.)
         if len(data) >= 7:
             self.mission.path_target = (float(data[4]), float(data[5]))
         self._record_target_distance(t)
@@ -253,26 +287,40 @@ class DataStore:
 
     def robot_true_heading(self) -> float | None:
         """Robot heading referenced to true north/east (CCW from east), or
-        None if no absolute heading source is available yet.
+        None if no heading source is available yet.
 
-        Prefers /mavros/global_position/compass_hdg, which is ABSOLUTE and
-        available immediately — unlike the odom yaw, whose world frame is
-        launch-zeroed (yaw 0 at launch, so the glyph would face east at the
-        start regardless of the real heading). Falls back to the georeference
-        offset (yaw + theta) only once heading-aligned."""
+        Prefers /mavros/global_position/compass_hdg (magnetometer, absolute).
+        Falls back to the odom yaw directly: /blueboat/odom's yaw is absolute
+        ENU (0 = East, CCW+) on both the real boat and the simulator, so no
+        frame correction is applied — see GPS_MAP_ARCHITECTURE.md."""
         if self.robot.compass_heading is not None:
             return self.robot.compass_heading
-        if not self.robot.has_odom:
-            return None
-        fit = self.geo.fit
-        if fit is None or not fit.heading_aligned:
-            return None
-        return fit.world_yaw_to_true(self.robot.yaw)
+        if self.robot.has_odom:
+            return self.robot.yaw
+        return None
 
-    def world_frame_ready(self) -> bool:
-        """True once the odom->GPS heading alignment has been established."""
-        fit = self.geo.fit
-        return fit is not None and fit.heading_aligned
+    def map_frame_ready(self) -> bool:
+        """True once the map may draw. Two simulation modes exist:
+
+        * non-GPS sim (no anchored mission): immediately — the sim world is
+          already ENU, identity anchor, no tiles;
+        * GPS-sim (anchored mission, synthesised NavSatFix feed) and real
+          water: once the odom->GPS translation is anchored (a few fixes,
+          no vehicle motion required).
+
+        Nothing is drawn on the map before this."""
+        return self.geo.is_valid or (
+            self.mission.simulation and not self.mission.gps_simulated)
+
+    def reset_georeference(self) -> None:
+        """Fresh anchor for a fresh run — called on every mission launch.
+
+        Each launch restarts the robot side, which latches a NEW world
+        origin; pairs recorded against the previous run's origin are wrong
+        by construction, and the rolling fit window would blend the two
+        frames for minutes. Consumers read ``store.geo`` per tick, so
+        swapping the object is safe."""
+        self.geo = GeoReferencer(self.cfg.geo)
 
     def active_target_distance(self) -> float | None:
         tgt = self.active_target_world()
@@ -320,3 +368,4 @@ class DataStore:
         self.robot.travelled_m = 0.0
         self.mission.started_t = None
         self._t0 = None
+        self.sea = None

@@ -5,12 +5,18 @@ Buttons (left → right):
 * **Launch Mission** — opens the configuration dialog, then starts
   ``ros2 launch`` through the :class:`~mcs.ros.launch_manager.LaunchManager`.
 * **Stop Mission** — graceful SIGINT-first shutdown; the station stays open.
-* **EMERGENCY STOP** — sequenced: publish ``default`` on
-  ``/blueboat/input_str``, wait for confirmation, then (optionally)
-  terminate nodes.  Never disabled while ROS is up.
+  The ONLY button here that ends the mission.
+* **E-STOP** — publishes ``stop``: robot-side that zeroes the thrust, closes
+  the motor gate, disarms and latches. Leaves the parameter mode alone and
+  leaves every node running.  Never disabled while ROS is up.
+* **E-STOP + Stop Override** — the same ``stop``, then ``default`` through the
+  confirmation sequence, handing the servo mapping back. Also leaves the nodes
+  running: it used to terminate them, which made "give the mapping back" and
+  "end the mission" impossible to ask for separately.
 * **Publish Default/Override Control Mode** — alternates the two commands.
-* **Manual Target** / **Continue Original Mission** — toggles the map's
-  manual-target mode; deactivation publishes ``[0.0, 0.0]``.
+* **Manual Target** / **Continue Original Mission** — Manual Target arms the
+  next map click and publishes nothing by itself; only Continue Original
+  Mission publishes the ``[0.0, 0.0]`` resume sentinel (CLAUDE.md N2).
 * **Measure** — toggles the distance tool.
 * A one-line launch console + launch state LED.
 """
@@ -19,7 +25,13 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget, QSizePolicy,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
 from mcs.config.settings import AppConfig
@@ -82,27 +94,27 @@ class BottomToolbar(QWidget):
         row.addSpacing(14)
 
         # Two direct emergency buttons (no confirmation popup — an emergency
-        # action must be one click). Both run the same guaranteed sequence
-        # (publish 'default' → confirm transmission → …); they differ only in
-        # whether the launched nodes are terminated afterwards.
+        # action must be one click). NEITHER terminates the launch; that is
+        # Stop Mission's job alone. They differ only in whether the servo
+        # mapping is handed back afterwards.
         self.estop_kill_button = QPushButton("E-STOP + Stop Override")
         self.estop_kill_button.setObjectName("estopButton")
         self.estop_kill_button.setToolTip(
-            "Publish 'default' on /blueboat/input_str, confirm transmission, "
-            "THEN terminate every launched node (stops whatever is driving "
-            "the motors). One click, no confirmation dialog.")
-        self.estop_kill_button.clicked.connect(
-            lambda: self._commands.emergency_stop(terminate_nodes=True))
+            "Publish 'stop' (thrust zeroed, motors disabled, disarmed, "
+            "latched), then 'default' to hand the servo mapping back to "
+            "QGC/RC — confirmed by the param_mode echo. Nodes keep running; "
+            "use Stop Mission to end the mission. One click, no dialog.")
+        self.estop_kill_button.clicked.connect(self._commands.stop_override)
         row.addWidget(self.estop_kill_button)
 
         self.estop_button = QPushButton("E-STOP")
         self.estop_button.setObjectName("estopButton")
         self.estop_button.setToolTip(
-            "Publish 'default' on /blueboat/input_str and confirm "
-            "transmission. Nodes keep running. One click, no confirmation "
-            "dialog.")
-        self.estop_button.clicked.connect(
-            lambda: self._commands.emergency_stop(terminate_nodes=False))
+            "Publish 'stop' on /blueboat/input_str: thrust zeroed, motors "
+            "disabled, disarmed, and latched until an explicit 'enable'. "
+            "Stays in override and leaves every node running. "
+            "One click, no confirmation dialog.")
+        self.estop_button.clicked.connect(self._commands.emergency_stop)
         row.addWidget(self.estop_button)
 
         self.mode_button = QPushButton()
@@ -207,7 +219,7 @@ class BottomToolbar(QWidget):
         # The safe-shutdown sequence publishes 'default' outside the toggle
         # button's own bookkeeping; CommandCenter resyncs its state, and this
         # refresh keeps the label consistent with it.
-        bus.estop_state_changed.connect(lambda _s: self._refresh_mode_button())
+        bus.estop_state_changed.connect(self._on_estop_state_mode_sync)
 
     # ================================================================ actions
     def _on_launch(self) -> None:
@@ -224,6 +236,42 @@ class BottomToolbar(QWidget):
                 QMessageBox.StandardButton.No)
             if confirm != QMessageBox.StandardButton.Yes:
                 return
+        # Simulated GPS-anchored mission: offer the personalized Gazebo
+        # worlds (BlueBoat-SSS-Sim folders) whose limits contain the path.
+        # Kept out of LaunchDialog.parameters(), which must stay
+        # non-interactive for the headless smoke test. In world mode the
+        # simulator's mavros shim owns the GPS feed (the station's SimGps
+        # stays disarmed — see MainWindow._on_mission_launched) and
+        # full_mission_launch.py declares no spawn_yaw.
+        if params.simulation and params.gps_simulated \
+                and params.gps_anchored_source:
+            from pathlib import Path
+
+            from mcs.core.worlds import eligible_worlds  # lazy: yaml/numpy
+            worlds = eligible_worlds(Path(self._cfg.launch.worlds_root),
+                                     Path(params.gps_anchored_source))
+            if worlds:
+                from mcs.gui.dialogs.world_dialog import WorldChoiceDialog
+                wdlg = WorldChoiceDialog(worlds, self)
+                if wdlg.exec() != wdlg.DialogCode.Accepted:
+                    return                        # Cancel aborts the launch
+                if wdlg.selected_world_dir:
+                    params.world_dir = wdlg.selected_world_dir
+                    params.spawn_yaw_rad = None
+        # Every Gazebo launch (empty world or personalized world) then
+        # chooses the sea state the boat will feel. Cancel aborts.
+        if params.simulation:
+            from mcs.core.sea import SeaCatalog, find_presets_file
+            from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
+            catalog = SeaCatalog.load(
+                find_presets_file(self._cfg.sea.presets_file))
+            last = self._launcher.last_parameters
+            sdlg = SeaStateDialog(catalog, self._cfg.sea,
+                                  last.sea if last is not None else None,
+                                  parent=self)
+            if sdlg.exec() != sdlg.DialogCode.Accepted:
+                return
+            params.sea = sdlg.choice()
         if self._launcher.start(params):
             self.mission_launched.emit(params)
 
@@ -254,7 +302,7 @@ class BottomToolbar(QWidget):
     # ================================================================ feedback
     def _on_launch_state(self, state: str) -> None:
         led = {"idle": "never", "starting": "warn",
-               "running": "ok", "stopping": "warn"}[state]
+               "running": "ok", "stopping": "warn"}.get(state, "warn")
         self._launch_led.set_status(led)
         self.launch_button.setEnabled(state == "idle")
         self.stop_button.setEnabled(state in ("starting", "running"))
@@ -262,9 +310,24 @@ class BottomToolbar(QWidget):
     def _on_launch_output(self, line: str) -> None:
         self._console.setText(line[-160:])
 
+    def _on_estop_state_mode_sync(self, state: str) -> None:
+        """Resync the Default/Override label after a sequence that moved the mode.
+
+        Only the 'default' sequence does. An E-STOP publishes 'stop', which is
+        not a parameter mode at all, so its states must leave the label alone.
+        """
+        if state.startswith("estop"):
+            return
+        self._refresh_mode_button()
+
     def _on_estop_state(self, state: str) -> None:
-        text = {"publishing": "safe-shutdown: publishing 'default'…",
+        text = {"estop": "E-STOP: 'stop' published, awaiting robot ack…",
+                "estop-confirmed": "E-STOP: confirmed — thrust cut and latched",
+                "estop-timeout": "E-STOP: published, no ack (check robot_interface)",
+                "estop-sim": "E-STOP: simulation — no robot to acknowledge",
+                "publishing": "safe-shutdown: publishing 'default'…",
                 "confirmed": "safe-shutdown: confirmed by param_mode echo",
+                "already-default": "safe-shutdown: boat was already in 'default'",
                 "timeout": "safe-shutdown: published, flushed (no echo — check chain)",
                 "sim": "safe-shutdown: simulation — ack skipped",
                 "idle": ""}.get(state, "")

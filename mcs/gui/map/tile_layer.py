@@ -22,10 +22,16 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 from PySide6.QtWidgets import QGraphicsItemGroup, QGraphicsPixmapItem, QGraphicsScene
 
 from mcs.config.settings import MapConfig
-from mcs.core.geo import GeoFit, latlon_to_local_en, local_en_to_latlon, latlon_to_tile_xy, metres_per_pixel, tile_xy_to_latlon
+from mcs.core.geo import (
+    GeoFit,
+    latlon_to_local_en,
+    latlon_to_tile_xy,
+    local_en_to_latlon,
+    metres_per_pixel,
+    tile_xy_to_latlon,
+)
 
 _LOG = logging.getLogger(__name__)
-_TILE_PX = 256
 
 
 class TileLayer:
@@ -55,24 +61,24 @@ class TileLayer:
         self._enabled = enabled
         self._group.setVisible(enabled)
 
-    def update_view(self, fit: GeoFit | None, view_rect_world, px_per_m: float,
-                    enu_scene: bool = False) -> None:
+    def update_view(self, fit: GeoFit | None, view_rect_world,
+                    px_per_m: float) -> None:
         """Ensure tiles covering the visible scene rect exist at a fitting zoom.
 
-        ``enu_scene`` selects how a scene point maps to lat/lon: in ENU mode
-        the scene axes ARE local east/north, so scene coords convert via the
-        projection origin directly; otherwise the scene is the robot world
-        frame and conversion goes through the georeference rotation."""
-        if not self._enabled or fit is None:
+        The scene axes ARE local east/north metres about ``(fit.lat0,
+        fit.lon0)``, so a scene point converts to lat/lon through the
+        projection origin directly — no rotation exists anywhere in tile
+        placement. With ``fit=None`` (simulation, or the map frame not yet
+        anchored) the whole layer is hidden."""
+        if fit is None:
+            self._group.setVisible(False)
             return
-        self._enu_scene = enu_scene
+        self._group.setVisible(self._enabled)
+        if not self._enabled:
+            return
 
         def scene_to_latlon(sx: float, sy: float) -> tuple[float, float]:
-            if enu_scene:
-                return local_en_to_latlon(sx, sy, fit.lat0, fit.lon0)
-            return fit.world_to_latlon(sx, sy)
-
-        self._scene_to_latlon = scene_to_latlon
+            return local_en_to_latlon(sx, sy, fit.lat0, fit.lon0)
         # Pick zoom so one tile pixel ~ one screen pixel.
         lat_c, _ = scene_to_latlon(view_rect_world.center().x(),
                                    view_rect_world.center().y())
@@ -174,27 +180,17 @@ class TileLayer:
 
     def _place_tile(self, item: QGraphicsPixmapItem, z: int, x: int, y: int,
                     fit: GeoFit) -> None:
-        """Map the tile's 4 geo corners into world metres via the geo fit.
+        """Place the tile axis-aligned in the ENU scene (north-up fixed).
 
-        Tiles are square in web-mercator, and locally (harbour scale) the
-        world frame is a rotation + translation of local EN metres, so an
-        affine placement of the NW corner + scale + rotation is accurate.
+        Tiles are square in web-mercator; at harbour scale the equirectangular
+        EN plane matches it closely, so NW corner + per-tile scale is accurate.
+        No rotation, ever — this is the QGC look.
         """
         lat_nw, lon_nw = tile_xy_to_latlon(x, y, z)
         lat_c, _ = tile_xy_to_latlon(x + 0.5, y + 0.5, z)
         m_per_px = metres_per_pixel(lat_c, z)
         transform = QTransform()
-        if getattr(self, "_enu_scene", False):
-            # ENU scene (north-up fixed): the tile is axis-aligned, NW corner
-            # at its east/north metres, no rotation — this is the QGC look.
-            en, nn = latlon_to_local_en(lat_nw, lon_nw, fit.lat0, fit.lon0)
-            transform.translate(en, nn)
-            transform.scale(m_per_px, -m_per_px)  # +v south => -north
-        else:
-            # World-frame scene (before heading alignment): NW corner mapped
-            # into world metres, tile rotated by the georef theta.
-            wx, wy = fit.latlon_to_world(lat_nw, lon_nw)
-            transform.translate(wx, wy)
-            transform.rotateRadians(fit.theta)
-            transform.scale(m_per_px, -m_per_px)
+        en, nn = latlon_to_local_en(lat_nw, lon_nw, fit.lat0, fit.lon0)
+        transform.translate(en, nn)
+        transform.scale(m_per_px, -m_per_px)  # +v south => -north
         item.setTransform(transform)

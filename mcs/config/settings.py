@@ -32,6 +32,7 @@ class TopicsConfig:
     gps: str = "/mavros/global_position/global"
     compass_hdg: str = "/mavros/global_position/compass_hdg"
     mavros_state: str = "/mavros/state"
+    battery: str = "/mavros/battery"
     pinger_body: str = "/blueboat/pinger_coordinates"
     uw_gps_raw: str = "/uw_gps_data"
     monitoring: str = "/monitoring_data"
@@ -39,9 +40,14 @@ class TopicsConfig:
     controller_ready: str = "/blueboat/controller_ready"
     param_mode: str = "/blueboat/param_mode"
 
+    # --- Simulation only (BlueBoat-SSS-Sim sea_state_node): the live sea
+    # state (String JSON, latched, 2 Hz) and the command that changes it.
+    sea_state: str = "/sim/sea_state"
+
     # --- Publications (commands consumed by the existing stack) ---
     input_str: str = "/blueboat/input_str"
     manual_target: str = "/blueboat/manual_target"
+    sea_state_command: str = "/sim/sea_state/command"
 
     # --- Services ---
     path_request: str = "/path_request"
@@ -60,22 +66,28 @@ class DiagnosticsConfig:
         "/blueboat/odom": 0.5,
         "/mavros/state": 2.0,
         "/mavros/global_position/global": 2.0,
+        "/mavros/global_position/compass_hdg": 2.0,
+        "/mavros/battery": 5.0,
         "/blueboat/pinger_coordinates": 1.0,
         "/uw_gps_data": 3.0,
         "/monitoring_data": 0.5,
         "/thruster_input": 0.5,
         "/blueboat/controller_ready": 30.0,
         "/blueboat/param_mode": 60.0,
+        "/sim/sea_state": 3.0,
     })
     stale_age_multiplier: float = 4.0
     expected_hz: dict[str, float] = field(default_factory=lambda: {
         "/blueboat/odom": 20.0,
         "/mavros/state": 1.0,
         "/mavros/global_position/global": 5.0,
+        "/mavros/global_position/compass_hdg": 5.0,
+        "/mavros/battery": 1.0,
         "/blueboat/pinger_coordinates": 20.0,
         "/uw_gps_data": 2.0,
         "/monitoring_data": 20.0,
         "/thruster_input": 20.0,
+        "/sim/sea_state": 2.0,
     })
     rate_window_s: float = 5.0
     update_period_s: float = 1.0
@@ -87,13 +99,32 @@ class LaunchConfig:
 
     package: str = "blueboat_control"
     launch_file: str = "BlueBoat_launch.py"
-    # Gazebo simulation alternative (Sim_launch.py): declares only
-    # robot_file / trajectory / controller_type and always starts
-    # master_control + path_generation + path_publisher + simulation_interface
-    # — no MAVROS, no robot_interface/param_set, no pinger.
+    # Gazebo simulation alternative (Sim_launch.py): declares
+    # robot_file / trajectory / controller_type / data_dir / spawn_yaw and
+    # always starts master_control + path_generation + path_publisher +
+    # simulation_interface — no MAVROS, no robot_interface/param_set,
+    # no pinger.
     sim_launch_file: str = "Sim_launch.py"
+    # Personalized Gazebo worlds (BlueBoat-SSS-Sim, ~/worlds/<path>/<world>/):
+    # full_mission_launch.py declares world_dir / with_control /
+    # trajectory_file / controller_type (+ use_stock_world, quiet,
+    # with_mavros_shim, sim_origin_*, acquisition args) and NO spawn_yaw.
+    # Its mavros shim publishes the GPS fixes from the world's own anchor,
+    # so the station's SimGps stays disarmed in this mode.
+    sim_world_package: str = "blueboat_sss_sim"
+    sim_world_launch_file: str = "full_mission_launch.py"
+    worlds_root: str = str(Path.home() / "worlds")
     sim_robot_files: list[str] = field(default_factory=lambda: ["thrusters_ur"])
     sim_default_controller: str = "MPC"
+    # Gazebo spawn heading, DEGREES ENU (0 = east), emitted as Sim_launch.py's
+    # spawn_yaw:= (radians) for a simulated GPS-anchored mission. The boat
+    # always spawns at world (0, 0); this is the only spawn degree of freedom
+    # the station controls, and it is FIXED rather than random so two runs of
+    # the same mission start identically. full_mission_launch.py declares no
+    # spawn_yaw (world (0, 0), heading east). To start from another heading
+    # for one run, pass spawn_yaw:=<radians> in Extra args — it is appended
+    # after this one and ros2 launch takes the last occurrence.
+    sim_spawn_yaw_deg: float = 0.0
     controllers: list[str] = field(default_factory=lambda: ["", "PID", "LoS", "MPC"])
     trajectories: list[str] = field(default_factory=lambda: [
         "station_keeping", "circle", "straight_line", "sin",
@@ -107,10 +138,40 @@ class LaunchConfig:
     # duration_s overrides it automatically.
     path_preview_total_time_s: float = 120.0
     path_preview_dt_s: float = 0.5
-    # Nodes considered "required" before mission controls are enabled.
-    readiness_topics: list[str] = field(default_factory=lambda: [
-        "/mavros/state", "/blueboat/odom",
-    ])
+    # An in-flight /path_request with no reply after this long is dropped
+    # (path_generation died mid-call, e.g. Stop/E-STOP while requesting) —
+    # without the deadline the stuck future would block every later request
+    # for the rest of the app session. A dropped or failed request is
+    # re-armed up to max_retries times, spaced by retry_delay.
+    path_request_timeout_s: float = 10.0
+    path_request_max_retries: int = 3
+    path_request_retry_delay_s: float = 2.0
+
+
+@dataclass
+class SeaConfig:
+    """Sea state (current + waves) for simulated missions.
+
+    The physics and the preset table live in BlueBoat-SSS-Sim
+    (``sea_state_node``, ``config/sea_states.yaml``); the station reads the
+    installed table (``presets_file`` "" = auto-locate through
+    ``$AMENT_PREFIX_PATH`` / ``~/ros2_ws/install``) and passes the choice as
+    ``sea_*`` launch arguments — to ``full_mission_launch.py`` directly in a
+    personalized world, and through a companion
+    ``ros2 launch blueboat_sss_sim sea_state_launch.py world_name:=ocean``
+    process next to ``Sim_launch.py`` in the empty Gazebo world (that
+    launch file declares no sea arguments). A null choice (no current,
+    calm) starts no companion at all.
+    """
+
+    presets_file: str = ""
+    schedules_dir: str = str(Path.home() / ".config" / "blueboat_mcs" / "sea_states")
+    default_current: str = "none"
+    default_waves: str = "calm"
+    companion_package: str = "blueboat_sss_sim"
+    companion_launch_file: str = "sea_state_launch.py"
+    stock_world_name: str = "ocean"
+    ramp_s: float = 20.0          # live changes ramp over this many seconds
 
 
 @dataclass
@@ -149,18 +210,41 @@ class MapConfig:
 
 @dataclass
 class GeoConfig:
-    """Online odom<->GPS georeferencing parameters."""
+    """Online odom<->GPS georeferencing parameters (translation-only:
+    /blueboat/odom is local ENU, so no rotation is estimated and no vehicle
+    motion is needed — the anchor converges from the first few fixes)."""
 
     fit_window_s: float = 180.0     # use pairs from the last N seconds
-    min_spread_m: float = 4.0       # boat must have moved this far to fit
-    min_pairs: int = 25
-    refit_period_s: float = 5.0
+    min_pairs: int = 5              # ~1 s of GPS before the anchor is trusted
+    refit_period_s: float = 5.0     # throttle once the anchor is supported
     max_residual_m: float = 6.0     # above this the fit is flagged low-quality
 
 
 @dataclass
+class SimGpsConfig:
+    """Simulated robot GPS for Gazebo runs of GPS-anchored missions.
+
+    The bridge node synthesises NavSatFix messages from the sim odom (world
+    metres -> lat/lon about the receiver origin, pure translation). The
+    receiver origin — the boat's FIRST fix — is placed ``offset_north_m``
+    north of the mission's first point, so the anchor/deferred-deploy
+    pipeline runs exactly as on real water. Non-anchored sim runs simulate
+    no GPS at all."""
+
+    offset_north_m: float = 10.0   # first fix this far north of the path start
+    noise_sigma_m: float = 0.4     # Gaussian noise per EN axis, metres
+    rate_hz: float = 5.0           # matches the real MAVROS fix rate
+    # Seed of that noise. FIXED, never None: the fix noise feeds the anchor
+    # estimate, which is where the deployed path lands relative to the boat,
+    # so an unseeded generator would make the same mission start a metre or
+    # so away from one run to the next. Change it to draw a different (still
+    # repeatable) realisation.
+    noise_seed: int = 20260913
+
+
+@dataclass
 class DesignerConfig:
-    """Mission Pattern Designer settings."""
+    """Survey Pattern Designer settings."""
 
     trajectories_dir: str = str(DEFAULT_CONFIG_DIR / "trajectories")
     grid_snap_m: float = 1.0          # Ctrl-drag / fixed-distance creation step
@@ -169,6 +253,14 @@ class DesignerConfig:
     default_speed_mps: float = 0.5    # time-parameterization cruise speed
     preview_arrow_every_m: float = 8.0
     undo_depth: int = 100
+    # "Does the mission start at the world origin, heading +x?" — the world
+    # frame is local ENU (origin = launch point, +x = East), so an aligned
+    # mission starts at the boat's launch position heading EAST. Shared by
+    # the designer's Align to Start and by the launch dialog's badge, so the
+    # two can never disagree about the same file. GPS-anchored missions are
+    # geographically fixed and exempt.
+    start_align_tol_m: float = 0.05
+    start_align_tol_deg: float = 2.0
 
 
 @dataclass
@@ -181,13 +273,15 @@ class AppConfig:
     los: LosApproximation = field(default_factory=LosApproximation)
     map: MapConfig = field(default_factory=MapConfig)
     geo: GeoConfig = field(default_factory=GeoConfig)
+    sim_gps: SimGpsConfig = field(default_factory=SimGpsConfig)
     designer: DesignerConfig = field(default_factory=DesignerConfig)
+    sea: SeaConfig = field(default_factory=SeaConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
 
     # ------------------------------------------------------------------ I/O
     @classmethod
-    def load(cls, path: Path | None = None) -> "AppConfig":
+    def load(cls, path: Path | None = None) -> AppConfig:
         """Load the configuration, merging a JSON override file if present."""
         cfg = cls()
         path = path or DEFAULT_CONFIG_FILE

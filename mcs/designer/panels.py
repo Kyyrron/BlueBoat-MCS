@@ -1,4 +1,4 @@
-"""Mission Pattern Designer — side panels and auto-generated dialogs.
+"""Survey Pattern Designer — side panels and auto-generated dialogs.
 
 * :class:`MissionTree` — the structured mission view (groups → waypoints)
   with reorder / lock / rename, synchronized with the map selection.
@@ -18,9 +18,22 @@ import re
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton,
-    QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSpinBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
 from mcs.designer import interpolation, patterns

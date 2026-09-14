@@ -4,9 +4,9 @@ Two files per mission, in ``designer.trajectories_dir``:
 
 * ``<name>.yaml`` — the **runtime** trajectory: only what execution needs
   (format tag, speed, loop, time-stamped ``[t, x, y, yaw]`` samples plus
-  informative length/duration). Consumed by
-  ``integration/yaml_trajectory.py`` on the robot side; documented in
-  ``docs/08_trajectory_format.md``.
+  informative length/duration). Consumed on the robot side by
+  ``BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py``;
+  documented in ``docs/05_trajectory_format.md``.
 * ``<name>.meta.yaml`` — **editor** metadata: the full designer model
   (groups, locks, segment interpolation settings, comments). The runtime
   never reads it; without it a runtime file can still be re-imported as
@@ -18,12 +18,15 @@ from __future__ import annotations
 import datetime
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import yaml
 
-from mcs.designer.model import MissionModel
-from mcs.designer.sampling import SampledMission
+from mcs.designer.sampling import SampledMission, start_misalignment
+
+if TYPE_CHECKING:  # annotation only -- see mcs/designer/sampling.py
+    from mcs.designer.model import MissionModel
 
 FORMAT = "blueboat_trajectory/1"
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
@@ -53,10 +56,12 @@ def save_mission(directory: Path, name: str, model: MissionModel,
                  geo_anchor: dict | None = None) -> Path:
     # geo_anchor (optional) georeferences the design frame:
     # {lat0, lon0, theta_deg} = GPS of the design-frame origin and its
-    # rotation relative to local east/north. With an anchor present every
-    # waypoint is linked to real-world GPS, and the station deploys the
-    # mission into the robot's CURRENT world frame at run time
-    # (see deploy_mission and docs/08).
+    # rotation relative to local east/north. The design frame IS local ENU
+    # now, so new anchors always carry theta_deg: 0.0 — the field remains
+    # for legacy files, which deploy_mission still honours. With an anchor
+    # present every waypoint is linked to real-world GPS, and the station
+    # deploys the mission into the robot's CURRENT world frame at run time
+    # (see deploy_mission and docs/05_trajectory_format.md).
     directory.mkdir(parents=True, exist_ok=True)
     points = [[round(float(t), 3), round(float(x), 4), round(float(y), 4),
                round(float(psi), 5)]
@@ -65,7 +70,9 @@ def save_mission(directory: Path, name: str, model: MissionModel,
         "format": FORMAT,
         "name": name,
         "generator": "mission-pattern-designer/1.0",
-        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        # Local wall-clock is deliberate: operators read this field.
+        "created": datetime.datetime.now().isoformat(  # noqa: DTZ005
+            timespec="seconds"),
         "frame": "world",
         "speed": float(model.speed),
         "loop": bool(model.loop),
@@ -99,43 +106,94 @@ def read_geo_anchor(yaml_path: Path) -> dict | None:
     return None
 
 
+def read_first_point(yaml_path: Path) -> tuple[float, float] | None:
+    """(x, y) of the first sample of a runtime file, or None.
+
+    Used to place the simulated GPS receiver relative to the mission start.
+    Never raises: an unreadable, non-YAML or malformed file answers None.
+    """
+    try:
+        data = yaml.safe_load(yaml_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    points = data.get("points") or []
+    if not points:
+        return None
+    first = points[0]
+    try:
+        if len(first) < 3:
+            return None
+        return float(first[1]), float(first[2])
+    except (TypeError, ValueError):
+        return None
+
+
+def read_start_misalignment(yaml_path: Path, tol_m: float, tol_deg: float
+                            ) -> tuple[tuple[float, float], float] | None:
+    """Start misalignment of a runtime file, read from its own samples.
+
+    The launch dialog only has the runtime ``<name>.yaml`` on disk, not the
+    designer model. ``points`` IS the sampled polyline save_mission wrote,
+    so the first two rows carry exactly the geometry the designer checks;
+    the shared predicate lives in :func:`sampling.start_misalignment`.
+
+    Never raises: an unreadable, non-YAML or malformed file answers "no
+    misalignment to report" so it cannot break the launch dialog.
+    """
+    try:
+        data = yaml.safe_load(yaml_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    try:
+        pts = np.asarray(data.get("points", []), dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] < 3:
+        return None
+    return start_misalignment(pts[:, 1:3], tol_m, tol_deg)
+
+
 def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     """Convert a GPS-anchored mission into the CURRENT run's world frame.
 
     The robot's world origin is created wherever robot_interface starts, so
     it differs every run; a GPS-anchored mission must not inherit that
-    offset. Each sample is mapped design-frame -> GPS (via the file's own
-    geo_anchor) -> today's world frame (via the station's live odom<->GPS
-    fit), and yaw is rotated by the net frame rotation. The result is
-    written to *dst* -- the file path_generation was pointed at and is
+    offset. The world frame is local ENU on both ends, so each sample is
+    mapped design-frame -> GPS (via the file's own geo_anchor) -> today's
+    world frame (via the station's live translation fit). New anchors are
+    always written with ``theta_deg: 0`` (the design frame IS ENU); a legacy
+    anchor with a non-zero ``theta_deg`` is honoured by rotating its points
+    into ENU (and its yaws by ``-theta_a``) before translating. The result
+    is written to *dst* -- the file path_generation was pointed at and is
     watching for (it holds position until the file appears).
     """
     import math as _math
 
-    from mcs.core.geo import GeoFit as _GeoFit
+    from mcs.core.geo import local_en_to_latlon as _en_to_ll
 
-    # The current fit's rotation must be trustworthy before deployment: a
-    # translation-only fit (heading_aligned False, theta placeholder 0) would
-    # rotate the whole mission wrong. The watcher retries until this holds.
-    if not getattr(current_fit, "heading_aligned", True):
-        raise ValueError("georeference heading not aligned yet "
-                         "(needs more vehicle motion)")
+    # A usable translation fit is all deployment needs: no rotation is
+    # estimated any more (the odom frame is local ENU), so no vehicle motion
+    # is required. The watcher retries until fixes have anchored the frame.
+    if current_fit is None:
+        raise ValueError("no georeference yet (waiting for GPS fixes)")
 
     data = yaml.safe_load(src.read_text()) or {}
     anchor = data.get("geo_anchor")
     if not anchor:
         raise ValueError(f"{src} has no geo_anchor")
     theta_a = _math.radians(float(anchor.get("theta_deg", 0.0)))
-    fit_a = _GeoFit(theta=theta_a, tx=0.0, ty=0.0,
-                    lat0=float(anchor["lat0"]), lon0=float(anchor["lon0"]),
-                    rms_m=0.0, n_pairs=0)
-    dtheta = current_fit.theta - theta_a
+    lat0_a, lon0_a = float(anchor["lat0"]), float(anchor["lon0"])
+    ca, sa = _math.cos(theta_a), _math.sin(theta_a)
     out_points = []
     for t_s, x, y, yaw in data.get("points", []):
-        lat, lon = fit_a.world_to_latlon(float(x), float(y))
+        # design -> EN about the anchor origin. For theta_deg == 0 this is
+        # the identity; a legacy anchor recorded design = R(theta_a) @ EN.
+        e = ca * float(x) + sa * float(y)
+        n = -sa * float(x) + ca * float(y)
+        lat, lon = _en_to_ll(e, n, lat0_a, lon0_a)
         wx, wy = current_fit.latlon_to_world(lat, lon)
-        yaw2 = _math.atan2(_math.sin(float(yaw) + dtheta),
-                           _math.cos(float(yaw) + dtheta))
+        yaw2 = _math.atan2(_math.sin(float(yaw) - theta_a),
+                           _math.cos(float(yaw) - theta_a))
         out_points.append([round(float(t_s), 3), round(wx, 4),
                            round(wy, 4), round(yaw2, 5)])
     deployed = dict(data)

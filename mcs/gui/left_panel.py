@@ -3,7 +3,7 @@
 Sections (all collapsible):
 * **Layers** — visibility checkboxes for every map layer.
 * **Robot** — live pose, GPS, heading, speed, controller, mission state,
-  motor commands, travelled distance, elapsed time.
+  motor commands, battery charge, travelled distance, elapsed time.
 * **Pinger** — world & robot-frame coordinates, live distance, last update.
 * **Target** — robot↔pinger or robot↔path distance depending on mode.
 * **ROS diagnostics** — per-topic rate / age / LED status.
@@ -18,7 +18,11 @@ import time
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout,
+    QCheckBox,
+    QGridLayout,
+    QLabel,
+    QScrollArea,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -26,6 +30,12 @@ from mcs.config.settings import AppConfig
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection, InfoGrid, StatusLed
 from mcs.models.store import DataStore, TargetMode
+
+# Battery row thresholds: below 40 % is a "plan the return" warning, below
+# 20 % an error. A row older than this is greyed rather than trusted.
+_BATTERY_WARN_FRAC = 0.40
+_BATTERY_ERR_FRAC = 0.20
+_BATTERY_STALE_S = 15.0
 
 _LAYERS: list[tuple[str, str, bool]] = [
     ("satellite", "Satellite map layer", False),
@@ -75,15 +85,15 @@ class LeftPanel(QWidget):
             sec_layers.add_widget(box)
         self._layer_boxes["satellite"].setEnabled(False)
         self._layer_boxes["satellite"].setToolTip(
-            "Enabled once the odom ↔ GPS georeference is established "
-            "(requires GPS fix and a few metres of motion).")
+            "Enabled once the odom ↔ GPS georeference is anchored "
+            "(a few GPS fixes, real or simulated — no motion needed).")
         layout.addWidget(sec_layers)
 
         # ---- Robot -----------------------------------------------------------
         sec_robot = CollapsibleSection("ROBOT")
         self.robot_grid = InfoGrid()
         for key in ("World (x, y)", "GPS", "Heading", "Speed", "Controller",
-                    "Mission state", "Left motor", "Right motor",
+                    "Mission state", "Left motor", "Right motor", "Battery",
                     "Travelled", "Elapsed"):
             self.robot_grid.add_row(key)
         sec_robot.add_widget(self.robot_grid)
@@ -126,7 +136,10 @@ class LeftPanel(QWidget):
         g = self.robot_grid
         if r.has_odom:
             g.set("World (x, y)", f"{r.x:+8.2f}, {r.y:+8.2f} m")
-            g.set("Heading", f"{_deg(r.yaw):6.1f}°")
+            # Same source as the map glyph (compass first, else the absolute
+            # ENU odom yaw) so the two can never disagree on screen.
+            hdg = s.robot_true_heading()
+            g.set("Heading", f"{_deg(hdg):6.1f}°" if hdg is not None else "—")
             g.set("Speed", f"{r.speed:5.2f} m/s")
         else:
             g.set("World (x, y)", "no odom")
@@ -139,6 +152,7 @@ class LeftPanel(QWidget):
         g.set("Mission state", *self._mission_state_text())
         g.set("Left motor", f"{r.thrust_left:+6.2f} N")
         g.set("Right motor", f"{r.thrust_right:+6.2f} N")
+        g.set("Battery", *_battery_text(r))
         g.set("Travelled", f"{r.travelled_m:8.1f} m")
         elapsed = s.mission.elapsed_s()
         g.set("Elapsed", _fmt_hms(elapsed) if elapsed is not None else "—")
@@ -191,7 +205,7 @@ class LeftPanel(QWidget):
         for topic in sorted(stats):
             if topic not in self._diag_rows:
                 self._add_diag_row(topic)
-            led, name_label, value_label = self._diag_rows[topic]
+            led, _name_label, value_label = self._diag_rows[topic]
             st = stats[topic]
             led.set_status(st["status"])
             rate = st["rate"]
@@ -223,6 +237,32 @@ class LeftPanel(QWidget):
         box = self._layer_boxes["satellite"]
         if box.isEnabled() != available:
             box.setEnabled(available)
+
+
+def _battery_text(r) -> tuple[str, str]:
+    """Charge fraction (and pack voltage when the FCU reports one).
+
+    ``BatteryState.percentage`` is a 0..1 fraction, hence the x100. The row
+    greys out once the stream goes quiet rather than showing a stale charge
+    as if it were live -- /mavros/battery only exists on the real boat, so
+    in simulation it stays "no data" for the whole run.
+    """
+    if r.battery_pct is None and r.battery_v is None:
+        return "no data", theme.TEXT_DIM
+    parts = []
+    if r.battery_pct is not None:
+        parts.append(f"{r.battery_pct * 100.0:5.1f} %")
+    if r.battery_v is not None:
+        parts.append(f"{r.battery_v:5.2f} V")
+    text = "  ".join(parts)
+    if r.battery_t is None or (time.monotonic() - r.battery_t) > _BATTERY_STALE_S:
+        return text, theme.TEXT_DIM
+    pct = r.battery_pct
+    if pct is None:
+        return text, theme.OK
+    if pct >= _BATTERY_WARN_FRAC:
+        return text, theme.OK
+    return text, theme.WARN if pct >= _BATTERY_ERR_FRAC else theme.ERR
 
 
 def _deg(rad: float) -> float:

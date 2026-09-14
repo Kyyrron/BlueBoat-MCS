@@ -11,14 +11,19 @@ between rows — every interpolation model stays editor-side.
 
 from __future__ import annotations
 
+import itertools
 import math
-
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from mcs.designer.interpolation import REGISTRY
-from mcs.designer.model import MissionModel
+
+if TYPE_CHECKING:  # MissionModel is Qt-backed and used only as an annotation;
+    # keeping it out of the runtime import graph is what lets the sampling
+    # helpers (and io_yaml, which builds on them) be imported without Qt.
+    from mcs.designer.model import MissionModel
 
 
 @dataclass
@@ -34,6 +39,30 @@ class SampledMission:
         return len(self.t) == 0
 
 
+def start_misalignment(xy, tol_m: float, tol_deg: float
+                       ) -> tuple[tuple[float, float], float] | None:
+    """``(origin, initial tangent angle)`` if the sampled polyline *xy* does
+    not start at ``(0, 0)`` heading ``+x`` within tolerance, else ``None``.
+
+    The robot's world frame is local ENU (origin = launch position,
+    +x = EAST), so an aligned mission starts at the launch point heading
+    east. Both the designer (in-memory model) and the launch
+    dialog (runtime YAML on disk) answer this question through this one
+    function, so they can never disagree about the same mission.
+
+    Fewer than two points is "nothing to say" -> ``None``, never a raise.
+    """
+    xy = np.asarray(xy, dtype=float)
+    if xy.ndim != 2 or xy.shape[0] < 2 or xy.shape[1] < 2:
+        return None
+    p0 = (float(xy[0][0]), float(xy[0][1]))
+    d = xy[1] - xy[0]
+    angle = math.atan2(float(d[1]), float(d[0]))
+    if math.hypot(*p0) <= tol_m and abs(angle) <= math.radians(tol_deg):
+        return None
+    return p0, angle
+
+
 def sample_mission(model: MissionModel, ds: float = 0.25) -> SampledMission:
     wps = model.flatten()
     if not wps:
@@ -44,7 +73,7 @@ def sample_mission(model: MissionModel, ds: float = 0.25) -> SampledMission:
                               np.array([0.0]), 0.0, 0.0)
 
     mission_speed = max(float(model.speed), 1e-3)
-    pairs = list(zip(wps[:-1], wps[1:]))
+    pairs = list(itertools.pairwise(wps))
     if model.loop:
         pairs.append((wps[-1], wps[0]))
 

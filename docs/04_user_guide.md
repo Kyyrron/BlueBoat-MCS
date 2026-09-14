@@ -15,8 +15,8 @@ inspection, georeference quality, ROS connection state.
 **Layers** — checkboxes toggling every map layer: satellite imagery, robot
 trajectory, published mission path, pinger position and trajectory, the thin
 robot→target line, the heading arrow and the metric grid. The satellite box
-unlocks automatically once the odom↔GPS georeference is established (GPS fix
-plus a few metres of motion; watch "georef" in the status bar).
+unlocks as soon as the map frame is anchored — a second or so of GPS, no
+driving needed; watch "georef" in the status bar.
 
 **Robot** — world coordinates, GPS (when fixed), heading, speed, active
 controller, mission state (an aggregated readiness count over FCU connection,
@@ -40,16 +40,35 @@ visible within one second.
 
 Drag to pan, mouse-wheel to zoom (anchored under the cursor). The grid's
 scale bar in the bottom-left corner shows the current cell size in metres.
-The map is always **north-up and fixed** — it never rotates. Once the
-georeference is heading-aligned the scene becomes geographic (an `N↑` badge
-appears) and the robot glyph points at its true heading; before that a
-"world-up" notice is shown and the glyph points at its raw launch-frame
-heading (which is why hardcoded paths draw horizontal until then). Only the
-vehicle icon rotates, exactly like QGroundControl. **Clear Paths** in MAP TOOLS wipes the robot
-and pinger trails without touching live data. A simple click
-anywhere shows, in the status bar: world coordinates, GPS coordinates (once
-georeferenced) and the live distance from the robot to that point; the point
-is marked on the map.
+The map is always **north-up and fixed** — it never rotates, and it is
+**GPS-frame-only**: on real water nothing is drawn until the first GPS fixes
+anchor the frame (a "Waiting for GPS fix" notice shows — typically a few
+seconds, no driving needed), then tiles, glyph and overlays appear together,
+geographically placed, with the glyph at its true heading. In a simulation
+of a **GPS-anchored mission** the station simulates the GPS itself, so the
+map behaves exactly as above — including satellite imagery of the location
+the path was planned at (the boat's first fix appears 10 m north of the
+path start, and the boat spawns at a fixed heading — east by default — at
+Gazebo (0, 0), the same every run). In a simulation
+without a GPS-anchored path the map draws immediately (no tiles — there is
+no GPS). Only the
+vehicle icon rotates, exactly like QGroundControl. A briefly empty map right
+after a real-water launch is expected, not a fault; manual-target clicks
+during that window are refused rather than sent somewhere wrong.
+**Sea state (sim)** — a floating box in the **top-left corner of the
+map**, the mirror of the mission-statistics box in the top-right. It
+appears only while a Gazebo mission runs and shows the current (preset,
+from-bearing, instantaneous speed), the waves (preset, Hs, Tp,
+from-bearing, and the wake / swell group currently passing, with its
+height and the seconds left), the surface elevation at the boat, the next
+scheduled change and a live/stale status, all read back from the
+simulator. **Modify situation…** opens the same dialog as at launch in
+live mode: pick new presets / directions (or a timeline) and a ramp time,
+**Apply now** sends it and the simulator blends over the ramp.
+
+A simple click anywhere shows, in the status bar: world coordinates, GPS
+coordinates (once georeferenced) and the live distance from the robot to that
+point; the point is marked on the map.
 
 **Manual Target** (toolbar button): a one-shot arming control. Press it,
 then click the map once — that point is published as the target on
@@ -63,9 +82,7 @@ cancels arming and publishes nothing. While a target is active, a
 **Continue Original Mission** button is shown: it does exactly one thing —
 publish `[0.0, 0.0]`, which hands control back to the mission — and the
 target highlight is cleared. When the boat arrives (≤ 1 m), a "Manual
-Target Reached" banner appears at the top of the map. (Note: the resume
-requires the one-line robot-side fix documented in `03_ros_integration.md`
-§Observations 1.)
+Target Reached" banner appears at the top of the map.
 
 **Measure** (toolbar button): first click sets point A, the line and distance
 follow the cursor, second click freezes the measurement; the status bar shows
@@ -74,10 +91,10 @@ measurement from the map.
 
 ## Right panel
 
-**Map tools** — **Zoom +**, **Zoom −** (view-center anchored) and **Center
-Robot**, which recenters the view on the boat exactly once; the camera then
-remains completely free — it is never a follow mode, and after a manual
-center no automatic recentering can move the camera again.
+**Map tools** — **Zoom +**, **Zoom −** (view-center anchored), **Center
+Robot**, which recenters the view on the boat exactly once (the camera then
+stays completely free — it is never a follow mode), and **Clear Paths**, which
+wipes the robot and pinger trails from the map without touching recorded data.
 
 **Live distance** — robot↔current-target distance versus experiment time; the
 title states whether the target is the pinger, the path target or a manual
@@ -109,32 +126,106 @@ selector chooses between the *Real robot* launch and the *Gazebo simulation*
 (`Sim_launch.py`). Real robot: controller type (empty / PID / LoS / MPC),
 trajectory, use-pinger, motor enable (always re-confirmed, with a second
 warning dialog), a log note and free-form extra launch arguments. Gazebo
-simulation: robot file, trajectory and controller only — the simulation
-always runs a controller, and motor/pinger/note fields are hidden because
-they do not exist in that graph; mission-state readiness shows "(sim)" and
-does not wait for a flight controller. On OK the station runs the ROS2 launch file; the LED turns
+simulation: robot file, trajectory, controller and the same **log note** —
+the simulation always runs a controller, and only the motor and pinger
+fields are hidden because they do not exist in that graph; mission-state
+readiness shows "(sim)" and does not wait for a flight controller. The log
+note lands in the run's position-log file name just as on the boat
+(`{date}-{note}-poslog.csv`), with a simulated run always tagged `sim`
+(`sim-<note>`), so a Gazebo log can never be mistaken for a field record.
+Selecting a GPS-anchored custom path in simulation additionally arms the
+simulated GPS feed and passes a fixed `spawn_yaw` (shown in the status bar
+and the console command line) — the boat spawns at the same pose every run,
+which is what makes two simulated runs comparable; `spawn_yaw:=<radians>`
+in Extra args overrides it for one run. On OK the station runs the ROS2 launch file; the LED turns
 orange while nodes come up and green once the required ones report
 (FCU connected + odometry flowing). Launch output streams to the console line.
 
-**Stop Mission** first publishes `default` on `/blueboat/input_str` and
-waits for confirmed transmission (the same guarantee as the Emergency Stop),
-then shuts every launched node down gracefully (SIGINT first) and releases
-the process; the station remains open and the mission can be relaunched.
+**Personalized Gazebo worlds.** After OK on a GPS-anchored custom path in
+simulation, a second small dialog lists every generated world
+(`~/worlds/<path>/<world>/`, made with the SSS-Sim World Builder) whose
+limit rectangle contains at least one point of the selected path — any
+matching world qualifies, not only those built from this exact path.
+**Launch in World** runs the mission inside it (simulated seabed,
+side-scan sonar and GPS from the world's own anchor); **Empty Gazebo**
+launches exactly as before; **Cancel** aborts the launch. In a
+personalized world the boat spawns at the world's origin heading east and
+the controller drives it onto the path. When no world matches (or
+`~/worlds` doesn't exist) the dialog is skipped entirely.
 
-**E-STOP + Stop Override** and **E-STOP** are two direct, one-click
-emergency buttons (no confirmation dialog). Both first publish `default` on
-`/blueboat/input_str` and wait until the command is confirmed transmitted
-(the `param_mode` echo, with a graph-verified reliable-delivery fallback).
-**E-STOP** stops there — nodes keep running with safe parameters restored.
-**E-STOP + Stop Override** additionally terminates every launched node once
-transmission is confirmed, stopping whatever is driving the motors. The
-label next to the buttons reports each phase, and the Default/Override
-toggle is resynchronized automatically (after either E-STOP the mode is
-`default`, so its next command is `override`).
+**Sea state.** After the world step, every Gazebo launch shows a third
+dialog: **Current** (No current / Weak 0.1 m/s / Moderate 0.25 / Strong
+0.5 / Very strong 0.8 — the stress level) with the compass direction it
+comes *from* (a 16-point combo synced with a degrees box; "from N (→ S)"
+pushes the boat south), **Waves** (Calm / Rippled Hs 0.05 m / Smooth 0.15
+/ Slight 0.35 / Rough 0.60 — the stress level) with their direction, a
+seed, a **Custom** wave entry (Hs, Tp, spectrum peakedness γ, wake groups
+per hour with their height and period — written as a one-keyframe timeline
+file so the launch can carry explicit numbers), and an optional
+**Timeline**: rows of (time, current, from, waves,
+from) that make the sea change over the mission, saved as a named file
+and reloadable from the "Saved" combo. Each preset shows a one-sentence
+explanation and its literature reference. "No current" + "Calm" (the
+default) changes nothing about the simulation. **Launch** starts the
+mission; in the empty Gazebo world a companion `sea_state_launch.py`
+process carries the choice (its output is prefixed `[sea]` in the
+console); in a personalized world it is part of the world launch.
+
+**Stop Mission** first publishes `default` on `/blueboat/input_str` and waits
+for the boat to confirm it left override, then shuts every launched node down
+gracefully (SIGINT first) and releases the process; the station remains open and
+the mission can be relaunched. It is the only button that terminates anything.
+
+**E-STOP** and **E-STOP + Stop Override** are two direct, one-click emergency
+buttons (no confirmation dialog). **Neither ends the mission** — that is Stop
+Mission's job alone.
+
+**E-STOP** publishes `stop`. On the boat that zeroes the thrust, closes the
+motor gate, disarms, and **latches**: nothing moves again until an explicit
+`enable`, even though the controller keeps commanding. It stays in override and
+leaves every node running, so the mission can be resumed rather than restarted.
+Confirmation comes back as the robot withdrawing its readiness, and the label
+beside the buttons reports each phase.
+
+**E-STOP + Stop Override** does the same `stop` first — motors dead before
+anything else changes — and only then publishes `default` to hand the servo
+mapping back to QGC / the RC receiver, waiting for the `param_mode` echo. Use it
+when you want the boat drivable from the transmitter again. It does not stop the
+mission either.
 
 **Publish Default Control Mode** publishes the same `default` command
 immediately; the button then alternates to **Publish Override Control Mode**
 (publishing `override`) and back on each click.
+
+**After an E-STOP**, the boat ignores all thrust until it is released. Publish
+`enable` on `/blueboat/input_str` to clear the latch:
+
+```bash
+ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: enable"
+```
+
+## Post-mission report
+
+Every mission produces one picture, automatically — written **on the boat**, not
+by the station. When the launch is torn down, `robot_interface` closes its
+position CSV and files the whole run into its own folder:
+
+```
+<workspace>/data/Robot_data/2026_09_04-14_18_19-poslog/
+    …-poslog.csv    the log, moved here     …-origin.yaml   its world-frame origin
+    …-poslog.png    GPS track, distance-to-target, speed, thrust, summary table
+```
+
+A filed run is never re-filed or overwritten, and the CSV is only ever moved —
+it is primary field data. To re-render an older log:
+
+```bash
+ros2 run blueboat_control poslog_report.py <file.csv>
+ros2 run blueboat_control poslog_report.py <dir> --all
+```
+
+The renderer and the plot contents belong to `BlueBoat-Control`; see that
+module's docs for the detail.
 
 ## Closing
 
@@ -156,27 +247,52 @@ same satellite layer as the main map. **Center Pattern** (`F`) frames the
 current selection, or the whole mission, on screen; **Zoom + / Zoom −**
 toolbar buttons (`+` / `−`) zoom about the view centre. **Align to Start**
 rigid-transforms the whole mission so it begins at world (0,0) with its
-first tangent along +x: because every launch (simulation or real) zeroes
-the world frame at the boat — origin = boat position, +x = boat heading —
-an aligned mission always starts at the boat and its first motion is
-forward. Saving a non-GPS mission that doesn't already start that way
+first tangent along +x: the world frame is local ENU — origin = the boat's
+launch position, +x = EAST — so an aligned mission starts at the launch
+point heading east (mainly useful in simulation; real missions should be
+GPS-anchored). Saving a non-GPS mission that doesn't already start that way
 offers this alignment automatically; GPS-anchored missions are
 geographically fixed and are never realigned (the boat turns toward them
-instead). If the robot is
-connected, its position sets the initial view and the live robot arrow and
-pinger overlays can be toggled from the toolbar; otherwise **Set GPS
-Origin…** accepts Google-Maps-format coordinates (`33.660196, 130.657780`)
-to define world (0,0) — the origin remains optional, and without one the
-editor simply works in the local world frame. A mission saved with a GPS
+instead).
+
+The designer is **independent of the live station**: it shows no robot or
+pinger, and it never picks up the GPS lock on its own. Its origin is always
+something you chose, and the status bar names the one in force at all times
+(`Anchor: 33.660196, 130.657780 (mission)`, or `Anchor: none — design frame =
+the boat's launch point`). This is deliberate — the designer used to adopt the
+station's live georeference whenever the boat had a fix, which silently moved
+an opened path off the imagery it was drawn on and rewrote its anchor on the
+next save.
+
+**Set GPS Origin…** offers three ways to define world (0,0): **Enter
+Coordinates…** accepts Google-Maps-format coordinates (`33.660196,
+130.657780`); **From a Gazebo World…** browses `~/worlds/` for a world's
+`metadata.yaml` — the world's GPS anchor becomes the design origin (the
+design frame then coincides with the world's local frame) and its limit
+rectangle is drawn on the map as a dashed read-only reference, so the
+path can be laid out inside it; and **From the Robot's Current Position…**
+takes a one-off snapshot of the boat's latest GPS fix, so design (0,0) is
+where the boat is right now. That snapshot is taken once, when you click it —
+the design frame does not follow the boat afterwards. Saving such a mission also copies the
+world folder to `~/worlds/<mission name>/<world name>/` with its
+provenance updated to the new path, so the launch dialog finds it grouped
+with this mission; an already-existing copy is never overwritten (the
+status bar says which happened). The origin remains optional, and without
+one the editor simply works in the local world frame. A mission saved with a GPS
 reference remembers it: reopening the mission restores the origin (and the
 satellite layer), every waypoint is linked to real-world GPS coordinates,
-and the launch dialog labels it “(GPS)”. Launching such a mission uses
-deferred deployment: the boat holds position while you drive it a few
-metres to establish the run's georeference (status messages guide you),
-then the path deploys automatically onto its true GPS coordinates —
-independent of where the robot was powered on. At the end of any custom
-path the target clamps at the final pose forever, so the boat
-station-keeps there; the same holds on a reached manual target.
+and the launch dialog labels it “(GPS)”. The origin belongs to the mission,
+not to the session — **New** and **Open** reset it to whatever the file
+declares, so an un-anchored path can never pick up the previous one's origin. Launching such a mission uses
+deferred deployment: the boat holds position for the first seconds while
+the run's georeference anchors from the incoming GPS fixes — no driving
+needed — then the path deploys automatically onto its true GPS
+coordinates, independent of where the robot was powered on. The same flow
+runs in **simulation** (the station simulates the GPS feed and spawns the
+boat at a fixed heading), so a planned path can be rehearsed before the
+field trial, repeatably. At the end of any custom path the target clamps at the final
+pose forever, so the boat station-keeps there; the same holds on a reached
+manual target.
 
 **Editing.** *✚ Add Waypoints* (or `A`) arms click-to-add: Shift constrains
 the new point horizontally/vertically from the previous waypoint, Ctrl
