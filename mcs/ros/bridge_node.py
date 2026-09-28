@@ -38,7 +38,7 @@ from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
 
-try:  # mavros_msgs may be absent on a dev laptop — degrade gracefully
+try:  # mavros_msgs may be absent (a workspace without MAVROS) — degrade gracefully
     from mavros_msgs.msg import State as MavrosState
 
     MAVROS_MSGS_AVAILABLE = True

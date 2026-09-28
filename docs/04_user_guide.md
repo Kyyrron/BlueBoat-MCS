@@ -130,7 +130,7 @@ simulation: robot file, trajectory, controller and the same **log note** —
 the simulation always runs a controller, and only the motor and pinger
 fields are hidden because they do not exist in that graph; mission-state
 readiness shows "(sim)" and does not wait for a flight controller. The log
-note lands in the run's position-log file name just as on the boat
+note lands in the run's position-log file name just as in a real-robot run
 (`{date}-{note}-poslog.csv`), with a simulated run always tagged `sim`
 (`sim-<note>`), so a Gazebo log can never be mistaken for a field record.
 Selecting a GPS-anchored custom path in simulation additionally arms the
@@ -180,7 +180,7 @@ the mission can be relaunched. It is the only button that terminates anything.
 buttons (no confirmation dialog). **Neither ends the mission** — that is Stop
 Mission's job alone.
 
-**E-STOP** publishes `stop`. On the boat that zeroes the thrust, closes the
+**E-STOP** publishes `stop`. `robot_interface` then zeroes the thrust, closes the
 motor gate, disarms, and **latches**: nothing moves again until an explicit
 `enable`, even though the controller keeps commanding. It stays in override and
 leaves every node running, so the mission can be resumed rather than restarted.
@@ -206,8 +206,8 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: enable"
 
 ## Post-mission report
 
-Every mission produces one picture, automatically — written **on the boat**, not
-by the station. When the launch is torn down, `robot_interface` closes its
+Every mission produces one picture, automatically — written by the control
+stack, not by the station. When the launch is torn down, `robot_interface` closes its
 position CSV and files the whole run into its own folder:
 
 ```

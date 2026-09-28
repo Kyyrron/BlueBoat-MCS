@@ -4,7 +4,7 @@ Two files per mission, in ``designer.trajectories_dir``:
 
 * ``<name>.yaml`` — the **runtime** trajectory: only what execution needs
   (format tag, speed, loop, time-stamped ``[t, x, y, yaw]`` samples plus
-  informative length/duration). Consumed on the robot side by
+  informative length/duration). Consumed by the control stack's
   ``BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py``;
   documented in ``docs/05_trajectory_format.md``.
 * ``<name>.meta.yaml`` — **editor** metadata: the full designer model

@@ -6,13 +6,14 @@ Operator ground station for autonomous side-scan-sonar surveys with a
 BlueRobotics **BlueBoat** — an unmanned surface vessel (USV) for shallow-water
 survey work ([bluerobotics.com](https://bluerobotics.com/store/boat/blueboat/)).
 
-The station runs on the basestation laptop, not on the boat. It launches and
-supervises missions, draws the boat and its mission on a north-up satellite map,
+The station runs on the operator laptop, like every other node of the project;
+the boat carries only its hardware and its own firmware, reached through the
+BlueBoat Base Station WiFi. It launches and supervises missions, draws the boat and its mission on a north-up satellite map,
 plots live telemetry, and carries the emergency-stop and safe-shutdown sequences.
 It performs **no control computation**: every number on screen comes from a ROS 2
-topic published by the boat's own stack. It also contains the **Survey Pattern
-Designer**, an editor for drawing survey paths and exporting them as trajectory
-files the boat executes.
+topic published by the control stack (`BlueBoat-Control`). It also contains the
+**Survey Pattern Designer**, an editor for drawing survey paths and exporting them
+as trajectory files the control stack follows.
 
 Part of the [BlueBoat-SideScanSonar](https://github.com/Kyyrron/BlueBoat-SideScanSonar)
 project.
@@ -23,12 +24,12 @@ project.
 
 | Needed | Why |
 |---|---|
-| Ubuntu 22.04 / 24.04, Python ≥ 3.10 | the basestation laptop (24.04)|
+| Ubuntu 22.04 / 24.04, Python ≥ 3.10 | the operator laptop (24.04)|
 | [ROS 2](https://docs.ros.org/en/jazzy/Installation.html) (Jazzy on the reference machine) | `rclpy`, `ros2 launch` |
 | [BlueBoat-Control](https://github.com/Kyyrron/BlueBoat-Control) | `blueboat_control` (the launch files and nodes the station drives) and `blueboat_interfaces` (the `/path_request` service type) |
 | [mavros](https://github.com/mavlink/mavros/blob/ros2/docs/installation.md#binary-package-deb) | `mavros_msgs`, and the MAVLink link to the boat's ArduPilot |
 | PySide6, numpy, scipy, PyYAML | `requirements.txt` |
-| Network route to the boat; internet for satellite tiles | tiles are optional — the map works without them |
+| Network route to the boat (the BlueBoat Base Station WiFi); internet for satellite tiles | tiles are optional — the map works without them |
 
 Optional, for simulated missions in personalized Gazebo worlds:
 [BlueBoat-SSS-Sim](https://github.com/Kyyrron/BlueBoat-SSS-Sim).
@@ -39,7 +40,8 @@ them disable themselves.
 
 ## Installation
 
-1. Install ROS 2 and mavros, and create the **basestation** workspace + src folder `~/ros2_ws/src`.
+1. Install ROS 2 and mavros, and create the workspace + src folder `~/ros2_ws/src` — the project's only
+   workspace; every node runs from it on this laptop.
 
 2. Clone the superproject into it, with submodules, and build:
 
@@ -103,7 +105,7 @@ __`build.sh` does ros2 colcon build -> sources env.sh -> starts MCS App in one g
   continues), windowed mission statistics, filterable launch console.
 * Three separate stop actions: E-STOP, E-STOP + Stop Override, Stop Mission.
 * Survey Pattern Designer: draw or generate survey patterns, anchor them to real
-  GPS coordinates, export them as trajectory files the boat runs.
+  GPS coordinates, export them as trajectory files the control stack follows.
 
 ## Usage
 
@@ -151,10 +153,10 @@ authoritative reference (architecture, ROS contract, non-negotiables), with
   "resume the mission", so a click exactly on the world origin is nudged by 1 mm.
   Never publish it as a position.
 * **The station never compensates for the boat.** If a number looks wrong, the
-  producing node is the first suspect. A boat running a stale `BlueBoat-Control`
-  build silently breaks the map and trajectory following.
-* **Robot-side changes belong in `BlueBoat-Control`**, never here. Nothing is
-  copied out of this repo onto the boat.
+  producing node is the first suspect. A stale `BlueBoat-Control` build in
+  `~/ros2_ws/install` silently breaks the map and trajectory following.
+* **Control-stack changes belong in `BlueBoat-Control`**, never here. Nothing is
+  copied out of this repo into another package.
 
 ---
 

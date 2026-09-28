@@ -74,7 +74,7 @@ class LaunchParameters:
       ``robot_file``/``trajectory``/``spawn_yaw``.
 
     ``note`` is the operator's free-text log tag and reaches all three: it is
-    what ``{date}-{note}-poslog.csv`` is named after, on the boat and in
+    what ``{date}-{note}-poslog.csv`` is named after, in real-robot runs and in
     Gazebo alike. :meth:`wire_note` is the effective value — sanitised, and
     prefixed with ``sim`` for a simulated run so the two sets of logs stay
     distinguishable.

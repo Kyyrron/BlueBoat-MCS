@@ -284,7 +284,7 @@ try:
 
     # Save -> load -> resample must reproduce the mission exactly (the editor
     # model round-trips through <name>.meta.yaml; the runtime file carries the
-    # samples the robot actually executes).
+    # samples path_generation actually executes).
     _dsn_rt = io_yaml.save_mission(_dsn_dir, "designer", _dsn, _dsn_s)
     _dsn_back = MissionModel()
     io_yaml.load_mission(_dsn_dir, "designer", _dsn_back)
@@ -1205,7 +1205,7 @@ finally:
 print("sentinel ok")
 
 # --- Per-launch georeference reset (+ sim-GPS mission flag lifecycle) ---
-# Every launch restarts the robot side with a NEW world origin, so the
+# Every launch restarts the control stack with a NEW world origin, so the
 # anchor must start fresh — inheriting the previous run's pair window would
 # blend two frames (the latent stale-anchor bug).
 from mcs.core.geo import GeoReferencer as _GR

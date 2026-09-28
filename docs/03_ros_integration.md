@@ -23,7 +23,7 @@ defaults below match the stack as provided.
 
 ## Published commands
 
-| Topic | Type | Payload | Effect (robot side) |
+| Topic | Type | Payload | Effect (control stack) |
 |---|---|---|---|
 | `/blueboat/input_str` | `std_msgs/String` | `"default"` | `robot_interface.str_input_callback` → forwarded to `param_set` → safe parameters; echoed on `/blueboat/param_mode`. Published by **Stop Mission** / app exit (the safe-shutdown sequence), by **E-STOP + Stop Override**, and by the Default/Override toggle. **Not** by E-STOP alone. |
 | `/blueboat/input_str` | `std_msgs/String` | `"override"` | Direct-control parameters; the other state of the toggle button. |
@@ -62,7 +62,7 @@ missions are previewed completely.
 
 The station calls the service itself rather than subscribing to `/set_path`,
 because `path_publisher.py` is started only by `Sim_launch.py` and by the
-simulator's `full_mission_launch.py` — there is no `/set_path` on the real boat,
+simulator's `full_mission_launch.py` — there is no `/set_path` in a real-robot run,
 so depending on it would break every real-robot run (`CLAUDE.md` §3 N7).
 
 ## Mission launch
@@ -199,7 +199,7 @@ the mission" could not be asked for one at a time.
 | **E-STOP + Stop Override** | `stop`, then `default` | the above, then the `param_mode` transition | no |
 | **Stop Mission**, **Application Exit** | `default` | the `param_mode` transition | yes, after confirmation |
 
-`stop` is the emergency primitive. Robot-side, `robot_interface.full_stop()`
+`stop` is the emergency primitive. In the control stack, `robot_interface.full_stop()`
 zeroes the thrust, closes the `enable_motors` gate, disarms, publishes
 `controller_ready=False` immediately (that is the acknowledgement the station
 waits on) and **latches** until an explicit `enable`. The latch is what makes it
@@ -249,7 +249,8 @@ Node termination is never initiated before steps 1–4 complete.
 
 ## Observations on the existing stack (flagged, not silently patched)
 
-Robot-side code lives in the `BlueBoat-Control` submodule and is built there;
+Control-stack code lives in the `BlueBoat-Control` submodule and is built with
+`colcon build` in `~/ros2_ws`;
 nothing is copied from this repo (`CLAUDE.md` §6, §3 N9). Anchor on symbol
 names, not line numbers — they drift with that module.
 
@@ -258,7 +259,7 @@ names, not line numbers — they drift with that module.
 conversion; `/blueboat/pinger_coordinates` carries the **body-frame** vector.
 The station derives the world position itself, once per pinger message, from
 `/blueboat/pinger_coordinates` + `/blueboat/odom` (§3 N4). To make it a single
-source of truth, publish it robot-side on a new topic and point `TopicsConfig`
+source of truth, publish it from `robot_interface` on a new topic and point `TopicsConfig`
 at it. Residual marker sluggishness is inherent to the source, not to that
 choice: with `fixed_pinger=False` the vector is seeded from the Waterlinked
 *filtered* acoustic position (seconds of smoothing) and dead-reckoned with odom
@@ -279,19 +280,20 @@ trajectory the boat locks into a circle near the start while the reference runs
 ahead. The `fsin` reference is a chain of near-closed ~2 m loops (364.75°
 heading swing per half-cycle) and the MPC cost/governor settles into a
 self-orbit once displaced. Mechanism and remedies:
-`BlueBoat-Control/.claude/TODO.md` §0.3 ("MPC on `fsin` — orbit limit
-cycle"). The map is displaying the truth — nothing to compensate here.
+§0.3 ("MPC on `fsin` — orbit limit cycle") of `BlueBoat-Control`'s pre-v1.0
+`TODO.md`, deleted at the freeze — `git show d64ac71^:.claude/TODO.md` in that
+submodule. The map is displaying the truth — nothing to compensate here.
 
 **Cosmetic.** `robot_interface` publishes monitoring on the *relative*
 `blueboat/monitoring_data` while `master_control` uses the global
 `/monitoring_data`; the station follows `master_control`.
 
-### Fixed in `BlueBoat-Control` — but only if the boat is rebuilt
+### Fixed in `BlueBoat-Control` — but only if the install is rebuilt
 
 These four are fixed at the source. There is no version handshake on a ROS
-topic, so a boat running a **stale build** reintroduces each one silently.
-Rebuild `/blueboat_ws` at the SHA the superproject records before any field
-session, and never compensate for them in the station.
+topic, so a **stale build** in `~/ros2_ws/install` reintroduces each one
+silently. Rebuild (`colcon build` in `~/ros2_ws`) at the SHA the superproject
+records before any field session, and never compensate for them in the station.
 
 | Was | Symptom on a stale build |
 |---|---|
@@ -334,7 +336,7 @@ The `master_control` loop runs at **20 Hz** — `self.dt = dbl('control_dt', 0.0
 a declared ROS parameter, so it is settable per launch. `/monitoring_data` follows
 that rate, which is why `diagnostics.expected_hz` is `20.0`.
 
-The position CSV the boat writes is **not** a station artefact: its column layout
+The position CSV `robot_interface` writes is **not** a station artefact: its column layout
 is defined by `BlueBoat-Control/blueboat_control/src/_custom_libraries/robot_log_schema.py`
 (`COLUMNS_PINGER` / `COLUMNS_NO_PINGER`), a ROS-free module — read that to consume
 the CSV offline.
@@ -362,7 +364,7 @@ Nothing is copied from this repo. Both files are committed in the
   hold that makes deferred GPS deployment possible.
 
 To change either one: edit it in the `BlueBoat-Control` submodule, commit
-there, and `colcon build` the boat's workspace. No launch-file modification is
+there, and `colcon build` in `~/ros2_ws`. No launch-file modification is
 needed — the YAML path rides inside the existing `trajectory` argument
 (`trajectory:=from_yaml:/abs/path.yaml`), which both `BlueBoat_launch.py` and
 `Sim_launch.py` already forward to the node.

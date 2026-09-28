@@ -1,8 +1,9 @@
 # BlueBoat-MCS — Mission Control Station
 
 Operator ground-station GUI for a BlueRobotics BlueBoat USV used in a master's
-thesis on aspect-aware side-scan sonar survey. Runs on the basestation laptop,
-**not** on the boat.
+thesis on aspect-aware side-scan sonar survey. Runs on the operator laptop
+(`~/ros2_ws`), like every node of the project; the boat carries only its hardware
+and its own firmware, reached through the BlueBoat Base Station WiFi.
 
 **The station supervises and commands. It performs no control computation and
 duplicates no logic that already exists on a ROS topic.** Every number it shows
@@ -42,7 +43,7 @@ from the repo root; ROS2 comes from the sourced workspace, never from pip.
 ├── build.sh               colcon build in ~/ros2_ws, then `python3 run.py`
 ├── ruff.toml              lint config (see §7)
 ├── requirements.txt       runtime deps only
-├── requirements-dev.txt   ruff, pinned; never installed on the basestation
+├── requirements-dev.txt   ruff, pinned; dev-only, kept out of requirements.txt
 └── README.md
 ```
 
@@ -51,7 +52,8 @@ from the repo root; ROS2 comes from the sourced workspace, never from pip.
 has no lint config and no pinned ruff until they are recreated. Everything else
 in the tree above is tracked.
 
-Robot-side code lives in the **`BlueBoat-Control` submodule**, not here — see §6.
+Control-stack code (`robot_interface`, `master_control`, `path_generation`, …) lives in the
+**`BlueBoat-Control` submodule**, not here — see §6.
 
 ### Threading model
 `rclpy` spins on its own thread. `core/signals.py::SignalBus` is the **only**
@@ -236,7 +238,7 @@ the floating box's button.
 
 | Topic | Type | Consumed by | Contract |
 |---|---|---|---|
-| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `move <l> <r> <s>`. Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override` and — from either E-STOP button — `stop`. `enable` is the only thing that clears the robot-side E-STOP latch. |
+| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `move <l> <r> <s>`. Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override` and — from either E-STOP button — `stop`. `enable` is the only thing that clears `robot_interface`'s E-STOP latch. |
 | `/blueboat/manual_target` | `std_msgs/Float32MultiArray` | `master_control.py` | `[x, y]` in the **WORLD frame**. `[0.0, 0.0]` is the *resume-original-mission sentinel*, not a coordinate — a genuine click at the origin is nudged by `1e-3`. Only the explicit "Continue Original Mission" action may publish `[0,0]`. |
 
 ### Services
@@ -291,7 +293,7 @@ mission):
 | **E-STOP + Stop Override** | `stop`, then `default` | the above, then the `param_mode` transition | no |
 | **Stop Mission** / app exit | `default` | the `param_mode` transition | yes, after confirmation |
 
-`stop` is the real emergency primitive: robot-side `full_stop()` zeroes the
+`stop` is the real emergency primitive: `robot_interface.full_stop()` zeroes the
 thrust, closes the motor gate, disarms and **latches** until an explicit
 `enable`, all without leaving override. Leaving override is a *transfer* of
 authority — the RC channels go back to whatever else is transmitting — so it is
@@ -359,9 +361,9 @@ could not be compared and a difference could not be attributed to the change
 under test. Rehearsing another orientation is a *choice*: `spawn_yaw:=` in
 Extra args (appended last, so it wins) or the config value.
 
-**N9 — Keep `mcs/` free of robot-side code.** Robot-side changes belong in the
-`BlueBoat-Control` submodule (§6); nothing under `mcs/` imports robot-side
-modules at runtime.
+**N9 — Keep `mcs/` free of control-stack code.** Control-stack changes belong in
+the `BlueBoat-Control` submodule (§6); nothing under `mcs/` imports
+`blueboat_control` modules at runtime.
 
 **N10 — Never weaken a comparison baseline or overstate evidence** in anything
 this module produces for the thesis. See the project-level
@@ -400,7 +402,7 @@ rationale and the portable recipe in `docs/GPS_MAP_ARCHITECTURE.md`):
   imagery of the location the mission was planned at.
 - **The georeferencer is reset on every mission launch**
   (`store.reset_georeference()` in `_on_mission_launched`): each launch
-  restarts the robot side with a NEW world origin, so pairs from the
+  restarts the control stack with a NEW world origin, so pairs from the
   previous run are wrong by construction. The map re-anchors from fresh
   fixes within seconds; a relaunch briefly showing "waiting for GPS fix"
   is correct, not a regression.
@@ -522,7 +524,7 @@ hand-editable) and `~/.config/blueboat_mcs/tile_cache/` (disposable).
 
 ---
 
-## 6. Robot-side files — in the `BlueBoat-Control` submodule
+## 6. Control-stack files — in the `BlueBoat-Control` submodule
 
 The four nodes the station depends on behaving a particular way are **committed
 to `blueboat_control`** and installed by its `CMakeLists.txt`. There is no copy
@@ -540,7 +542,7 @@ there, and `colcon build`.
 Trajectory selection needs **no launch-file change** — the path rides inside the
 existing argument: `trajectory:=from_yaml:/abs/path.yaml`.
 
-### Robot-side behaviours the station does not compensate for
+### Control-stack behaviours the station does not compensate for
 **Point-LoS arrival checking is the pinger branch's alone.** `safety_distance`
 is a declared ROS parameter on `master_control`, defaulting to `-1.0` on the
 real boat (arrival check off) and `+1.0` in simulation. When it is positive,
@@ -554,22 +556,21 @@ one" failure mode is gone from that path.
 Pinger-marker lag is inherent to the source — the filtered seed plus dead
 reckoning described in §2 (`robot_interface.odom_callback`); N4 is what keeps it
 from *also* dragging behind the robot. Neither is corrected in `mcs/`: the
-station supervises, and a station-side workaround would hide a robot-side defect
+station supervises, and a station-side workaround would hide a control-stack defect
 behind a display that looks right.
 
-**⚠ Line numbers into `BlueBoat-Control` are volatile, and which version the
-boat runs cannot be settled from this repository.** `control_dt`
-(`self.dt = dbl('control_dt', 0.05)`) and `safety_distance` are **committed**
-declared parameters now — the old working-tree-only caveat no longer applies —
-but the boat's own `/blueboat_ws` build may still be older. That matters doubly
+**⚠ Line numbers into `BlueBoat-Control` are volatile, and the installed build
+can lag the source.** `control_dt` (`self.dt = dbl('control_dt', 0.05)`) and
+`safety_distance` are **committed** declared parameters now — the old
+working-tree-only caveat no longer applies — but what runs is the copy in
+`~/ros2_ws/install/`, which only `colcon build` refreshes. That matters doubly
 since the 2026-08-31 local-ENU odom fix (`docs/03_ros_integration.md` §Observations): a
-stale boat build publishes the old hybrid frame (launch-relative yaw over
-ENU axes) and silently breaks the GPS map and trajectory following from
-non-East headings. Anchor on the symbol name, not the line, and confirm before
-a field session that `/blueboat_ws` is built at the SHA the superproject
-records — that check needs the boat's own workspace and cannot be made here.
+stale install publishes the old hybrid frame (launch-relative yaw over ENU axes)
+and silently breaks the GPS map and trajectory following from non-East headings.
+Anchor on the symbol name, not the line, and rebuild in `~/ros2_ws` before a field
+session so the install matches the SHA the superproject records.
 
-### CSV logs (written by `robot_interface.py` on the robot)
+### CSV logs (written by `robot_interface.py` in real-robot runs)
 Two layouts. With pinger: date, `relative_*`, `corrected_pinger_*`, GPS, pinger
 GPS, thrusters, then raw USBL/IMU. Without pinger: date, `relative_*`,
 `target_*`, GPS, thrusters, then raw IMU. `target_*` exists **only** in the
@@ -580,8 +581,8 @@ no-pinger layout — in pinger mode it duplicated `corrected_pinger_*`.
 ## 7. Commands known to work
 
 ```bash
-# run (basestation workspace is ~/ros2_ws; env.sh activates .venv + sources
-# ROS2 and the overlay). /blueboat_ws is the BOAT's workspace, not this one.
+# run (the one workspace is ~/ros2_ws; env.sh activates .venv + sources
+# ROS2 and the overlay)
 cd ~/ros2_ws && source env.sh
 cd src/BlueBoat-SideScanSonar/BlueBoat-MCS
 pip install -r requirements.txt   # first time only; NOT --user inside the venv
@@ -615,9 +616,9 @@ ros2 topic echo /mavros/global_position/compass_hdg
 ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: default"
 ```
 
-The boat's own workspace is `/blueboat_ws` (with a `.venv`), which is where
-`BlueBoat-Control` is built and run — distinct from the basestation's
-`~/ros2_ws`.
+`~/ros2_ws` is the project's only workspace: `BlueBoat-Control`, this station
+and every other node are built and run there, on this laptop (`/blueboat_ws`
+never existed in this project — do not reintroduce it).
 
 `ruff check .` is the lint gate, configured in `ruff.toml`. It exits clean on
 this tree in any environment — sourced, venv-only, or bare system Python — and
@@ -767,14 +768,14 @@ inventory and the "how to add X" checklists live in §1 of this file, not in
 
 | Doc | Content |
 |---|---|
-| `03_ros_integration.md` | every topic / command / service, the launch targets, the stop actions and the safe-shutdown sequence, open robot-side observations |
+| `03_ros_integration.md` | every topic / command / service, the launch targets, the stop actions and the safe-shutdown sequence, open control-stack observations |
 | `04_user_guide.md` | every screen and control, including the Survey Pattern Designer |
 | `05_trajectory_format.md` | the `blueboat_trajectory/1` YAML contract and deferred GPS deployment |
 | `GPS_MAP_ARCHITECTURE.md` | the authoritative, self-contained description of the GPS-only map model (§4), written for reuse in any application that draws a GPS vehicle on a real-world map |
 
 `03_ros_integration.md` §Observations carries what is still open or carried
-deliberately on the robot side, plus the table of `BlueBoat-Control` fixes that
-a stale boat build silently reintroduces. §6 above owns the station-side half.
+deliberately in the control stack, plus the table of `BlueBoat-Control` fixes that
+a stale `~/ros2_ws/install` build silently reintroduces. §6 above owns the station-side half.
 
 Line citations into `BlueBoat-Control` drift whenever that module is edited;
 `BlueBoat-Control` owns them, and its own `CLAUDE.md` §2.1.1 records the

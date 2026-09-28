@@ -217,7 +217,7 @@ class DataStore:
         message. Between messages the marker stays fixed in the world —
         composing an older body-frame vector with newer robot poses (the
         previous behaviour) dragged the pinger along with the robot.
-        Residual lag now comes only from the robot side (Waterlinked
+        Residual lag now comes only from the source (robot_interface: Waterlinked
         'filaco' filtering + dead-reckoning drift, see 03_ros_integration)."""
         p = self.pinger
         p.t = t
@@ -246,9 +246,9 @@ class DataStore:
         # which captures the world target before its inRobotFrame() conversion
         # (the '--- world-frame monitoring target ---' markers, all branches).
         # (Do NOT re-add a robot->world fixup here: it would double-convert.
-        # If the boat is running a STALE build that predates that capture,
+        # If ~/ros2_ws/install holds a STALE build that predates that capture,
         # LoS-path/manual/pinger targets arrive robot-frame and will display
-        # off-path — rebuild the boat workspace, do not compensate here.)
+        # off-path — colcon build in ~/ros2_ws, do not compensate here.)
         if len(data) >= 7:
             self.mission.path_target = (float(data[4]), float(data[5]))
         self._record_target_distance(t)
@@ -315,7 +315,7 @@ class DataStore:
     def reset_georeference(self) -> None:
         """Fresh anchor for a fresh run — called on every mission launch.
 
-        Each launch restarts the robot side, which latches a NEW world
+        Each launch restarts the control stack, which latches a NEW world
         origin; pairs recorded against the previous run's origin are wrong
         by construction, and the rolling fit window would blend the two
         frames for minutes. Consumers read ``store.geo`` per tick, so

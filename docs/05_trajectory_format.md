@@ -1,7 +1,7 @@
 # 5 — YAML Trajectory Format Specification
 
 Format tag: **`blueboat_trajectory/1`**. Produced by the Survey Pattern
-Designer, consumed on the boat by
+Designer, consumed by the control stack's
 `BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py`
 next to `path_generation.py`. Two files per mission; the runtime never needs
 the second one.
@@ -13,7 +13,7 @@ navigation pipeline evaluates trajectories at arbitrary times
 (`single_pose(t)`), so the file stores **dense, time-stamped samples** and
 the runtime does nothing but linear interpolation. All interpolation
 mathematics (arcs, splines, Béziers, …) is resolved at export time and
-never runs on the robot.
+never runs in the control stack.
 
 ```yaml
 format: blueboat_trajectory/1        # REQUIRED, exact string
@@ -121,7 +121,7 @@ model:
 (kinds: `straight`, `sine`, `arc`, `spline`, `bezier`; registry in
 `mcs/designer/interpolation.py`), plus its `speed` in m/s — `0.0` means "use the
 mission cruise speed". Per-segment speeds are already baked into the runtime
-file's `t` column, which is why the robot never reads this.
+file's `t` column, which is why the control stack never reads this.
 
 If the metadata file is missing, the editor re-imports the runtime samples as
 plain waypoints (decimated), so a mission is never unopenable.

@@ -14,7 +14,7 @@ E-STOP + Stop Override       ``stop`` then ``default``  **no**
 Stop Mission / App Exit      ``default``                yes, after confirmation
 ===========================  =========================  ===========================
 
-``stop`` is what an emergency stop should be: robot-side it zeroes the thrust,
+``stop`` is what an emergency stop should be: ``robot_interface`` zeroes the thrust,
 disables the motor gate, disarms and **latches** until an explicit ``enable``, all
 without leaving override. Leaving override is a *transfer* of authority — the RC
 channels go back to whatever else is transmitting — so it is the operator's
@@ -39,8 +39,8 @@ How the guarantee is implemented (layered, strongest evidence first)
    proves ``robot_interface``'s subscription has completed QoS discovery
    with this publisher: under DDS reliable QoS, a sample handed to the
    writer will then be delivered (with retransmission) as long as the writer
-   stays alive. A count of 0 is reported to the operator (nothing on the
-   robot side could receive the command) and the sequence still publishes
+   stays alive. A count of 0 is reported to the operator (no subscriber
+   in the control stack could receive the command) and the sequence still publishes
    and re-checks, in case discovery completes within the window.
 2. **Publication.** ``publish()`` is synchronous into the DDS writer: when
    it returns, the sample is queued in the reliable send path. This is the
@@ -319,8 +319,8 @@ class CommandCenter(QObject):
             return
         node = self._ros.node
         if node is None:
-            # Degraded mode: nothing can be published, but nothing robot-side
-            # is reachable either. Tear the launch down if asked and finish.
+            # Degraded mode: nothing can be published, but no control-stack
+            # node is reachable either. Tear the launch down if asked and finish.
             self._bus.ros_log.emit(
                 f"{reason}: ROS layer unavailable — skipping publish, "
                 "stopping launch process only.")

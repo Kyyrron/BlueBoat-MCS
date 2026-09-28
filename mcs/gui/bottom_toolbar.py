@@ -6,7 +6,7 @@ Buttons (left → right):
   ``ros2 launch`` through the :class:`~mcs.ros.launch_manager.LaunchManager`.
 * **Stop Mission** — graceful SIGINT-first shutdown; the station stays open.
   The ONLY button here that ends the mission.
-* **E-STOP** — publishes ``stop``: robot-side that zeroes the thrust, closes
+* **E-STOP** — publishes ``stop``: ``robot_interface`` zeroes the thrust, closes
   the motor gate, disarms and latches. Leaves the parameter mode alone and
   leaves every node running.  Never disabled while ROS is up.
 * **E-STOP + Stop Override** — the same ``stop``, then ``default`` through the

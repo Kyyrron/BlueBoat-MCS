@@ -592,7 +592,7 @@ class DesignerWindow(QMainWindow):
             f"Anchor: {fit.lat0:.6f}, {fit.lon0:.6f} ({self._anchor_source})")
         self._anchor_label.setToolTip(
             "GPS of design (0, 0). Saved into the mission as geo_anchor and "
-            "used to deploy it into whatever world frame the boat comes up "
+            "used to deploy it into whatever world frame the run starts "
             "with. It never follows the station's live GPS.")
 
     def _set_gps_origin(self) -> None:

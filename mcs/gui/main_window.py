@@ -256,7 +256,7 @@ class MainWindow(QMainWindow):
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
         self.store.reset_experiment()
-        # Every launch restarts the robot side, which latches a NEW world
+        # Every launch restarts the control stack, which latches a NEW world
         # origin — the previous run's odom<->GPS pairs are wrong by
         # construction, so the anchor must start fresh (real and sim alike).
         self.store.reset_georeference()

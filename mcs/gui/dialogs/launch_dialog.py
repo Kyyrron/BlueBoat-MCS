@@ -13,7 +13,7 @@ Two mission types, matching the two launch files of the stack:
   pinger do not exist in that graph and their fields are hidden to keep the
   dialog coherent with what will actually run. The **log note** does exist
   there — ``simulation_interface`` names its poslog CSV from it exactly as
-  ``robot_interface`` does on the boat — so that field stays visible in both
+  ``robot_interface`` does in a real-robot run — so that field stays visible in both
   modes; a simulated run's note always carries the ``sim`` marker
   (:meth:`LaunchParameters.wire_note`). A GPS-anchored custom path takes the
   SAME deferred-deploy pipeline as on real water: the station synthesises the
@@ -124,7 +124,8 @@ class LaunchDialog(QDialog):
         self._note.setPlaceholderText("added to the run's log file names")
         self._note.setToolTip(
             "Free text put into the poslog CSV name, {date}-{note}-poslog.csv "
-            "— robot_interface on the boat, simulation_interface in Gazebo. A "
+            "— robot_interface in a real-robot run, simulation_interface in "
+            "Gazebo. A "
             "simulated run is always tagged 'sim' (sim-<note>).")
         self._note_label = QLabel("Log note")
         form.addRow(self._note_label, self._note)
