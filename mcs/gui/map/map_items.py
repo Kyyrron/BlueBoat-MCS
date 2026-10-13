@@ -7,7 +7,7 @@ applies a y-flip so +y points up on screen.  Items that must keep constant
 ``ItemIgnoresTransformations`` around a world-anchored origin.
 
 Z-order (back to front): tiles(-100) < grid(view background) < mission path
-< trajectories < target line < prediction < markers < robot.
+< its start "S" < trajectories < target line < prediction < markers < robot.
 """
 
 from __future__ import annotations
@@ -185,6 +185,43 @@ class MissionPathItem(PolylineItem):
     def __init__(self) -> None:
         super().__init__(theme.C_MISSION_PATH, 2.0, Qt.PenStyle.SolidLine, z=10)
         self.setOpacity(0.9)
+
+
+class StartMarkerItem(QGraphicsItemGroup):
+    """Constant-pixel circled "S" on the first point of the mission path.
+
+    Says where a run begins: the boat drives there first when a GPS-anchored
+    run starts, and a placed path begins under the boat. Drawn in the path's
+    colour, just above it (z 11), below every live marker.
+    """
+
+    def __init__(self, z: float = 11.0, radius_px: float = 9.0) -> None:
+        super().__init__()
+        self.setZValue(z)
+        self._ring = QGraphicsEllipseItem(-radius_px, -radius_px,
+                                          2 * radius_px, 2 * radius_px)
+        self._ring.setBrush(QBrush(QColor(theme.BG_DARK)))
+        self._ring.setPen(QPen(theme.C_MISSION_PATH, 2.0))
+        self._ring.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.addToGroup(self._ring)
+        # A child of the ring, so it is untransformed (upright) as well.
+        self._text = QGraphicsSimpleTextItem("S", self._ring)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSizeF(9.5)
+        self._text.setFont(font)
+        self._text.setBrush(QBrush(theme.C_MISSION_PATH))
+        rect = self._text.boundingRect()
+        self._text.setPos(-rect.width() / 2.0, -rect.height() / 2.0)
+
+    def set_world_pos(self, x: float, y: float) -> None:
+        self._ring.setPos(x, y)
+
+    def scene_pos(self) -> tuple[float, float]:
+        """Current scene position (carried by the child ring, see
+        :meth:`MarkerItem.scene_pos`)."""
+        p = self._ring.pos()
+        return p.x(), p.y()
 
 
 def draw_north_indicator(painter, viewport_w: int) -> None:

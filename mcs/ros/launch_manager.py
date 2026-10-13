@@ -58,10 +58,15 @@ def sanitize_note(note: str) -> str:
 class LaunchParameters:
     """Arguments of the selected launch file.
 
-    Three launch targets exist, with different declared arguments:
+    Four launch targets exist, with different declared arguments:
 
     * ``BlueBoat_launch.py`` (real robot): ``enable_motors``, ``note``,
-      ``controller_type``, ``trajectory``, ``use_pinger``.
+      ``controller_type``, ``trajectory``, ``use_pinger``, ``session_mode``.
+      Every station launch of it is a **run session** (``session=True``):
+      ``session_mode:=True`` and ``trajectory:=from_yaml:<session file>`` --
+      the one file path_generation watches, which the station fills for each
+      run (:mod:`mcs.ros.run_session`). ``session_source`` is the designer
+      file the first run will execute ("" when following the pinger).
     * ``Sim_launch.py`` (empty Gazebo): ``robot_file``, ``trajectory``,
       ``controller_type``, ``data_dir``, ``note``, ``spawn_yaw`` — it always
       starts ``master_control`` (so the controller must be non-empty) and
@@ -72,6 +77,10 @@ class LaunchParameters:
       as ``Sim_launch.py`` plus the simulated sonar and a mavros shim that
       publishes the GPS fixes from the world's own anchor. It declares NO
       ``robot_file``/``trajectory``/``spawn_yaw``.
+    * ``Replay_launch.py`` (v1.1, "From a ros2bag", selected when
+      ``replay_bag`` is set): ``bag``, ``rate``, ``world_dir`` (optional, a
+      personalized world). The boat moves kinematically along a recorded
+      real-robot run; no controller, no sea state, no note, no companion.
 
     ``note`` is the operator's free-text log tag and reaches all three: it is
     what ``{date}-{note}-poslog.csv`` is named after, in real-robot runs and in
@@ -110,8 +119,17 @@ class LaunchParameters:
     # Sea state (current + waves) of a simulated run: ``sea_*`` arguments of
     # full_mission_launch.py in world mode; in the empty Gazebo world
     # (Sim_launch.py declares none) a companion sea_state_launch.py process
-    # carries them (LaunchManager.start). None / null = calm, no companion.
+    # carries them (LaunchManager.start). None / null = calm: no sea args,
+    # but the companion still runs (it carries the hull, see companion_command).
     sea: SeaChoice | None = None
+    # Run session (real-robot launches): connect and idle; runs are started
+    # and stopped from the station. See the class docstring.
+    session: bool = False
+    session_source: str = ""
+    # Gazebo replay of a recorded run (a run folder or its bag directory) and
+    # its initial playback rate. Implies ``simulation``.
+    replay_bag: str = ""
+    replay_rate: float = 1.0
     extra_args: dict[str, str] = field(default_factory=dict)
 
     def wire_note(self) -> str:
@@ -133,7 +151,11 @@ class LaunchParameters:
         def b(v: bool) -> str:
             return "True" if v else "False"
 
-        if self.simulation and self.world_dir:
+        if self.replay_bag:
+            args = [f"bag:={self.replay_bag}", f"rate:={self.replay_rate:g}"]
+            if self.world_dir:
+                args.append(f"world_dir:={self.world_dir}")
+        elif self.simulation and self.world_dir:
             args = [
                 f"world_dir:={self.world_dir}",
                 "with_control:=true",
@@ -161,6 +183,8 @@ class LaunchParameters:
                 args += [f"controller_type:={self.controller_type}"]
             if self.wire_note() != "":
                 args += [f"note:={self.wire_note()}"]
+            if self.session:
+                args += ["session_mode:=True"]
         args += [f"{k}:={v}" for k, v in self.extra_args.items()]
         return args
 
@@ -170,17 +194,22 @@ def companion_command(cfg, params: LaunchParameters) -> list[str] | None:
 
     ``Sim_launch.py`` (BlueBoat-Control) declares no ``sea_*`` argument, so
     the sea state rides a second ``ros2 launch`` of the simulator's
-    ``sea_state_launch.py`` against the stock world name; a null choice
-    (no current, calm) starts nothing, keeping that path byte-identical to
-    today's. World mode needs no companion: ``full_mission_launch.py``
-    includes ``sea_state_launch.py`` itself. Module scope and Qt-free so
-    the smoke test can pin it."""
-    if not (params.simulation and not params.world_dir and params.sea
-            and not params.sea.is_null):
+    ``sea_state_launch.py`` against the stock world name. It runs for
+    EVERY empty-world launch, a null choice (no current, calm) included,
+    with no ``sea_*`` argument then (the simulator's own calm defaults):
+    since 2026-10-09 the simulator's catamaran hydrostatics carry the hull
+    in every run, so without the companion this path alone floated on
+    Gazebo's URDF box — and a live "Change sea state…" had no listener.
+    World mode needs no companion: ``full_mission_launch.py`` includes
+    ``sea_state_launch.py`` itself. Module scope and Qt-free so the smoke
+    test can pin it."""
+    if params.replay_bag or not (params.simulation and not params.world_dir):
+        # A replay feels no sea: the recording holds the real one, and the
+        # replay description takes no force (blueboat_description replay:=true).
         return None
     return ["ros2", "launch", cfg.sea.companion_package,
             cfg.sea.companion_launch_file,
-            f"world_name:={cfg.sea.stock_world_name}", *params.sea.launch_args()]
+            f"world_name:={cfg.sea.stock_world_name}", *params.sea_args()]
 
 
 def launch_target(cfg, params: LaunchParameters) -> tuple[str, str]:
@@ -189,6 +218,8 @@ def launch_target(cfg, params: LaunchParameters) -> tuple[str, str]:
     Module-level and Qt-free so the smoke test can pin the three-way choice
     without a LaunchManager. *cfg* is the ``LaunchConfig`` dataclass.
     """
+    if params.replay_bag:
+        return cfg.package, cfg.replay_launch_file
     if params.simulation and params.world_dir:
         return cfg.sim_world_package, cfg.sim_world_launch_file
     if params.simulation:

@@ -6,7 +6,12 @@ the left panel) instead of the top-right.
 
 The box exists only for a running simulation — `/sim/sea_state` is published
 by the simulator's ``sea_state_node`` and nothing else — and hides itself
-whenever no simulated mission is running.
+whenever no simulated mission is running. It says, in plain words, what the
+water is doing (the current right now against its configured mean, the
+waves), what that does to the boat (roll / pitch / heave over the last
+30 s, measured by the simulator on its own odometry), and what is planned
+next. The Status row turns amber with "hull: Gazebo box" when the simulator
+reports that the URDF box, not its catamaran hull, is floating the boat.
 
 It does not reuse :class:`~mcs.gui.widgets.InfoGrid`: the sea strings are
 long sentences, and a floating overlay cannot widen itself across the map to
@@ -74,7 +79,7 @@ class FloatingSeaBox(QWidget):
 
     modify_sea_clicked = Signal()
 
-    _ROWS = ("Current", "Waves", "Surface", "Next change", "Status")
+    _ROWS = ("Current", "Waves", "Boat motion", "Next change", "Status")
 
     def __init__(self, store: DataStore, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -112,10 +117,10 @@ class FloatingSeaBox(QWidget):
             self._values[key] = value
         sec_sea.add_widget(grid_host)
 
-        self.modify_sea_btn = QPushButton("Modify situation…")
+        self.modify_sea_btn = QPushButton("Change sea state…")
         self.modify_sea_btn.setToolTip(
-            "Change the current / waves of the running simulation; the "
-            "simulator ramps to the new situation.")
+            "Change the current or the waves of the running simulation; the "
+            "simulator blends the new sea in gradually.")
         self.modify_sea_btn.clicked.connect(self.modify_sea_clicked.emit)
         sec_sea.add_widget(self.modify_sea_btn)
         layout.addWidget(sec_sea)
@@ -146,7 +151,9 @@ class FloatingSeaBox(QWidget):
     def refresh(self) -> None:
         """Pulled on the shared UI tick; hides the box outside a sim run."""
         s = self._store
-        show = bool(s.mission.simulation and s.mission.launch_running)
+        # A bag replay has no sea state (the REPLAY box takes this corner).
+        show = bool(s.mission.simulation and s.mission.launch_running
+                    and not s.mission.replay)
         # setVisible, not `if isVisible() != show`: isVisible() is also false
         # whenever an ancestor is hidden, which would leave the box's own flag
         # stuck on from an earlier run.
@@ -159,7 +166,7 @@ class FloatingSeaBox(QWidget):
             wanted = choice.summary() if choice is not None else "calm water, no current"
             self._set("Current", "—")
             self._set("Waves", "—")
-            self._set("Surface", "—")
+            self._set("Boat motion", "—")
             self._set("Next change", "—")
             self._set("Status", f"waiting for the simulator ({wanted})",
                       theme.TEXT_DIM)
@@ -169,10 +176,17 @@ class FloatingSeaBox(QWidget):
         self._set("Current", r.current_text)
         self._set("Waves", r.waves_text,
                   theme.WARN if r.waves_status == "unavailable" else None)
-        self._set("Surface", f"η {r.eta_m:+.2f} m")
-        self._set("Next change", r.next_change_text)
+        self._set("Boat motion", r.boat_text)
+        self._set("Next change", r.next_change_text,
+                  theme.ACCENT if r.blend < 1.0 else None)
         if age > 5.0:
             self._set("Status", f"stale ({age:.0f} s)", theme.WARN)
+        elif r.hull_model == "gazebo_box":
+            # The simulator's catamaran hull carries the boat in every run;
+            # the URDF box means a fallback (no wrench path) or a legacy
+            # configuration -- not the hull the validation was made on.
+            self._set("Status", f"{r.summary or 'live'} · hull: Gazebo box",
+                      theme.WARN)
         else:
             self._set("Status", r.summary or "live", theme.OK)
         self._fit()

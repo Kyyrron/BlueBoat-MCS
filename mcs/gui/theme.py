@@ -56,6 +56,7 @@ QLabel#sectionTitle {{
     padding: 4px 0px;
 }}
 QLabel#valueLabel {{ font-family: "DejaVu Sans Mono", monospace; }}
+QLabel#hint {{ color: {TEXT_DIM}; font-size: 11px; }}
 QGroupBox {{
     border: 1px solid {BORDER};
     border-radius: 4px;
@@ -85,6 +86,24 @@ QPushButton#estopButton {{
 }}
 QPushButton#estopButton:hover {{ background-color: #e04040; }}
 QPushButton#launchButton {{ font-weight: bold; }}
+QPushButton#runStartButton {{
+    background-color: #1f6f34; color: white; font-weight: bold; font-size: 15px;
+    border: 2px solid {OK}; border-radius: 5px; padding: 10px 12px;
+}}
+QPushButton#runStartButton:hover {{ background-color: #268a41; }}
+QPushButton#runStartButton:disabled {{
+    background-color: {BG_PANEL}; color: {TEXT_DIM}; border: 2px solid {BORDER};
+}}
+QPushButton#runStopButton {{
+    background-color: #8a5a00; color: white; font-weight: bold; font-size: 15px;
+    border: 2px solid {WARN}; border-radius: 5px; padding: 10px 12px;
+}}
+QPushButton#runStopButton:hover {{ background-color: #a86d00; }}
+QPushButton#releaseEstopButton {{
+    background-color: #5c4300; color: white; font-weight: bold;
+    border: 2px solid {WARN}; border-radius: 4px; padding: 8px 14px;
+}}
+QPushButton#releaseEstopButton:hover {{ background-color: #7a5900; }}
 QCheckBox {{ spacing: 6px; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; }}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {{

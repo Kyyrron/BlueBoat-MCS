@@ -138,6 +138,15 @@ def world_contains_any(meta: dict, latlon_pts) -> bool:
     return bool(inside.any())
 
 
+def eligible_worlds_for_track(worlds_root: Path, latlon_pts) -> list[dict]:
+    """The worlds a GPS track touches (the bag replay of a recorded run,
+    v1.1): the same one-point-inside rule as :func:`eligible_worlds`."""
+    if not latlon_pts:
+        return []
+    return [w for w in list_worlds(worlds_root)
+            if world_contains_any(w["meta"], latlon_pts)]
+
+
 def eligible_worlds(worlds_root: Path, mission_yaml: Path) -> list[dict]:
     """The worlds a mission can be launched in: any world whose limits
     contain at least one of the mission's GPS points. Empty when the

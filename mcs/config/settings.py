@@ -39,15 +39,27 @@ class TopicsConfig:
     thruster_input: str = "/thruster_input"
     controller_ready: str = "/blueboat/controller_ready"
     param_mode: str = "/blueboat/param_mode"
+    # Run sessions (real-robot launches only): master_control's run state
+    # (String JSON, heartbeated 1 Hz) and robot_interface's per-run log state.
+    run_state: str = "/blueboat/run_state"
+    run_log: str = "/blueboat/run_log"
 
     # --- Simulation only (BlueBoat-SSS-Sim sea_state_node): the live sea
     # state (String JSON, latched, 2 Hz) and the command that changes it.
     sea_state: str = "/sim/sea_state"
+    # --- Bag replay only (blueboat_control bag_replay, v1.1): the replay's
+    # state (String JSON, latched, 2 Hz) and its pause / rate command.
+    replay_state: str = "/replay/state"
 
     # --- Publications (commands consumed by the existing stack) ---
     input_str: str = "/blueboat/input_str"
     manual_target: str = "/blueboat/manual_target"
     sea_state_command: str = "/sim/sea_state/command"
+    replay_command: str = "/replay/command"
+    # Run-session commands to master_control (String JSON: configure / start /
+    # stop) and the arrow-key thrust stream ([right, left] N, [] = release).
+    run_command: str = "/blueboat/run_command"
+    arrow_thrust: str = "/blueboat/arrow_thrust"
 
     # --- Services ---
     path_request: str = "/path_request"
@@ -75,6 +87,8 @@ class DiagnosticsConfig:
         "/blueboat/controller_ready": 30.0,
         "/blueboat/param_mode": 60.0,
         "/sim/sea_state": 3.0,
+        "/blueboat/run_state": 3.0,
+        "/blueboat/run_log": 3.0,
     })
     stale_age_multiplier: float = 4.0
     expected_hz: dict[str, float] = field(default_factory=lambda: {
@@ -88,6 +102,8 @@ class DiagnosticsConfig:
         "/monitoring_data": 20.0,
         "/thruster_input": 20.0,
         "/sim/sea_state": 2.0,
+        "/blueboat/run_state": 1.0,
+        "/blueboat/run_log": 1.0,
     })
     rate_window_s: float = 5.0
     update_period_s: float = 1.0
@@ -113,6 +129,10 @@ class LaunchConfig:
     # so the station's SimGps stays disarmed in this mode.
     sim_world_package: str = "blueboat_sss_sim"
     sim_world_launch_file: str = "full_mission_launch.py"
+    # Gazebo replay of a recorded real-robot run (v1.1, blueboat_control):
+    # declares bag / world_dir / rate / heave / start_paused / gui. The boat
+    # is moved kinematically from the bag; no controller, no sea state.
+    replay_launch_file: str = "Replay_launch.py"
     worlds_root: str = str(Path.home() / "worlds")
     sim_robot_files: list[str] = field(default_factory=lambda: ["thrusters_ur"])
     sim_default_controller: str = "MPC"
@@ -125,6 +145,10 @@ class LaunchConfig:
     # for one run, pass spawn_yaw:=<radians> in Extra args — it is appended
     # after this one and ros2 launch takes the last occurrence.
     sim_spawn_yaw_deg: float = 0.0
+    # Controller choices. A real-robot launch is a run session and needs a
+    # controller (manual target and arrow keys go through master_control), so
+    # the empty "robot interface only" entry is offered for nothing any more;
+    # it stays here only so an old config.json naming it still loads.
     controllers: list[str] = field(default_factory=lambda: ["", "PID", "LoS", "MPC"])
     trajectories: list[str] = field(default_factory=lambda: [
         "station_keeping", "circle", "straight_line", "sin",
@@ -146,6 +170,57 @@ class LaunchConfig:
     path_request_timeout_s: float = 10.0
     path_request_max_retries: int = 3
     path_request_retry_delay_s: float = 2.0
+    # Run sessions. The ONE trajectory file path_generation watches in a
+    # real-robot session (trajectory:=from_yaml:<this>): the station writes
+    # each run's path here -- GPS-deployed, or placed at the boat when the run
+    # starts. A hidden directory, so it never collides with a designer mission
+    # name and the mission lists never show it.
+    session_trajectory_file: str = str(
+        DEFAULT_CONFIG_DIR / "trajectories" / ".session" / "run.yaml")
+
+
+@dataclass
+class RunConfig:
+    """Run-session behaviour (real-robot launches)."""
+
+    # master_control's /blueboat/run_state older than this = not connected
+    # (it heartbeats at 1 Hz).
+    state_fresh_s: float = 3.0
+    # A configure / start / stop not acknowledged within this is reported.
+    ack_timeout_s: float = 3.0
+    # A started run whose position log robot_interface has not confirmed by
+    # then is flagged in the RUN box (field data would be missing).
+    log_confirm_timeout_s: float = 3.0
+
+
+@dataclass
+class ReplayConfig:
+    """Gazebo replay of a recorded run ("From a ros2bag", v1.1)."""
+
+    # Where the launch dialog's folder picker opens: the run folders that
+    # robot_interface files a bag into (Robot_data/<stem>/<..>-bag/).
+    bag_root: str = str(Path.home() / "ros2_ws" / "data" / "Robot_data")
+    rates: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 2.0, 4.0])
+    default_rate: float = 1.0
+    # /replay/state older than this = the replay node is not answering.
+    state_fresh_s: float = 3.0
+    # GPS points sampled from the bag to choose eligible worlds.
+    world_track_points: int = 400
+
+
+@dataclass
+class ArrowConfig:
+    """Arrow-key thrust control (the floating box at the map's bottom-right)."""
+
+    max_power_n: float = 20.0       # slider range 0..max (master_control's
+                                    # thrust_limit saturates above 20 N anyway)
+    default_power_n: float = 10.0
+    turn_n: float = 5.0             # default Rotation: +/- added per side by
+                                    # Left / Right (the name predates the slider)
+    min_turn_n: float = 3.0         # Rotation slider range
+    max_turn_n: float = 15.0
+    publish_hz: float = 20.0        # stream rate; master_control's dead-man
+                                    # (arrow_timeout, 0.5 s) zeroes a gap
 
 
 @dataclass
@@ -160,8 +235,10 @@ class SeaConfig:
     personalized world, and through a companion
     ``ros2 launch blueboat_sss_sim sea_state_launch.py world_name:=ocean``
     process next to ``Sim_launch.py`` in the empty Gazebo world (that
-    launch file declares no sea arguments). A null choice (no current,
-    calm) starts no companion at all.
+    launch file declares no sea arguments). The companion runs for every
+    empty-world launch, a null choice (no current, calm) included — with no
+    sea argument then — because the simulator's catamaran hydrostatics carry
+    the hull in every run (since 2026-10-09).
     """
 
     presets_file: str = ""
@@ -276,6 +353,9 @@ class AppConfig:
     sim_gps: SimGpsConfig = field(default_factory=SimGpsConfig)
     designer: DesignerConfig = field(default_factory=DesignerConfig)
     sea: SeaConfig = field(default_factory=SeaConfig)
+    run: RunConfig = field(default_factory=RunConfig)
+    arrows: ArrowConfig = field(default_factory=ArrowConfig)
+    replay: ReplayConfig = field(default_factory=ReplayConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
 

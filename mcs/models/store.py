@@ -13,6 +13,12 @@ Design notes
   here (e.g. the current path target comes from ``/monitoring_data``).  The
   only computations performed are pure display transforms: pinger body ->
   world frame, distances, travelled-distance integration, speed statistics.
+* **Run sessions** (real-robot launches, 2026-10-09): histories record only
+  while a RUN is active (:meth:`DataStore.recording`). Between runs the live
+  state (boat glyph, pinger, target) keeps updating, but nothing is appended,
+  so the trail, statistics, distance plot and timeline stay frozen on the last
+  run until the next Start Run resets them. Outside a session (simulation)
+  recording is unconditional, as before.
 """
 
 from __future__ import annotations
@@ -92,22 +98,73 @@ class MissionState:
                                             # deferred deploy — runs as on real water
     manual_target: tuple[float, float] | None = None
     world_dir: str = ""                     # personalized world folder ("" = empty Gazebo)
+    # Gazebo replay of a recorded real-robot run (v1.1): the recorded GPS,
+    # compass and odom drive the map exactly as on real water, so the map
+    # waits for a real GPS anchor; nothing commands the replayed boat.
+    replay: bool = False
     sea_choice: object = None               # SeaChoice chosen at launch (sim only)
-    started_t: float | None = None          # first odom after launch
+    started_t: float | None = None          # first odom after launch (session: of the run)
+    stopped_t: float | None = None          # session: when the last run stopped
     path_target: tuple[float, float] | None = None   # x_d, y_d from /monitoring_data
+    # False only in an idle run session: no path / pinger is being followed.
+    following: bool = True
 
     @property
     def target_mode(self) -> TargetMode:
         if self.manual_target is not None:
             return TargetMode.MANUAL
-        if not self.launch_running or self.controller_type == "":
+        if (not self.launch_running or self.controller_type == ""
+                or not self.following):
             return TargetMode.NONE
         return TargetMode.PINGER if self.use_pinger else TargetMode.PATH
 
     def elapsed_s(self) -> float | None:
         if self.started_t is None:
             return None
-        return now_mono() - self.started_t
+        end = self.stopped_t if self.stopped_t is not None else now_mono()
+        return max(0.0, end - self.started_t)
+
+
+@dataclass
+class NextMission:
+    """What the next run of a session executes (launch dialog / Update Mission)."""
+
+    source: str = ""                        # designer runtime YAML ("" = pinger)
+    name: str = ""
+    anchored: bool = False                  # source carries a geo_anchor
+    use_pinger: bool = False
+    controller_type: str = "PID"
+    note: str = ""
+
+    def summary(self) -> str:
+        what = "USBL pinger" if self.use_pinger else (self.name or "no path")
+        return f"{what} · {self.controller_type}"
+
+
+@dataclass
+class SessionState:
+    """A real-robot run session (connected; runs started and stopped by hand).
+
+    ``state`` / ``log`` are the last ``/blueboat/run_state`` (master_control)
+    and ``/blueboat/run_log`` (robot_interface) JSON payloads; ``run_active``
+    follows master_control's acknowledgement, ``run_pending`` the command the
+    station sent and is still waiting on."""
+
+    active: bool = False
+    motors_enabled: bool = False            # launched with enable_motors:=True
+    next: NextMission = field(default_factory=NextMission)
+    run_active: bool = False
+    run_pending: str = ""                   # "start" | "stop" | ""
+    run: int = 0                            # run counter (current / last)
+    state: dict = field(default_factory=dict)
+    state_t: float | None = None
+    log: dict = field(default_factory=dict)
+    log_t: float | None = None
+    arrow_active: bool = False
+    arrow_cmd: tuple[float, float] = (0.0, 0.0)   # (right, left) N
+
+    def state_fresh(self, max_age_s: float) -> bool:
+        return self.state_t is not None and (now_mono() - self.state_t) <= max_age_s
 
 
 @dataclass
@@ -126,6 +183,7 @@ class DataStore:
     robot: RobotState = field(default_factory=RobotState)
     pinger: PingerState = field(default_factory=PingerState)
     mission: MissionState = field(default_factory=MissionState)
+    session: SessionState = field(default_factory=SessionState)
 
     def __post_init__(self) -> None:
         self.geo = GeoReferencer(self.cfg.geo)
@@ -138,6 +196,7 @@ class DataStore:
         self.mission_path: np.ndarray | None = None  # (n, 3) x, y, yaw
         self._t0: float | None = None             # experiment time origin
         self.sea = None                           # SeaReadout | None (sim only)
+        self.replay = None                        # ReplayReadout | None (bag replay)
 
     # -------------------------------------------------------------- updates
     def on_odom(self, t: float, pose, twist) -> None:
@@ -147,6 +206,9 @@ class DataStore:
         r.x, r.y, r.yaw = float(pose[0]), float(pose[1]), float(pose[5])
         r.speed = math.hypot(float(twist[0]), float(twist[1]))
         r.has_odom = True
+        if not self.recording():
+            # Idle run session: the glyph moves, nothing is recorded.
+            return
         if prev is not None:
             step = math.hypot(r.x - prev[0], r.y - prev[1])
             if step < 5.0:  # reject origin-reset jumps from the odometry source
@@ -174,6 +236,13 @@ class DataStore:
         r = parse_readback(payload, received_mono=t)
         if r is not None:
             self.sea = r
+
+    def on_replay_state(self, t: float, payload: dict) -> None:
+        """Latest bag-replay state (``/replay/state`` JSON)."""
+        from mcs.core.replay import parse_state
+        r = parse_state(payload, received_mono=t)
+        if r is not None:
+            self.replay = r
 
     def on_compass(self, t: float, heading_deg: float) -> None:
         """Absolute heading from /mavros/global_position/compass_hdg
@@ -232,6 +301,8 @@ class DataStore:
         xw = r.x + c * p.body[0] - s * p.body[1]
         yw = r.y + s * p.body[0] + c * p.body[1]
         p.world = (xw, yw)
+        if not self.recording():
+            return
         last = self.pinger_track.last()
         if last is None or (t - last[0]) > 0.2:  # trail stored at <= 5 Hz
             self.pinger_track.append(t, (xw, yw))
@@ -251,11 +322,13 @@ class DataStore:
         # off-path — colcon build in ~/ros2_ws, do not compensate here.)
         if len(data) >= 7:
             self.mission.path_target = (float(data[4]), float(data[5]))
-        self._record_target_distance(t)
+        if self.recording():
+            self._record_target_distance(t)
 
     def on_thruster(self, t: float, right: float, left: float) -> None:
         self.robot.thrust_right, self.robot.thrust_left = right, left
-        self.thrust_hist.append(t, (right, left))
+        if self.recording():
+            self.thrust_hist.append(t, (right, left))
 
     def on_controller_ready(self, t: float, ready: bool) -> None:
         self.robot.controller_ready = ready
@@ -267,6 +340,15 @@ class DataStore:
         self.mission_path = np.asarray(poses, dtype=np.float64) if len(poses) else None
 
     # -------------------------------------------------------------- derived
+    def recording(self) -> bool:
+        """Do histories record right now? Always, except in a run session
+        between runs (a start already sent counts as running, so the first
+        samples of a run are never lost waiting for its acknowledgement)."""
+        ss = self.session
+        if not ss.active:
+            return True
+        return ss.run_active or ss.run_pending == "start"
+
     def active_target_world(self) -> tuple[float, float] | None:
         """World position of whatever the boat is currently steering to."""
         mode = self.mission.target_mode
@@ -304,13 +386,15 @@ class DataStore:
 
         * non-GPS sim (no anchored mission): immediately — the sim world is
           already ENU, identity anchor, no tiles;
-        * GPS-sim (anchored mission, synthesised NavSatFix feed) and real
-          water: once the odom->GPS translation is anchored (a few fixes,
-          no vehicle motion required).
+        * GPS-sim (anchored mission, synthesised NavSatFix feed), the Gazebo
+          replay of a recorded run (its recorded fixes) and real water: once
+          the odom->GPS translation is anchored (a few fixes, no vehicle
+          motion required).
 
         Nothing is drawn on the map before this."""
         return self.geo.is_valid or (
-            self.mission.simulation and not self.mission.gps_simulated)
+            self.mission.simulation and not self.mission.gps_simulated
+            and not self.mission.replay)
 
     def reset_georeference(self) -> None:
         """Fresh anchor for a fresh run — called on every mission launch.
@@ -367,5 +451,7 @@ class DataStore:
             s.clear()
         self.robot.travelled_m = 0.0
         self.mission.started_t = None
+        self.mission.stopped_t = None
         self._t0 = None
         self.sea = None
+        self.replay = None

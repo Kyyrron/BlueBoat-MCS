@@ -4,6 +4,11 @@ Wires together the data store, the signal bus, the panels, the map and the
 toolbar.  Owns the single 10 Hz refresh timer that drives all repainting
 (messages update the store immediately; widgets repaint on the tick — this
 is what keeps the UI smooth and flicker-free during long experiments).
+
+A real-robot launch is a **run session** (:mod:`mcs.ros.run_session`): the
+RUN box under the left panel starts and stops runs, the toolbar's Launch /
+Stop buttons become Update Mission / Turn Off Connection, and the floating
+ARROW CONTROL box (map, bottom-right) drives the boat from the keyboard.
 """
 
 from __future__ import annotations
@@ -27,16 +32,20 @@ from PySide6.QtWidgets import (
 from mcs.config.settings import AppConfig
 from mcs.core.signals import SignalBus
 from mcs.gui import theme
+from mcs.gui.arrow_box import FloatingArrowBox
 from mcs.gui.bottom_toolbar import BottomToolbar
 from mcs.gui.left_panel import LeftPanel
 from mcs.gui.map.map_view import MapMode, MapView
 from mcs.gui.mission_stats import FloatingStatsBox
+from mcs.gui.replay_box import FloatingReplayBox
 from mcs.gui.right_panel import RightPanel
+from mcs.gui.run_panel import RunPanel
 from mcs.gui.sea_state_box import FloatingSeaBox
 from mcs.models.store import DataStore
 from mcs.ros.command_center import CommandCenter
 from mcs.ros.launch_manager import LaunchManager, LaunchParameters
 from mcs.ros.ros_manager import RosManager
+from mcs.ros.run_session import RunSession
 
 _LOG = logging.getLogger(__name__)
 
@@ -59,6 +68,7 @@ class MainWindow(QMainWindow):
         self.ros = RosManager(cfg, self.bus)
         self.launcher = LaunchManager(cfg, self.bus)
         self.commands = CommandCenter(cfg, self.bus, self.ros, self.launcher)
+        self.run_session = RunSession(cfg, self.bus, self.store, self.commands)
 
         # ---- Widgets -----------------------------------------------------------
         self.map_view = MapView(cfg, self.store)
@@ -70,6 +80,10 @@ class MainWindow(QMainWindow):
         self.right_panel.setMinimumWidth(340)
         self.right_panel.setMaximumWidth(600)
         self.toolbar = BottomToolbar(cfg, self.bus, self.launcher, self.commands)
+        # RUN box: pinned under the left panel's scroll area (below ROS
+        # DIAGNOSTICS, never scrolled away); visible during a run session.
+        self.run_panel = RunPanel(self.store, self.run_session)
+        self.left_panel.set_footer(self.run_panel)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.left_panel)
@@ -86,6 +100,12 @@ class MainWindow(QMainWindow):
         # Floating Sea State box — mirror of the stats box, glued to the
         # top-LEFT of the map view (i.e. right against the left panel).
         self.sea_box = FloatingSeaBox(self.store, self.map_view)
+        # Bag replay (v1.1): same corner as the sea box, which a replay never
+        # shows (no sea state in a replay).
+        self.replay_box = FloatingReplayBox(cfg, self.store, self.map_view)
+        # Arrow-key control: the bottom-RIGHT corner of the map view.
+        self.arrow_box = FloatingArrowBox(cfg, self.store, self.commands,
+                                          self.map_view)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -147,6 +167,7 @@ class MainWindow(QMainWindow):
         bus.controller_ready_received.connect(store.on_controller_ready)
         bus.param_mode_received.connect(store.on_param_mode)
         bus.sea_state_received.connect(store.on_sea_state)
+        bus.replay_state_received.connect(store.on_replay_state)
         bus.mission_path_received.connect(store.on_mission_path)
         bus.mission_path_failed.connect(self._on_mission_path_failed)
 
@@ -187,11 +208,30 @@ class MainWindow(QMainWindow):
         self.toolbar.create_pattern_clicked.connect(self._open_designer)
         self.toolbar.mission_launched.connect(self._on_mission_launched)
         self.sea_box.modify_sea_clicked.connect(self._on_modify_sea)
+        self.replay_box.pause_requested.connect(
+            lambda pause: self._send_replay("pause" if pause else "resume"))
+        self.replay_box.rate_requested.connect(
+            lambda rate: self._send_replay("rate", rate))
         self.toolbar.mission_stopped.connect(self._on_mission_stopped)
         bus.launch_state_changed.connect(self._on_launch_state)
 
         # Manual target clicks
         self.map_view.target_clicked.connect(self._on_target_clicked)
+
+        # Run session (real-robot launches) and arrow control
+        self.run_panel.start_clicked.connect(self.run_session.start_run)
+        self.run_panel.stop_clicked.connect(self.run_session.stop_run)
+        self.toolbar.update_mission_requested.connect(self._on_update_mission)
+        self.run_session.message.connect(self._status.showMessage)
+        self.run_session.message.connect(lambda msg, _ms: _LOG.info("run session: %s", msg))
+        self.run_session.preview_requested.connect(self._on_session_preview)
+        self.run_session.preview_cleared.connect(self._on_session_preview_cleared)
+        self.run_session.deploy_requested.connect(self._arm_session_deployment)
+        self.run_session.arrows_release_requested.connect(
+            lambda: self.arrow_box.set_active(False, hold=False))
+        self.run_session.manual_target_cleared.connect(self._clear_manual_target_ui)
+        self.arrow_box.engaged.connect(self._on_arrows_engaged)
+        self.arrow_box.released.connect(self._on_arrows_released)
 
     # ================================================================ tick
     def _on_tick(self) -> None:
@@ -219,6 +259,32 @@ class MainWindow(QMainWindow):
             if self.sea_box.pos() != QPoint(8, 8):
                 self.sea_box.move(8, 8)
                 self.sea_box.raise_()
+        self.replay_box.refresh()
+        if not self.replay_box.isHidden() and self.replay_box.pos() != QPoint(8, 8):
+            self.replay_box.move(8, 8)
+            self.replay_box.raise_()
+        self.toolbar.set_replay_ui(self.store.mission.replay
+                                   and self.store.mission.launch_running)
+
+        # Arrow control box: bottom-right of the map view, whenever a launch
+        # with a controller runs (real session or Gazebo).
+        m = self.store.mission
+        self.arrow_box.set_available(m.launch_running and bool(m.controller_type))
+        if not self.arrow_box.isHidden():
+            pos = QPoint(self.map_view.width() - self.arrow_box.width() - 8,
+                         self.map_view.height() - self.arrow_box.height() - 8)
+            if self.arrow_box.pos() != pos:
+                self.arrow_box.move(pos)
+                self.arrow_box.raise_()
+
+        # Run session: RUN box + session labels of the toolbar.
+        ss = self.store.session
+        self.run_panel.refresh()
+        self.toolbar.set_session_ui(
+            ss.active,
+            can_update=self.run_session.can_update(),
+            run_active=ss.run_active or ss.run_pending == "start",
+            release_visible=ss.motors_enabled and self.commands.estop_latched)
 
         # Georeference status + satellite availability
         geo = self.store.geo
@@ -253,9 +319,17 @@ class MainWindow(QMainWindow):
         m.gps_simulated = params.gps_simulated
         m.world_dir = params.world_dir
         m.sea_choice = params.sea
+        m.replay = bool(params.replay_bag)
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
         self.store.reset_experiment()
+        if params.session:
+            # Real robot = run session: connect, idle, runs by hand.
+            self.run_session.begin(params)
+            self._status.showMessage(
+                "Run session: the boat connects and goes into override but does "
+                "not move or log until START RUN. Drive it with Manual Target "
+                "or the arrow keys meanwhile.", 12000)
         # Every launch restarts the control stack, which latches a NEW world
         # origin — the previous run's odom<->GPS pairs are wrong by
         # construction, so the anchor must start fresh (real and sim alike).
@@ -265,7 +339,14 @@ class MainWindow(QMainWindow):
         # arming the station's SimGps too would put a second publisher on
         # the same topic with an arbitrary receiver origin and deploy the
         # trajectory into the wrong frame relative to the world geometry.
-        if params.gps_simulated and not params.world_dir:
+        if params.replay_bag:
+            # A replay publishes the RECORDED fixes: the only GPS publisher.
+            self.commands.disarm_sim_gps()
+            self._status.showMessage(
+                "Replay of a recorded run: the boat follows the recording "
+                "(pose, attitude, GPS, speed); pause or change the rate in the "
+                "REPLAY box.", 12000)
+        elif params.gps_simulated and not params.world_dir:
             self._arm_sim_gps(params)
         else:
             self.commands.disarm_sim_gps()
@@ -291,8 +372,14 @@ class MainWindow(QMainWindow):
         # (gated on map_frame_ready).
         deployment_pending = bool(params.gps_anchored_source) and not (
             params.simulation and not params.gps_simulated)
+        # A run session previews nothing up front: an anchored first mission
+        # is previewed by the deployment poll, a placed one only once its run
+        # starts (RunSession.preview_requested).
+        # A replay has no path server: its path (the run's -path.yaml
+        # snapshot) is published on /set_path by bag_replay instead.
         self._pending_preview_trajectory = (
-            None if deployment_pending else params.trajectory)
+            None if (deployment_pending or params.session or params.replay_bag)
+            else params.trajectory)
         self._start_gps_deployment(params)
 
     # ========================================================= simulated GPS
@@ -362,9 +449,20 @@ class MainWindow(QMainWindow):
         if not params.gps_anchored_source or (
                 params.simulation and not params.gps_simulated):
             return
+        self._arm_deployment(Path(params.gps_anchored_source),
+                             Path(params.gps_deployed_target))
+
+    def _arm_session_deployment(self, source: str) -> None:
+        """Update Mission chose a GPS-anchored path for the next run: deploy
+        it into the session file as soon as the frame is anchored (at once
+        when it already is) -- the same watcher a launch uses."""
+        self._stop_gps_deployment()
+        self._arm_deployment(Path(source), self.run_session.session_file)
+
+    def _arm_deployment(self, src: Path, dst: Path) -> None:
         from mcs.designer import io_yaml  # lazy: PyYAML machinery
-        self._gps_src = Path(params.gps_anchored_source)
-        self._gps_dst = Path(params.gps_deployed_target)
+        self._gps_src = src
+        self._gps_dst = dst
         self._gps_dst.unlink(missing_ok=True)  # never reuse a stale frame
         self._gps_hint_countdown = 0
         self._gps_timer = QTimer(self)
@@ -396,10 +494,17 @@ class MainWindow(QMainWindow):
         self._stop_gps_deployment()
         _LOG.info("GPS mission deployed to %s (fit rms %.2f m)",
                   self._gps_dst, geo.fit.rms_m)
-        self._status.showMessage(
-            f"GPS path deployed (georef rms {geo.fit.rms_m:.2f} m) — the "
-            "robot transitions onto the mission at its next path request.",
-            10000)
+        if self.store.session.active:
+            self.run_session.mark_deployed(str(self._gps_src))
+            self._status.showMessage(
+                f"GPS path deployed (georef rms {geo.fit.rms_m:.2f} m) — shown "
+                "on the map, start circled 'S'; the boat follows it when the "
+                "run starts.", 10000)
+        else:
+            self._status.showMessage(
+                f"GPS path deployed (georef rms {geo.fit.rms_m:.2f} m) — the "
+                "robot transitions onto the mission at its next path request.",
+                10000)
         QTimer.singleShot(
             1500, lambda: self._request_path_preview(f"from_yaml:{self._gps_dst}"))
 
@@ -482,6 +587,8 @@ class MainWindow(QMainWindow):
             self.toolbar.set_manual_target_active(False)
             if self.toolbar.manual_button.isChecked():
                 self.toolbar.manual_button.setChecked(False)
+            self.arrow_box.set_active(False, hold=False)
+            self.run_session.end()
 
     # ============================================================ manual target
     def _on_manual_mode(self, armed: bool) -> None:
@@ -500,6 +607,10 @@ class MainWindow(QMainWindow):
             self.map_view.set_mode(MapMode.NORMAL)
 
     def _on_target_clicked(self, x: float, y: float) -> None:
+        if self.arrow_box.active:
+            # A clicked target is a newer intent than the keys: end arrow
+            # control (no hold point) before publishing it.
+            self.arrow_box.set_active(False, hold=False)
         if x == 0.0 and y == 0.0:
             # (0,0) is the reserved resume sentinel of master_control — nudge it.
             x = 1e-3
@@ -513,14 +624,71 @@ class MainWindow(QMainWindow):
         self.toolbar.set_manual_target_active(True)
 
     def _on_continue_mission(self) -> None:
-        """'Continue Original Mission': publish [0.0, 0.0], nothing else."""
+        """'Continue Original Mission': publish [0.0, 0.0], nothing else.
+
+        Between the runs of a session the same button reads 'Release Target'
+        and the same sentinel just lets go of the target (zero thrust)."""
         self.commands.resume_original_mission()
+        self._clear_manual_target_ui()
+        ss = self.store.session
+        if ss.active and not (ss.run_active or ss.run_pending == "start"):
+            self._status.showMessage(
+                "Published [0.0, 0.0] — target released; no run is active, the "
+                "boat holds zero thrust.", 6000)
+        else:
+            self._status.showMessage(
+                "Published [0.0, 0.0] — master_control resumes the original "
+                "mission.", 6000)
+
+    def _clear_manual_target_ui(self) -> None:
         self.store.mission.manual_target = None
         self.map_view.clear_manual_target()
         self.toolbar.set_manual_target_active(False)
+
+    # ============================================================ run session
+    def _on_update_mission(self) -> None:
+        """Update Mission (toolbar, run session, between runs)."""
+        from mcs.gui.dialogs.mission_update_dialog import MissionUpdateDialog
+        if not self.run_session.can_update():
+            self._status.showMessage(
+                "Update Mission is only possible between runs, once "
+                "master_control reports.", 6000)
+            return
+        dlg = MissionUpdateDialog(self.cfg, self.store.session.next, self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        self.run_session.update_mission(dlg.selection())
+
+    def _on_session_preview(self, trajectory: str) -> None:
+        """A run's path was just written: preview it (once the map is ready)."""
+        self._preview_retries_left = self.cfg.launch.path_request_max_retries
+        self._pending_preview_trajectory = trajectory
+
+    def _on_session_preview_cleared(self) -> None:
+        self._stop_gps_deployment()
+        self.store.mission_path = None
+        self._pending_preview_trajectory = None
+        self._last_preview_trajectory = None
+        self.commands.cancel_mission_path_request()
+
+    # ============================================================ arrow control
+    def _on_arrows_engaged(self) -> None:
+        if self.toolbar.manual_button.isChecked():
+            self.toolbar.manual_button.setChecked(False)   # disarm map clicks
         self._status.showMessage(
-            "Published [0.0, 0.0] — master_control resumes the original "
-            "mission.", 6000)
+            "Arrow control ON: ↑ ahead, ↓ astern, ← / → turn. Any running path "
+            "or pinger run is paused.", 8000)
+
+    def _on_arrows_released(self, hold: bool) -> None:
+        """Arrow control OFF: hold the boat where it is (a manual target at its
+        position, through the normal manual-target code), then release."""
+        r = self.store.robot
+        if hold and r.has_odom:
+            self._on_target_clicked(r.x, r.y)
+            self._status.showMessage(
+                "Arrow control OFF — holding position here. Use "
+                f"'{self.toolbar.continue_button.text()}' to let go.", 8000)
+        self.commands.release_arrows()
 
     def _on_clear_paths(self) -> None:
         self.store.clear_tracks()
@@ -534,7 +702,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================ designer
     def _on_modify_sea(self) -> None:
-        """Left panel 'Modify situation…': live sea-state change (sim)."""
+        """SEA STATE box 'Change sea state…': live sea-state change (sim)."""
         from mcs.core.sea import SeaCatalog, SeaChoice, find_presets_file
         from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
         if not self.store.mission.simulation:
@@ -554,6 +722,11 @@ class MainWindow(QMainWindow):
                 f"(ramp {dlg.ramp_s():.0f} s)", 8000)
         else:
             self._status.showMessage("ROS is not running — sea state not sent", 8000)
+
+    def _send_replay(self, cmd: str, rate: float | None = None) -> None:
+        """REPLAY box: pause / resume / playback rate of the bag replay."""
+        if not self.commands.send_replay_command(cmd, rate):
+            self._status.showMessage("ROS is not running — replay command not sent", 8000)
 
     def _open_designer(self) -> None:
         """Open the Survey Pattern Designer (one shared, non-modal instance).

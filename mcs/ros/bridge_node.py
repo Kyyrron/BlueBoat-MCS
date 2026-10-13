@@ -6,9 +6,10 @@ Responsibilities
   message to the :class:`~mcs.core.signals.SignalBus` (thread boundary).
 * Track per-topic reception statistics (rate / age / status) for the
   diagnostics panel.
-* Expose the two command publishers (``/blueboat/input_str`` and
-  ``/blueboat/manual_target``) through thread-safe helpers callable from
-  the GUI thread.
+* Expose the command publishers (``/blueboat/input_str``,
+  ``/blueboat/manual_target``, the run-session ``/blueboat/run_command`` and
+  the arrow-key ``/blueboat/arrow_thrust`` stream) through thread-safe helpers
+  callable from the GUI thread.
 * Query the mission path from the ``/path_request`` service exactly as
   ``path_publisher.py`` does (same request pattern, reused, not reinvented).
 
@@ -140,11 +141,22 @@ class BridgeNode(Node):
         # situation immediately; the reader matches that durability.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, t.sea_state, self._on_sea_state, latched)
+        # Gazebo replay of a recorded run (bag_replay): latched state, like
+        # the sea state.
+        self.create_subscription(String, t.replay_state, self._on_replay_state, latched)
+        # Run sessions (real-robot launches): master_control's run state and
+        # robot_interface's per-run log state, both JSON, heartbeated at 1 Hz
+        # on the default profile at both ends (CM-4).
+        self.create_subscription(String, t.run_state, self._on_run_state, 10)
+        self.create_subscription(String, t.run_log, self._on_run_log, 10)
 
         # ---- Publishers ----------------------------------------------------
         self._pub_input_str = self.create_publisher(String, t.input_str, 10)
         self._pub_manual_target = self.create_publisher(Float32MultiArray, t.manual_target, 10)
         self._pub_sea_command = self.create_publisher(String, t.sea_state_command, 10)
+        self._pub_replay_command = self.create_publisher(String, t.replay_command, 10)
+        self._pub_run_command = self.create_publisher(String, t.run_command, 10)
+        self._pub_arrow_thrust = self.create_publisher(Float32MultiArray, t.arrow_thrust, 10)
 
         # ---- Simulated GPS (Gazebo runs of GPS-anchored missions) ----------
         # The station itself publishes NavSatFix on the real GPS topic, which
@@ -274,9 +286,27 @@ class BridgeNode(Node):
         if isinstance(payload, dict):
             self._bus.sea_state_received.emit(t, payload)
 
+    def _on_replay_state(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.replay_state)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.replay_state_received.emit(t, payload)
+
     def _on_param_mode(self, msg: String) -> None:
         t = self._mark(self._cfg.topics.param_mode)
         self._bus.param_mode_received.emit(t, str(msg.data))
+
+    def _on_run_state(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.run_state)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.run_state_received.emit(t, payload)
+
+    def _on_run_log(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.run_log)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.run_log_received.emit(t, payload)
 
     # =============================================================== outputs
     # publish() on rclpy publishers is safe to call from other threads; the
@@ -305,6 +335,14 @@ class BridgeNode(Node):
             self._pub_sea_command.publish(msg)
         self._bus.command_sent.emit("sea_state/command ← " + payload[:60])
 
+    def publish_replay_command(self, payload: str) -> None:
+        """Publish a JSON command on /replay/command (bag replay only)."""
+        with self._pub_lock:
+            msg = String()
+            msg.data = payload
+            self._pub_replay_command.publish(msg)
+        self._bus.command_sent.emit("replay/command ← " + payload[:60])
+
     def publish_manual_target(self, x: float, y: float) -> None:
         """Publish a manual target; (0, 0) resumes the original mission."""
         with self._pub_lock:
@@ -312,6 +350,31 @@ class BridgeNode(Node):
             msg.data = [float(x), float(y)]
             self._pub_manual_target.publish(msg)
         self._bus.command_sent.emit(f"manual_target ← [{x:.2f}, {y:.2f}]")
+
+    def publish_run_command(self, payload: dict) -> None:
+        """Publish one run-session command (JSON) on /blueboat/run_command."""
+        text = json.dumps(payload)
+        with self._pub_lock:
+            msg = String()
+            msg.data = text
+            self._pub_run_command.publish(msg)
+        self._bus.command_sent.emit(f"run_command ← {payload.get('cmd', '?')}")
+
+    def run_command_subscriber_count(self) -> int:
+        """Matched subscriptions on /blueboat/run_command (master_control in
+        a run session). Thread-safe, like input_str_subscriber_count."""
+        return self._pub_run_command.get_subscription_count()
+
+    def publish_arrow_thrust(self, values) -> None:
+        """Publish [right, left] N, or [] to release arrow control.
+
+        Called at the stream rate (20 Hz) while arrow control is on, so it
+        deliberately emits no ``command_sent``: the status bar and the log
+        would drown in it. Engaging and releasing are reported by the GUI."""
+        with self._pub_lock:
+            msg = Float32MultiArray()
+            msg.data = [float(v) for v in values]
+            self._pub_arrow_thrust.publish(msg)
 
     # ---------------------------------------------------------- simulated GPS
     def set_sim_gps(self, model) -> None:
@@ -430,3 +493,12 @@ class BridgeNode(Node):
             for name, st in self._stats.items()
         }
         self._bus.topic_stats_updated.emit(snapshot)
+
+
+def _json_object(text: str) -> dict | None:
+    """Decode a JSON status message; anything but an object is ignored."""
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None

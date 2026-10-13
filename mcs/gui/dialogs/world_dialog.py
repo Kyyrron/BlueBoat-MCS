@@ -32,20 +32,21 @@ class WorldChoiceDialog(QDialog):
     the launch entirely.
     """
 
-    def __init__(self, worlds: list[dict], parent=None) -> None:
+    def __init__(self, worlds: list[dict], parent=None,
+                 intro_text: str | None = None) -> None:
         super().__init__(parent)
         self.selected_world_dir: str | None = None
         self.setWindowTitle("Launch Mission — Gazebo world")
         self.setMinimumSize(460, 320)
         layout = QVBoxLayout(self)
 
-        intro = QLabel(
+        intro = QLabel(intro_text or (
             f"This GPS-anchored path lies inside {len(worlds)} personalized "
             "world(s). Launch inside one of them (simulated seabed, sonar "
             "and GPS — blueboat_sss_sim), or in the standard empty Gazebo "
             "world. In a personalized world the boat spawns at the world's "
             "own origin heading east; the controller then drives it onto "
-            "the path.")
+            "the path."))
         intro.setWordWrap(True)
         layout.addWidget(intro)
 

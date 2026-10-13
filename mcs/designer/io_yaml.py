@@ -16,6 +16,8 @@ Two files per mission, in ``designer.trajectories_dir``:
 from __future__ import annotations
 
 import datetime
+import math
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -201,10 +203,64 @@ def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     deployed["deployed_from"] = str(src)
     deployed["deployed_fit_rms_m"] = round(float(current_fit.rms_m), 3)
     deployed["points"] = out_points
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(yaml.safe_dump(deployed, sort_keys=False,
-                                  default_flow_style=None))
+    _atomic_write_yaml(dst, deployed)
     return dst
+
+
+def place_mission(src: Path, x: float, y: float, yaw: float, dst: Path) -> Path:
+    """Place a NON-anchored mission at the boat, for the start of a run.
+
+    A run session (real-robot launch) fixes the world frame at connection,
+    long before a run starts, so a design-frame mission can no longer simply
+    start "where the boat was at launch": the boat has been driven since. The
+    whole path is therefore moved RIGIDLY so its first sample sits on the
+    boat's current world position (x, y) and its first heading on the boat's
+    current world heading ``yaw`` (odom yaw, radians ENU) -- the path starts
+    at the boat and runs out ahead of it. Shape, spacing and timing are
+    untouched: every sample is rotated by ``yaw - yaw_first`` about the first
+    sample, then translated; every yaw gains the same angle.
+
+    Written atomically to *dst* -- the file path_generation watches -- with
+    ``deployed_from`` and ``placed_at`` provenance. A GPS-anchored mission is
+    refused: it is geographically fixed and goes through deploy_mission.
+    """
+    data = yaml.safe_load(src.read_text()) or {}
+    if data.get("geo_anchor"):
+        raise ValueError(f"{src.name} is GPS-anchored: deploy it, do not place it")
+    points = data.get("points") or []
+    if not points:
+        raise ValueError(f"{src.name} has no points")
+    _t0, x0, y0, yaw0 = (float(v) for v in points[0][:4])
+    dpsi = float(yaw) - yaw0
+    c, s = math.cos(dpsi), math.sin(dpsi)
+    out_points = []
+    for t_s, px, py, pyaw in (row[:4] for row in points):
+        dx, dy = float(px) - x0, float(py) - y0
+        wyaw = float(pyaw) + dpsi
+        out_points.append([round(float(t_s), 3),
+                           round(float(x) + c * dx - s * dy, 4),
+                           round(float(y) + s * dx + c * dy, 4),
+                           round(math.atan2(math.sin(wyaw), math.cos(wyaw)), 5)])
+    placed = dict(data)
+    placed["deployed_from"] = str(src)
+    placed["placed_at"] = {"x": round(float(x), 4), "y": round(float(y), 4),
+                           "yaw": round(float(yaw), 5)}
+    placed["points"] = out_points
+    _atomic_write_yaml(dst, placed)
+    return dst
+
+
+def _atomic_write_yaml(dst: Path, data: dict) -> None:
+    """Write a runtime trajectory so a reader never sees half a file.
+
+    path_generation reloads its watched file on the next request after the
+    mtime changes, and in a run session that request can come within one
+    control tick of the write: write a sibling, then os.replace() it in.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    tmp.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=None))
+    os.replace(tmp, dst)
 
 
 def deployed_path(directory: Path, name: str) -> Path:

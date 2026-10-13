@@ -7,6 +7,7 @@ window brings up a real bridge node, without one it degrades to GUI-only. The
 blocks that assert what was published substitute their own node stub, so the
 result never depends on which of the two it is.
 """
+import itertools
 import math
 import os
 import sys
@@ -733,55 +734,85 @@ _dmv.deleteLater()
 print("world launch ok")
 
 # --- Sea state (simulator current + waves) ---
+# The operator's model (2026-10-08): a Current card (mean speed, from,
+# variation level) and a Waves card (strength, from, period, crest, wakes),
+# carried to the simulator as its own schedule format with plain keys -- a
+# scenario file at launch (sea_schedule:=), a JSON command live. Changes
+# over time are timeline segments (hold keyframes + per-keyframe ramp_s).
 import json as _json_sea
 
 from mcs.core.sea import (
+    CurrentSetting,
     SeaCatalog,
     SeaChoice,
+    SeaTimeline,
+    Segment,
+    WaveSetting,
+    clock_text,
     compass_name,
     direction_text,
     find_presets_file,
+    list_schedules,
     parse_direction,
     parse_readback,
     read_schedule,
-    schedule_doc,
-    schedule_rows,
-    write_schedule,
 )
 from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
+from mcs.gui.dialogs.sea_timeline_dialog import SeaTimelineDialog
 from mcs.ros.launch_manager import companion_command as _companion
 
 _cat_fb = SeaCatalog.load(None)
 assert next(iter(_cat_fb.current)) == "none" and next(iter(_cat_fb.waves)) == "calm"
-assert _cat_fb.source == "" and _cat_fb.label("waves", "rough") == "rough"
+assert _cat_fb.source == "" and set(_cat_fb.variation) == {"steady", "natural", "strong"}
 _cat_bad = SeaCatalog.load(Path(tempfile.mkdtemp()) / "missing.yaml")
 assert _cat_bad.source == ""                       # never raises
 _pf = find_presets_file(cfg.sea.presets_file)
 _cat = SeaCatalog.load(_pf)
-if _pf is not None:                                 # simulator installed
-    assert _cat.source and _cat.description("current", "weak")
-    assert "Douglas" in _cat.label("waves", "rippled") or _cat.label("waves", "rippled")
+if _pf is not None and "current_variation" in _pf.read_text():   # simulator built
+    assert _cat.source and _cat.description("variation", "natural")
+    assert _cat.variation_text("natural").startswith("±")
+    assert "[" not in _cat.description("current", "weak")      # no references shown
+    _tp = [_cat.auto_tp(h) for h in (0.05, 0.1, 0.15, 0.25, 0.35, 0.6, 1.0)]
+    assert all(b2 >= a2 for a2, b2 in itertools.pairwise(_tp))
+    assert abs(_cat.auto_tp(_cat.wave_hs("smooth")) - _cat.number("waves", "smooth", "tp_s")) < 1e-9
 assert compass_name(0) == "N" and compass_name(225) == "SW" and compass_name(359) == "N"
 assert parse_direction("NE") == 45.0 and parse_direction("270") == 270.0
 assert parse_direction("nonsense") is None
 assert direction_text(0.0).startswith("from N (→ S")
+assert clock_text(305) == "5:05" and clock_text(3725) == "1:02:05"
+# Plain blocks: what the simulator's sea/presets.py resolves on its side.
 _null = SeaChoice()
-assert _null.is_null and _null.launch_args()[0] == "sea_current:=none"
-_sea = SeaChoice(current="strong", current_from_deg=90.0, waves="slight",
-                 waves_from_deg=45.0, seed=3)
+assert _null.is_null and _null.current.block() == {"preset": "none"}
+assert _null.waves.block() == {"preset": "calm"}
+_sea = SeaChoice(current=CurrentSetting(True, 0.3, 45.0, "natural"),
+                 waves=WaveSetting(True, "slight", 0.2, 90.0, True, 3.0, "long", "frequent"),
+                 seed=3)
 assert not _sea.is_null
-assert _sea.launch_args() == ["sea_current:=strong", "sea_current_from_deg:=90.0",
-                              "sea_waves:=slight", "sea_waves_from_deg:=45.0",
-                              "sea_seed:=3"]
+assert _sea.current.block() == {"speed_mps": 0.3, "from_deg": 45.0, "variation": "natural"}
+assert _sea.waves.block() == {"preset": "slight", "from_deg": 90.0, "crest": "long",
+                              "wakes": "frequent"}                # preset period kept
+_cw = WaveSetting(True, "custom", 0.25, 10.0, True, 3.0, "short", "none").block()
+assert _cw["hs_m"] == 0.25 and _cw["tp_s"] == "auto" and "preset" not in _cw
+assert WaveSetting(True, "smooth", 0.2, 0.0, False, 4.5).block()["tp_s"] == 4.5
+# A launch always carries its sea as a scenario file + the seed.
+_sea_dir = Path(tempfile.mkdtemp())
+_scfg = cfg.sea.__class__(schedules_dir=str(_sea_dir))
+_f = _sea.write_scenario(_sea_dir)
+assert _sea.launch_args() == [f"sea_schedule:={_f}", "sea_seed:=3"]
+_doc = read_schedule(_f)
+assert _doc["format"] == "blueboat_sea_schedule/1" and _doc["interpolation"] == "hold"
+assert _doc["keyframes"][0]["current"]["variation"] == "natural"
+assert list_schedules(_sea_dir) == []              # the launch scenario is not "saved"
 _cmd = _json_sea.loads(_sea.command_json(12.0))
-assert _cmd["current"]["preset"] == "strong" and _cmd["ramp_s"] == 12.0
+assert _cmd["ramp_s"] == 12.0 and _cmd["current"]["speed_mps"] == 0.3
+assert _cmd["waves"]["crest"] == "long"
 # World branch: sea args ride full_mission_launch.py, before the extras.
 _wps = _WLP(simulation=True, gps_simulated=True, controller_type="PID",
             world_dir="/w/pA/w1", gps_deployed_target="/tmp/d.yaml", sea=_sea,
             extra_args={"with_mavros_shim": "false"})
 _wcs = _wps.to_cli()
-assert "sea_current:=strong" in _wcs and "sea_waves_from_deg:=45.0" in _wcs
-assert _wcs.index("sea_current:=strong") < _wcs.index("with_mavros_shim:=false")
+assert f"sea_schedule:={_f}" in _wcs and "sea_seed:=3" in _wcs
+assert _wcs.index("sea_seed:=3") < _wcs.index("with_mavros_shim:=false")
 assert _wcs[-1] == "with_mavros_shim:=false"
 assert _companion(cfg, _wps) is None                # world mode: no companion
 # Stock branch: Sim_launch.py gets no sea args; a companion carries them.
@@ -789,65 +820,100 @@ _sps = _WLP(simulation=True, controller_type="PID", sea=_sea)
 assert not any(a.startswith("sea_") for a in _sps.to_cli())
 _cc = _companion(cfg, _sps)
 assert _cc[:4] == ["ros2", "launch", "blueboat_sss_sim", "sea_state_launch.py"]
-assert "world_name:=ocean" in _cc and "sea_waves:=slight" in _cc
-assert _companion(cfg, _WLP(simulation=True, sea=SeaChoice())) is None  # null
+assert "world_name:=ocean" in _cc and f"sea_schedule:={_f}" in _cc
+# A null (or absent) choice still starts the companion -- it carries the
+# simulator's catamaran hull in every run -- with no sea_ argument at all.
+for _null in (SeaChoice(), None):
+    _nc = _companion(cfg, _WLP(simulation=True, sea=_null))
+    assert _nc == ["ros2", "launch", "blueboat_sss_sim", "sea_state_launch.py",
+                   "world_name:=ocean"], _nc
 assert _companion(cfg, _WLP(simulation=False, sea=_sea)) is None       # real
-# Dialog, headless: defaults are null; a choice round-trips; a timeline
-# saves as the simulator's schedule format and loads back.
-_sea_dir = Path(tempfile.mkdtemp())
-_scfg = cfg.sea.__class__(schedules_dir=str(_sea_dir))
+# Timeline: segments -> hold keyframes with per-keyframe ramp_s; an older
+# linear timeline opens as segments whose change takes the whole gap.
+_tl = SeaTimeline([Segment(0.0, 60.0, CurrentSetting(), WaveSetting()),
+                   Segment(300.0, 90.0, CurrentSetting(True, 0.25, 0.0),
+                           WaveSetting(True, "smooth", from_deg=90.0)),
+                   Segment(900.0, 120.0, CurrentSetting(True, 0.5, 30.0, "strong"),
+                           WaveSetting(True, "slight", from_deg=90.0))], "build")
+_td = _tl.to_doc(seed=7)
+assert [k["t_s"] for k in _td["keyframes"]] == [0.0, 300.0, 900.0]
+assert "ramp_s" not in _td["keyframes"][0] and _td["keyframes"][2]["ramp_s"] == 120.0
+assert SeaTimeline.from_doc(_td, _cat).to_doc(7) == _td      # exact round-trip
+_old = {"format": "blueboat_sea_schedule/1", "interpolation": "linear", "keyframes": [
+    {"t_s": 0, "current": {"preset": "weak", "from": "NE"}, "waves": {"preset": "rippled"}},
+    {"t_s": 300, "current": {"preset": "moderate", "from": "NE"},
+     "waves": {"hs_m": 0.3, "tp_s": 4.0, "events": {"rate_per_hour": 0}}}]}
+_otl = SeaTimeline.from_doc(_old, _cat)
+assert _otl.segments[1].start_s == 0.0 and _otl.segments[1].transition_s == 300.0
+assert _otl.segments[0].current.active and _otl.segments[0].current.from_deg == 45.0
+assert _otl.segments[1].waves.level == "custom" and _otl.segments[1].waves.hs_m == 0.3
+assert not _otl.segments[1].waves.period_auto and _otl.segments[1].waves.wakes == "none"
+_tlc = SeaChoice(timeline=_tl, seed=7)
+assert not _tlc.is_null and "3 segments" in _tlc.summary(_cat)
+assert _json_sea.loads(_tlc.command_json())["schedule"]["keyframes"][1]["ramp_s"] == 90.0
+# Dialog, headless: defaults are null; a choice round-trips; a launch
+# writes the scenario; a plan greys the cards out and replaces them.
 _sd = SeaStateDialog(_cat, _scfg, None)
-assert _sd.choice().is_null
+assert _sd.choice().is_null and not _sd.current_card.isChecked()
 _sd.set_choice(_sea)
-assert _sd.choice() == _sea
-_sd._add_row()
-_sd._add_row()
-_rows = _sd.rows()
-assert len(_rows) == 2 and _rows[1]["t_s"] == 300.0 and _rows[0]["current"] == "strong"
-_sched_path = write_schedule(_sea_dir / "build.yaml",
-                             schedule_doc(_rows, "build", seed=7))
-_doc = read_schedule(_sched_path)
-assert _doc["format"] == "blueboat_sea_schedule/1" and len(_doc["keyframes"]) == 2
-assert schedule_rows(_doc) == _rows
-_sd2 = SeaStateDialog(_cat, _scfg, SeaChoice(schedule_file=str(_sched_path)))
-assert _sd2.choice().schedule_file == str(_sched_path) and len(_sd2.rows()) == 2
-assert "sea_schedule:=" + str(_sched_path) in _sd2.choice().launch_args()
+_c2 = _sd.choice()
+assert _c2.current == _sea.current and _c2.waves == _sea.waves and _c2.seed == 3
+_sd._accept()
+assert _sd.choice().scenario_file and read_schedule(_sd.choice().scenario_file)
+_sd.set_timeline(_tl)
+assert not _sd.current_card.isEnabled() and _sd._clear_btn.isVisibleTo(_sd)
+assert _sd.choice().timeline is _tl
+_sd.set_timeline(None)
+assert _sd.current_card.isEnabled() and _sd.choice().timeline is None
+_sd.waves_card.level.setCurrentIndex(_sd.waves_card.level.findData("custom"))
+assert _sd.waves_card.custom_hs.isVisibleTo(_sd.waves_card)
 _sd.deleteLater()
-_sd2.deleteLater()
-# Custom waves: explicit Hs/Tp/gamma/events instead of a preset -> a
-# one-keyframe schedule file at launch, explicit fields in a live command.
-_sd3 = SeaStateDialog(_cat, _scfg, None)
-_sd3._waves.setCurrentIndex(_sd3._waves.findData("custom"))
-assert _sd3.is_custom() and _sd3._custom_box.isVisibleTo(_sd3)
-_sd3._c_hs.setValue(0.3); _sd3._c_tp.setValue(4.0); _sd3._c_rate.setValue(9)
-_sd3._accept()
-_cc3 = _sd3.choice()
-assert _cc3.custom_waves["hs_m"] == 0.3 and _cc3.custom_waves["events"]["rate_per_hour"] == 9.0
-assert _cc3.schedule_file.endswith("custom_waves.yaml") and not _cc3.is_null
-_doc3 = read_schedule(_cc3.schedule_file)
-assert _doc3["keyframes"][0]["waves"]["hs_m"] == 0.3 and "preset" not in _doc3["keyframes"][0]["waves"]
-assert "sea_schedule:=" + _cc3.schedule_file in _cc3.launch_args()
-_live3 = _json_sea.loads(SeaChoice(custom_waves=_cc3.custom_waves, waves_from_deg=30.0).command_json(5.0))
-assert _live3["waves"]["tp_s"] == 4.0 and _live3["waves"]["from_deg"] == 30.0
-assert "custom waves Hs 0.30" in _cc3.summary(_cat)
-_sd3.deleteLater()
-# Readback parse + the store/panel gating.
-_rb = parse_readback({"t_sim": 12.5, "current": {"preset": "strong", "label": "Strong",
-                      "mean_speed_mps": 0.5, "from_deg": 90.0,
-                      "instant": {"speed_mps": 0.47}},
-                      "waves": {"preset": "slight", "label": "Slight", "hs_m": 0.35,
-                                "tp_s": 2.5, "from_deg": 45.0, "status": "active",
-                                "eta_m": 0.12},
+_sdl = SeaStateDialog(_cat, _scfg, _sea, live=True)
+_sdl._accept()                                     # live: no file written
+assert _sdl.choice().scenario_file == "" and _sdl.ramp_s() == cfg.sea.ramp_s
+_sdl.deleteLater()
+# Timeline editor, headless: seeded from the basic choice, segments added,
+# edited through the same cards, the strip draws blends.
+_te = SeaTimelineDialog(_cat, _scfg, None, first=_sea, seed=3)
+assert len(_te.timeline().segments) == 1 and _te.timeline().segments[0].current.speed_mps == 0.3
+_te.add_segment()
+assert len(_te.timeline().segments) == 2 and _te.timeline().sorted()[1].start_s == 300.0
+_te._waves.setChecked(False)                       # edit the selected (2nd) segment
+assert not _te.timeline().sorted()[1].waves.enabled
+_ser = _te.strip.series("waves")
+assert _ser[0][1] > 0.0 and _ser[-1][1] == 0.0     # waves ramp down at 5:00
+_te.remove_selected()
+assert len(_te.timeline().segments) == 1
+_te.deleteLater()
+# Readback parse (fields added after 2026-09 are optional).
+_rb = parse_readback({"t_sim": 12.5, "current": {"preset": "custom", "label": "Custom",
+                      "mean_speed_mps": 0.5, "from_deg": 90.0, "variation": "natural",
+                      "instant": {"speed_mps": 0.47, "from_deg": 84.0}},
+                      "waves": {"preset": "slight", "label": "Choppy (0.35 m)", "hs_m": 0.35,
+                                "tp_s": 3.6, "from_deg": 45.0, "status": "active"},
+                      "boat": {"roll_std_deg": 1.4, "pitch_std_deg": 1.1, "heave_std_m": 0.04},
+                      "blend": 1.0,
                       "schedule": {"name": "x", "next_t_sim": 300.0, "next": "rough"},
-                      "summary": "strong from E; slight from NE"}, received_mono=1.0)
+                      "summary": "s"}, received_mono=1.0)
 assert _rb is not None and _rb.current_instant_mps == 0.47
-assert _rb.waves_text.startswith("Slight Hs 0.35") and "in 288 s" in _rb.next_change_text
-_rb2 = parse_readback({"waves": {"label": "Smooth", "hs_m": 0.15, "tp_s": 2.8,
+assert _rb.current_text == "0.47 m/s from E · mean 0.50 from E (natural)"
+assert _rb.waves_text == "Choppy (0.35 m), every 3.6 s, from NE"
+assert _rb.boat_text == "roll ±1.4°, pitch ±1.1°, heave ±4 cm"
+assert "in 4:48" in _rb.next_change_text
+_rb2 = parse_readback({"waves": {"label": "Light chop", "hs_m": 0.15, "tp_s": 2.8,
                                  "status": "active", "events_per_hour": 12,
                                  "event": {"hs_m": 0.14, "tp_s": 5.5,
-                                           "from_deg": 70, "t_remaining_s": 18}}})
-assert "wake group 0.14 m 6 s from ENE, 18 s left" in _rb2.waves_text
+                                           "from_deg": 70, "t_remaining_s": 18}},
+                       "blend": 0.4})
+assert _rb2.waves_text.startswith("Light chop 0.15 m, every 2.8 s")
+assert "passing wake 0.14 m from ENE, 18 s left" in _rb2.waves_text
+assert _rb2.boat_text == "—" and _rb2.next_change_text == "changing now (40 %)"
+assert parse_readback({"boat": {"roll_std_deg": 0.0, "pitch_std_deg": 0.01,
+                                "heave_std_m": 0.0}}).boat_text == "level and steady"
 assert parse_readback("not json") is None
+assert _rb.hull_model == ""                                   # older simulators
+assert parse_readback({"hull": {"model": "catamaran", "active": True}}
+                      ).hull_model == "catamaran"
 print("sea state ok")
 
 # --- Full window in offscreen mode, synthetic telemetry ---
@@ -1845,8 +1911,17 @@ w.store.sea = parse_readback({"t_sim": 0.0,
                               "summary": "strong from E; slight from NE"},
                              received_mono=time.monotonic())
 w._on_tick(); app.processEvents()
-assert w.sea_box._values["Surface"].text() == "\u03b7 +0.12 m"
+assert w.sea_box._values["Boat motion"].text() == "—"     # no window yet
 assert w.sea_box._values["Status"].text() == "strong from E; slight from NE"
+# The catamaran hull reads as before; the URDF box (a fallback) is flagged.
+w.store.sea = parse_readback({"summary": "calm", "hull": {"model": "catamaran"}},
+                             received_mono=time.monotonic())
+w._on_tick(); app.processEvents()
+assert w.sea_box._values["Status"].text() == "calm"
+w.store.sea = parse_readback({"summary": "calm", "hull": {"model": "gazebo_box"}},
+                             received_mono=time.monotonic())
+w._on_tick(); app.processEvents()
+assert w.sea_box._values["Status"].text() == "calm · hull: Gazebo box"
 # A longer wave string wraps to more lines; the box gets taller, the rows
 # never overlap and the width stays put.
 _w_fixed = w.sea_box.width()
@@ -1877,6 +1952,517 @@ w.store.sea = None
 w._on_tick(); app.processEvents()
 assert w.sea_box.isHidden()
 print("sea box ok")
+
+# =========================================================================
+# RUN SESSIONS (real-robot launches, 2026-10-09). A real launch connects and
+# idles; runs are started / stopped from the station; Update Mission changes
+# the next run between runs; arrow keys drive the boat. Simulation keeps the
+# v1.0 flow. Every block below substitutes its own stubs for the ROS node.
+# =========================================================================
+
+# --- Real launch = run session: CLI, path list, controller list ------------
+import numpy as np
+
+from mcs.gui.dialogs.launch_dialog import LaunchDialog as _SLD
+
+_sl_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_sl_"))
+try:
+    _sl_cfg = AppConfig()
+    _sl_cfg.designer.trajectories_dir = str(_sl_dir)
+    _sl_cfg.launch.session_trajectory_file = str(_sl_dir / ".session" / "run.yaml")
+    _sl_m = MissionModel()
+    _sl_m.from_dict({"name": "m", "speed": 0.5, "loop": False, "items": []})
+    for _x, _y in ((0.0, 0.0), (8.0, 0.0), (8.0, 6.0)):
+        _sl_m.add_waypoint(_x, _y)
+    _sl_s = sample_mission(_sl_m, cfg.designer.sample_ds_m)
+    _sl_anch = io_yaml.save_mission(_sl_dir, "gps_path", _sl_m, _sl_s,
+                                    geo_anchor={"lat0": 43.2, "lon0": 5.8,
+                                                "theta_deg": 0.0})
+    _sl_plain = io_yaml.save_mission(_sl_dir, "plain_path", _sl_m, _sl_s)
+
+    _sd = _SLD(_sl_cfg, None)
+    _sd._mode.setCurrentText("Real robot")
+    _items = [_sd._trajectory.itemText(i) for i in range(_sd._trajectory.count())]
+    # Built-in shapes are a simulation / CLI affair; a session runs designer paths.
+    assert not any(t in _items for t in _sl_cfg.launch.trajectories), _items
+    _ctl = [_sd._controller.itemText(i) for i in range(_sd._controller.count())]
+    assert _ctl == ["PID", "LoS", "MPC"], _ctl            # no empty controller
+    _sd._trajectory.setCurrentIndex(_sd._trajectory.findData(str(_sl_plain)))
+    _sp = _sd.parameters()
+    assert _sp.session and not _sp.simulation
+    assert _sp.trajectory == f"from_yaml:{_sl_cfg.launch.session_trajectory_file}"
+    assert _sp.session_source == str(_sl_plain) and _sp.gps_anchored_source == ""
+    assert "session_mode:=True" in _sp.to_cli(), _sp.to_cli()
+    assert "controller_type:=PID" in _sp.to_cli()
+    _sd._trajectory.setCurrentIndex(_sd._trajectory.findData(str(_sl_anch)))
+    _sa = _sd.parameters()
+    assert _sa.gps_anchored_source == str(_sl_anch)
+    assert _sa.gps_deployed_target == _sl_cfg.launch.session_trajectory_file
+    # MPC cannot follow the pinger: greyed out and left when it was chosen.
+    _sd._controller.setCurrentText("MPC")
+    _sd._use_pinger.setChecked(True)
+    assert _sd._controller.currentText() == "PID"
+    _mpc = _sd._controller.findText("MPC")
+    assert not _sd._controller.model().item(_mpc).isEnabled()
+    _spp = _sd.parameters()
+    assert _spp.use_pinger and _spp.session_source == ""
+    _sd._use_pinger.setChecked(False)
+    # Simulation keeps the v1.0 arguments: no session_mode.
+    _sd._mode.setCurrentText("Gazebo simulation")
+    assert "session_mode:=True" not in _sd.parameters().to_cli()
+    assert _sd._trajectory.findText("circle") >= 0       # built-ins in sim
+    _sd.deleteLater()
+finally:
+    shutil.rmtree(_sl_dir, ignore_errors=True)
+print("session launch ok")
+
+# --- Placement: a non-anchored path starts at the boat, ahead of it --------
+_pl_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_pl_"))
+try:
+    _pl_src = io_yaml.save_mission(_pl_dir, "lawn", _sl_m, _sl_s)
+    _pl_dst = _pl_dir / ".session" / "run.yaml"
+    _bx, _by, _byaw = 12.5, -4.0, math.radians(130.0)
+    io_yaml.place_mission(_pl_src, _bx, _by, _byaw, _pl_dst)
+    import yaml as _pl_yaml
+    _pl_doc = _pl_yaml.safe_load(_pl_dst.read_text())
+    _pl_in = np.asarray(_pl_yaml.safe_load(_pl_src.read_text())["points"], float)
+    _pl_out = np.asarray(_pl_doc["points"], float)
+    assert abs(_pl_out[0, 1] - _bx) < 1e-3 and abs(_pl_out[0, 2] - _by) < 1e-3
+    assert abs(math.atan2(math.sin(_pl_out[0, 3] - _byaw),
+                          math.cos(_pl_out[0, 3] - _byaw))) < 1e-3
+    # Rigid: every inter-sample distance and the timing are untouched.
+    _d_in = np.hypot(*np.diff(_pl_in[:, 1:3], axis=0).T)
+    _d_out = np.hypot(*np.diff(_pl_out[:, 1:3], axis=0).T)
+    assert np.allclose(_d_in, _d_out, atol=2e-3)
+    assert np.allclose(_pl_in[:, 0], _pl_out[:, 0])
+    # The second sample is AHEAD of the boat (along its heading).
+    _ahead = ((_pl_out[1, 1] - _bx) * math.cos(_byaw)
+              + (_pl_out[1, 2] - _by) * math.sin(_byaw))
+    assert _ahead > 0.0, _ahead
+    assert _pl_doc["deployed_from"] == str(_pl_src) and "placed_at" in _pl_doc
+    # Atomic write: no temporary sibling is left behind.
+    assert sorted(p.name for p in _pl_dst.parent.iterdir()) == ["run.yaml"]
+    # A GPS-anchored mission is deployed, never placed.
+    _pl_g = io_yaml.save_mission(_pl_dir, "gps", _sl_m, _sl_s,
+                                 geo_anchor={"lat0": 43.2, "lon0": 5.8,
+                                             "theta_deg": 0.0})
+    try:
+        io_yaml.place_mission(_pl_g, 0.0, 0.0, 0.0, _pl_dst)
+        raise AssertionError("an anchored mission was placed")
+    except ValueError:
+        pass
+finally:
+    shutil.rmtree(_pl_dir, ignore_errors=True)
+print("placement ok")
+
+# --- Arrow keys: thrust law, key capture, hold-where-released --------------
+from PySide6.QtCore import QEvent as _QEvent
+from PySide6.QtCore import Qt as _Qt
+from PySide6.QtGui import QKeyEvent as _QKeyEvent
+
+from mcs.core.arrows import arrow_thrust
+
+# The operator's own examples ([right, left] order on the wire).
+assert arrow_thrust(False, False, False, True, 6.0, 5.0) == (-5.0, 5.0)   # CW
+assert arrow_thrust(True, False, False, True, 6.0, 5.0) == (1.0, 11.0)    # up+CW
+assert arrow_thrust(False, True, True, False, 6.0, 5.0) == (-1.0, -11.0)  # back+CCW
+assert arrow_thrust(True, True, True, True, 6.0, 5.0) == (0.0, 0.0)       # cancel
+
+
+class _ArrowNode:
+    def __init__(self):
+        self.log: list = []
+
+    def publish_arrow_thrust(self, values) -> None:
+        self.log.append(("arrow", tuple(values)))
+
+    def publish_manual_target(self, x: float, y: float) -> None:
+        self.log.append(("target", round(x, 3), round(y, 3)))
+
+
+_ar_node = _ArrowNode()
+_ar_saved_node = w.ros.node
+w.ros.node = _ar_node
+_ab = w.arrow_box
+assert _ab.parent() is w.map_view
+_ab._capture_allowed = lambda: True       # offscreen: no active window
+try:
+    w.store.mission.launch_running = True
+    w.store.mission.controller_type = "PID"
+    w._on_tick()
+    assert not _ab.isHidden()
+    assert (_ab.pos().x(), _ab.pos().y()) == (
+        w.map_view.width() - _ab.width() - 8,
+        w.map_view.height() - _ab.height() - 8)        # bottom-right corner
+    # Defaults: forward 10 N, rotation 5 N, rotation adjustable 3..15 N.
+    from mcs.config.settings import ArrowConfig as _ArrowConfig
+    assert (_ArrowConfig().default_power_n, _ArrowConfig().turn_n) == (10.0, 5.0)
+    assert (_ab.turn_slider.minimum(), _ab.turn_slider.maximum()) == (3, 15)
+    _ab.slider.setValue(6)
+    _ab.turn_slider.setValue(5)
+    _ab.set_active(True)
+    assert w.store.session.arrow_active and _ar_node.log[-1] == ("arrow", (0.0, 0.0))
+
+    def _key(kind, key, repeat=False):
+        return _ab.eventFilter(None, _QKeyEvent(kind, key,
+                                                _Qt.KeyboardModifier.NoModifier,
+                                                "", repeat))
+    assert _key(_QEvent.Type.KeyPress, _Qt.Key.Key_Up)
+    assert _key(_QEvent.Type.KeyPress, _Qt.Key.Key_Right)
+    assert _ar_node.log[-1] == ("arrow", (1.0, 11.0)), _ar_node.log[-1]
+    _n = len(_ar_node.log)
+    assert _key(_QEvent.Type.KeyPress, _Qt.Key.Key_Up, repeat=True)   # swallowed
+    assert len(_ar_node.log) == _n                                      # no event
+    assert not _key(_QEvent.Type.KeyPress, _Qt.Key.Key_A)               # not ours
+    # The slider applies in real time.
+    _ab.slider.setValue(10)
+    assert _ar_node.log[-1] == ("arrow", (5.0, 15.0)), _ar_node.log[-1]
+    # So does the Rotation slider: up at 10 N + clockwise at 8 N.
+    _ab.turn_slider.setValue(8)
+    assert _ar_node.log[-1] == ("arrow", (2.0, 18.0)), _ar_node.log[-1]
+    _ab.turn_slider.setValue(5)
+    # Losing focus forgets every held key: a missed release can't keep thrust.
+    _ab._forget_keys()
+    assert _ar_node.log[-1] == ("arrow", (0.0, 0.0))
+    # OFF = hold where released: the boat's position as a manual target
+    # FIRST, then the release ([]).
+    w.store.robot.has_odom = True
+    w.store.robot.x, w.store.robot.y = 3.25, -1.5
+    _ar_node.log.clear()
+    _ab.set_active(False)
+    assert _ar_node.log == [("target", 3.25, -1.5), ("arrow", ())], _ar_node.log
+    assert w.store.mission.manual_target == (3.25, -1.5)
+    assert not w.toolbar.continue_button.isHidden()
+    # A START RUN ends arrow control WITHOUT a hold point.
+    _ab.set_active(True)
+    _ar_node.log.clear()
+    _ab.set_active(False, hold=False)
+    assert _ar_node.log == [("arrow", ())], _ar_node.log
+finally:
+    _ab.set_active(False, hold=False)
+    w._on_continue_mission()
+    w.store.mission.launch_running = False
+    w.store.mission.controller_type = ""
+    w.ros.node = _ar_saved_node
+    w._on_tick()
+print("arrow ok")
+
+# --- Run session protocol: configure / start / stop, gating, turn-off order --
+from mcs.models.store import DataStore as _RSStore
+from mcs.models.store import NextMission as _RSNext
+from mcs.ros.run_session import RunSession as _RunSession
+
+_rs_events: list = []
+
+
+class _RunNode:
+    matched = 1
+
+    def publish_run_command(self, payload: dict) -> None:
+        _rs_events.append(("run", dict(payload)))
+
+    def run_command_subscriber_count(self) -> int:
+        return self.matched
+
+    def input_str_subscriber_count(self) -> int:
+        return 1
+
+    def publish_input_str(self, command: str) -> None:
+        _rs_events.append(("input", command))
+
+
+class _RunLauncher:
+    state = "running"
+
+    def stop(self) -> None:
+        _rs_events.append(("terminate",))
+
+
+_rs_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_rs_"))
+try:
+    _rs_cfg = AppConfig()
+    _rs_cfg.launch.session_trajectory_file = str(_rs_dir / ".session" / "run.yaml")
+    _rs_cfg.run.ack_timeout_s = 0.3
+    _rs_cfg.estop_confirm_timeout_s = 0.2
+    _rs_cfg.estop_flush_delay_s = 0.02
+    _rs_src = io_yaml.save_mission(_rs_dir, "lawn", _sl_m, _sl_s)
+    _rs_bus = SignalBus()
+    _rs_store = _RSStore(_rs_cfg)
+    _rs_cc = CommandCenter(_rs_cfg, _rs_bus, _StubRos(_RunNode()), _RunLauncher())
+    _rs = _RunSession(_rs_cfg, _rs_bus, _rs_store, _rs_cc)
+    _rs_previews: list = []
+    _rs.preview_requested.connect(_rs_previews.append)
+
+    # Launch: a session whose first run follows a placed (non-anchored) path.
+    _rs.begin(_LP(simulation=False, controller_type="LoS", use_pinger=False,
+                  note="dock test", session=True, session_source=str(_rs_src),
+                  enable_motors=True))
+    assert _rs_store.session.active and not _rs_store.mission.following
+    assert _rs.start_blockers() == ["master_control not reporting yet"]
+
+    def _state(**kw):
+        payload = {"state": "idle", "controller_type": "PID", "use_pinger": False,
+                   "note": "", "run": 0, "ok": True, "detail": "", "seq": None}
+        payload.update(kw)
+        _rs_bus.run_state_received.emit(time.monotonic(), payload)
+
+    # The first heartbeat makes the station send the mission settings.
+    _state()
+    _cfgs = [e[1] for e in _rs_events if e[0] == "run" and e[1]["cmd"] == "configure"]
+    assert len(_cfgs) == 1, _rs_events
+    assert _cfgs[0]["controller_type"] == "LoS" and _cfgs[0]["note"] == "dock-test"
+    # Not applied until master_control echoes them; odom/ready gate too.
+    assert "mission settings not applied yet" in _rs.start_blockers()
+    _rs_store.robot.has_odom = True
+    _rs_store.robot.controller_ready = True
+    _rs_store.robot.x, _rs_store.robot.y, _rs_store.robot.yaw = 4.0, 2.0, 1.0
+    _state(seq=_cfgs[0]["seq"], controller_type="LoS", note="dock-test")
+    assert _rs.start_blockers() == [], _rs.start_blockers()
+
+    # START RUN: path written at the boat BEFORE 'start' goes out.
+    _rs_events.clear()
+    assert _rs.start_run()
+    _start = [e[1] for e in _rs_events if e[0] == "run"]
+    assert [p["cmd"] for p in _start] == ["start"], _rs_events
+    _placed = io_yaml.read_first_point(Path(_rs_cfg.launch.session_trajectory_file))
+    assert _placed == (4.0, 2.0), _placed
+    assert _rs_previews[-1] == f"from_yaml:{_rs_cfg.launch.session_trajectory_file}"
+    # Recording starts with the command, before the acknowledgement.
+    assert _rs_store.recording() and _rs_store.session.run_pending == "start"
+    _rs_store.on_odom(time.monotonic(), [4.0, 2.0, 0, 0, 0, 1.0], [0] * 6)
+    assert len(_rs_store.robot_track) == 1
+    _state(seq=_start[0]["seq"], state="running", run=1,
+           controller_type="LoS", note="dock-test")
+    assert _rs_store.session.run_active and _rs_store.session.run == 1
+    assert _rs.start_blockers() == ["a run is active"]
+    assert not _rs.can_update()
+
+    # STOP RUN: recording freezes at once; the next run is placed afresh.
+    _rs_events.clear()
+    assert _rs.stop_run()
+    assert [e[1]["cmd"] for e in _rs_events if e[0] == "run"] == ["stop"]
+    assert not _rs_store.recording()
+    _rs_store.on_odom(time.monotonic(), [9.0, 9.0, 0, 0, 0, 0.0], [0] * 6)
+    assert len(_rs_store.robot_track) == 1, "recorded between runs"
+    assert not Path(_rs_cfg.launch.session_trajectory_file).exists()
+    _state(seq=_rs_events[-1][1]["seq"], state="idle", run=1,
+           controller_type="LoS", note="dock-test")
+    assert not _rs_store.session.run_active and _rs.can_update()
+
+    # A refused start (e.g. master_control still loading) reverts cleanly.
+    _rs_events.clear()
+    assert _rs.start_run()
+    _sq = _rs_events[-1][1]["seq"]
+    _state(seq=_sq, ok=False, state="idle", detail="controller not ready (loading)",
+           run=1, controller_type="LoS", note="dock-test")
+    assert not _rs_store.session.run_active and not _rs_store.session.run_pending
+
+    # Update Mission: pinger + PID for the next run -> a new configure.
+    _rs_events.clear()
+    _rs.update_mission(_RSNext(use_pinger=True, controller_type="PID"))
+    _cf = [e[1] for e in _rs_events if e[0] == "run"]
+    assert _cf and _cf[-1]["cmd"] == "configure" and _cf[-1]["use_pinger"] is True
+    assert "mission settings not applied yet" in _rs.start_blockers()
+    _state(seq=_cf[-1]["seq"], controller_type="PID", use_pinger=True, run=1)
+    assert _rs.start_blockers() == []
+
+    # master_control restarted: its heartbeat echoes no command any more, so
+    # the station sends its settings again rather than trusting a stale ack.
+    _rs_events.clear()
+    _state(seq=None, controller_type="PID", use_pinger=False)
+    _again = [e[1] for e in _rs_events if e[0] == "run"]
+    assert [p["cmd"] for p in _again] == ["configure"], _rs_events
+    assert _again[0]["use_pinger"] is True
+    _state(seq=_again[0]["seq"], controller_type="PID", use_pinger=True, run=1)
+    assert _rs.start_blockers() == []
+
+    # E-STOP latched: START RUN waits for Release E-STOP.
+    _rs_cc.emergency_stop()
+    assert _rs_cc.estop_latched
+    assert any("E-STOP" in r for r in _rs.start_blockers())
+    _rs_events.clear()
+    _rs_cc.release_estop()
+    assert _rs_events == [("input", "enable")] and not _rs_cc.estop_latched
+
+    # Turn Off Connection with a run active: 'stop' (run) BEFORE 'default'
+    # and before any termination.
+    _rs.start_run()
+    _state(seq=_rs_events[-1][1]["seq"], state="running", run=2,
+           controller_type="PID", use_pinger=True)
+    _rs_events.clear()
+    _rs_cc.safe_stop_mission()
+    assert _pump(lambda: ("terminate",) in _rs_events, 2.0), _rs_events
+    _order = [e if e[0] != "run" else ("run", e[1]["cmd"]) for e in _rs_events]
+    assert _order.index(("run", "stop")) < _order.index(("input", "default")) \
+        < _order.index(("terminate",)), _order
+
+    _rs.end()
+    assert not _rs_store.session.active and _rs_store.recording()
+finally:
+    shutil.rmtree(_rs_dir, ignore_errors=True)
+print("run session ok")
+
+# --- The map's circled "S" sits on the first point of the path -------------
+w.store.mission.simulation = True          # non-GPS sim: identity anchor
+w.store.mission.launch_running = True
+w.store.mission_path = np.array([[2.0, 3.0, 0.0], [5.0, 3.0, 0.0]])
+w.map_view.refresh()
+assert w.map_view.start_marker.isVisible()
+assert w.map_view.start_marker.scene_pos() == w.map_view._to_scene(2.0, 3.0)
+w.map_view.set_layer_visible("mission_path", False)
+w.map_view.refresh()
+assert not w.map_view.start_marker.isVisible()      # follows the path layer
+w.map_view.set_layer_visible("mission_path", True)
+w.store.mission_path = None
+w.map_view.refresh()
+assert not w.map_view.start_marker.isVisible()
+w.store.mission.simulation = False
+w.store.mission.launch_running = False
+print("start marker ok")
+
+# --- Window in a session: RUN box, toolbar labels, Release E-STOP ----------
+_ws_saved_state = w.launcher._state
+try:
+    assert w.run_panel.isHidden()                     # no session: no RUN box
+    w.store.session.active = True
+    w.launcher._state = "running"
+    w._on_tick()
+    assert not w.run_panel.isHidden()
+    assert w.toolbar.launch_button.text() == "Update Mission"
+    assert w.toolbar.stop_button.text() == "Turn Off Connection"
+    assert w.toolbar.continue_button.text() == "Release Target"     # no run
+    assert not w.run_panel.button.isEnabled()          # nothing reported yet
+    assert w.toolbar.release_estop_button.isHidden()
+    w.toolbar.set_session_ui(True, release_visible=True)
+    assert not w.toolbar.release_estop_button.isHidden()
+    w.toolbar.set_session_ui(True, run_active=True)
+    assert w.toolbar.continue_button.text() == "Continue Original Mission"
+finally:
+    w.store.session.active = False
+    w.launcher._state = _ws_saved_state
+    w._on_tick()
+assert w.toolbar.launch_button.text() == "Launch Mission"
+assert w.toolbar.stop_button.text() == "Stop Mission"
+assert w.run_panel.isHidden()
+print("session window ok")
+
+# --- Bag replay of a recorded run (v1.1): "From a ros2bag" ---
+# Replay_launch.py declares bag / rate / world_dir: exactly those, extra args
+# last, no companion (the replayed boat feels no sea), and the bag folder is
+# resolved from a run folder. The RUN box reports the run's bag.
+from mcs.core import replay as _rp
+from mcs.core.worlds import eligible_worlds_for_track as _ewft
+from mcs.ros.launch_manager import LaunchParameters as _RLP
+from mcs.ros.launch_manager import companion_command as _rcomp
+from mcs.ros.launch_manager import launch_target as _rtarget
+
+_rlp = _RLP(simulation=True, replay_bag="/d/run/x-bag", replay_rate=2.0,
+            extra_args={"heave": "false"})
+assert _rlp.to_cli() == ["bag:=/d/run/x-bag", "rate:=2", "heave:=false"]
+_rlp.world_dir = "/w/pA/w1"
+assert _rlp.to_cli()[:3] == ["bag:=/d/run/x-bag", "rate:=2", "world_dir:=/w/pA/w1"]
+assert _rtarget(cfg.launch, _rlp) == (cfg.launch.package, cfg.launch.replay_launch_file)
+assert _rcomp(cfg, _rlp) is None
+assert _rcomp(cfg, _RLP(simulation=True)) is not None      # live sim unchanged
+
+with tempfile.TemporaryDirectory() as _rd:
+    _run = Path(_rd) / "2026_10_13-10_00_00-t-poslog"
+    _bagd = _run / "2026_10_13-10_00_00-t-bag"
+    _bagd.mkdir(parents=True)
+    assert _rp.find_bag(_run) is None                  # no metadata yet
+    (_bagd / "metadata.yaml").write_text(
+        "rosbag2_bagfile_information:\n  version: 9\n  storage_identifier: mcap\n"
+        "  duration: {nanoseconds: 125000000000}\n"
+        "  starting_time: {nanoseconds_since_epoch: 1791864654745326267}\n"
+        "  message_count: 3\n  topics_with_message_count:\n"
+        "    - {topic_metadata: {name: /mavros/local_position/odom, type: nav_msgs/msg/Odometry}, message_count: 2}\n"
+        "    - {topic_metadata: {name: /mavros/global_position/global, type: sensor_msgs/msg/NavSatFix}, message_count: 1}\n")
+    assert _rp.find_bag(_run) == _bagd and _rp.find_bag(_bagd) == _bagd
+    _sum = _rp.bag_summary(_bagd)
+    assert _sum is not None and abs(_sum.duration_s - 125.0) < 1e-6
+    assert _sum.has_pose and _sum.has_gps and "2:05" in _sum.describe()
+    assert _rp.bag_gps_track(_bagd) == []              # not a real mcap: no track, no raise
+
+    # The dialog: Source "From a ros2bag" hides the controller rows and returns
+    # replay parameters; an empty folder is refused with a reason.
+    _rdlg = LaunchDialog(cfg, None)
+    _rdlg._mode.setCurrentText("Gazebo simulation")
+    _rdlg._source.setCurrentText("From a ros2bag")
+    assert not _rdlg._controller.isVisibleTo(_rdlg) and _rdlg._bag_row.isVisibleTo(_rdlg)
+    _rdlg._bag.setText(str(_run))
+    assert _rdlg.bag_problem() == ""
+    _rpar = _rdlg.parameters()
+    assert _rpar.simulation and _rpar.replay_bag == str(_bagd)
+    assert _rpar.replay_rate == cfg.replay.default_rate and _rpar.controller_type == ""
+    _rdlg._bag.setText(_rd)                    # the bag is two levels down
+    assert "no ros2bag" in _rdlg.bag_problem()
+    _rdlg._bag.setText(str(Path(_rd) / "nowhere"))
+    assert "no ros2bag" in _rdlg.bag_problem()
+    _rdlg._source.setCurrentText("Controller")
+    assert _rdlg._controller.isVisibleTo(_rdlg) and _rdlg.bag_problem() == ""
+    _rdlg.deleteLater()
+assert _ewft(Path(cfg.launch.worlds_root), []) == []
+
+assert _rp.command_json("pause") == '{"cmd": "pause"}'
+assert _json_sea.loads(_rp.command_json("rate", 2))["rate"] == 2.0
+for _bad in (("seek", None), ("rate", None), ("rate", -1.0)):
+    try:
+        _rp.command_json(*_bad)
+        raise AssertionError(f"accepted {_bad}")
+    except ValueError:
+        pass
+
+# The window in replay mode: map waits for a GPS anchor, the REPLAY box shows
+# (the SEA STATE box does not), Manual Target and the mode toggle are greyed.
+_rm = w.store.mission
+_r_saved = (_rm.launch_running, _rm.simulation, _rm.replay, _rm.gps_simulated)
+try:
+    _rm.launch_running, _rm.simulation, _rm.replay, _rm.gps_simulated = True, True, True, False
+    w.store.reset_georeference()
+    assert not w.store.map_frame_ready()
+    w._on_tick()
+    assert not w.replay_box.isHidden() and w.sea_box.isHidden()
+    assert w.replay_box._values["Status"].text().startswith("waiting")
+    assert not w.toolbar.manual_button.isEnabled() and not w.toolbar.mode_button.isEnabled()
+    w.store.on_replay_state(time.monotonic(), {
+        "bag": "/d/run/x-bag", "t": 61.0, "duration": 122.0, "rate": 2.0,
+        "paused": True, "finished": False, "frame": "empty", "world": "ocean",
+        "gazebo": True})
+    w._on_tick()
+    assert w.replay_box._values["Time"].text() == "1:01 / 2:02"
+    assert w.replay_box.pause_btn.text() == "Resume"
+    assert w.replay_box.progress.value() == 500
+    assert w.replay_box.rate.currentData() == 2.0
+    _rq = []
+    w.replay_box.pause_requested.connect(_rq.append)
+    w.replay_box.pause_btn.click()
+    assert _rq == [False]                            # paused -> resume
+finally:
+    _rm.launch_running, _rm.simulation, _rm.replay, _rm.gps_simulated = _r_saved
+    w.store.replay = None
+    w._on_tick()
+assert w.replay_box.isHidden() and w.toolbar.manual_button.isEnabled()
+
+# RUN box: the run's bag, from robot_interface's additive run_log fields.
+_rss = w.store.session
+_r_log, _r_active = dict(_rss.log), _rss.run_active
+try:
+    _rss.log = {"run": 1, "logging": True, "csv": "/r/a-poslog.csv",
+                "bag_enabled": True, "bag_recording": True, "bag": "/r/.run-bag-1-1"}
+    assert w.run_session.status().bag == "recording"
+    _rss.log = {"run": None, "logging": False, "csv": "/r/a-poslog.csv",
+                "bag_enabled": True, "bag_recording": False,
+                "bag": "/r/a-poslog/a-bag"}
+    assert w.run_session.status().bag == "saved: a-bag"
+    _rss.run_active = True
+    assert w.run_session.status().bag_color == "err"     # run without a bag
+    _rss.log = {"bag_enabled": False}
+    assert w.run_session.status().bag.startswith("off")
+    _rss.log = {"run": None, "logging": False, "csv": ""}  # pre-v1.1 control stack
+    assert w.run_session.status().bag == "—"
+finally:
+    _rss.log, _rss.run_active = _r_log, _r_active
+print("replay ok")
 
 w.close()
 print("window ok")

@@ -7,6 +7,9 @@ Sections (all collapsible):
 * **Pinger** — world & robot-frame coordinates, live distance, last update.
 * **Target** — robot↔pinger or robot↔path distance depending on mode.
 * **ROS diagnostics** — per-topic rate / age / LED status.
+* **RUN** (real-robot run session only) — pinned below the scroll area, so it
+  sits under ROS DIAGNOSTICS and never scrolls away: START RUN / STOP RUN and
+  the run's status (``mcs/gui/run_panel.py``, hosted via :meth:`set_footer`).
 
 The panel is read-only except for the checkboxes; all values are pulled
 from the :class:`~mcs.models.store.DataStore` on the shared 10 Hz tick.
@@ -65,6 +68,8 @@ class LeftPanel(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        self._outer = outer
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         outer.addWidget(scroll)
@@ -196,6 +201,8 @@ class LeftPanel(QWidget):
             checks.append(s.robot.controller_ready)
         ready = sum(checks)
         label = "operational" if ready == len(checks) else "starting"
+        if s.session.active and ready == len(checks):
+            label = "run active" if s.session.run_active else "idle, no run"
         suffix = " (sim)" if s.mission.simulation else ""
         color = theme.OK if ready == len(checks) else theme.WARN
         return f"{label} ({ready}/{len(checks)}){suffix}", color
@@ -232,6 +239,10 @@ class LeftPanel(QWidget):
         self._diag_grid.addWidget(name, row, 1)
         self._diag_grid.addWidget(value, row, 2)
         self._diag_rows[topic] = (led, name, value)
+
+    def set_footer(self, widget: QWidget) -> None:
+        """Pin *widget* below the scroll area (the run session's RUN box)."""
+        self._outer.addWidget(widget)
 
     def set_satellite_available(self, available: bool) -> None:
         box = self._layer_boxes["satellite"]

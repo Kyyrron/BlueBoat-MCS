@@ -104,6 +104,8 @@ __`build.sh` does ros2 colcon build -> sources env.sh -> starts MCS App in one g
 * Distance plot, mission timeline (freeze the display while recording
   continues), windowed mission statistics, filterable launch console.
 * Three separate stop actions: E-STOP, E-STOP + Stop Override, Stop Mission.
+* Replay of a recorded real-robot run in Gazebo ("From a ros2bag"): the boat moves
+  exactly as it did in the water, with pause and playback rate.
 * Survey Pattern Designer: draw or generate survey patterns, anchor them to real
   GPS coordinates, export them as trajectory files the control stack follows.
 
@@ -123,7 +125,10 @@ The buttons that matter:
 
 * **Launch Mission** — a dialog for controller, trajectory, pinger and motors
   (motor enable is always re-confirmed). Simulation runs add a world dialog and a
-  sea-state dialog.
+  sea-state dialog. In *Gazebo simulation*, **Source ▸ From a ros2bag** replays a
+  recorded real-robot run instead: pick its `Robot_data` folder, and the simulated
+  boat moves exactly as it did in the water (the REPLAY box pauses it or changes
+  the speed). Every real-robot run records that bag automatically, next to its CSV.
 * **Manual Target** — press it, then click the map once; that point is published
   as the boat's target and the button disarms itself. **Continue Original
   Mission** hands control back to the mission.

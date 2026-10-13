@@ -4,8 +4,11 @@ Buttons (left → right):
 
 * **Launch Mission** — opens the configuration dialog, then starts
   ``ros2 launch`` through the :class:`~mcs.ros.launch_manager.LaunchManager`.
+  In a connected real-robot **run session** it reads **Update Mission** and
+  opens the small next-run window instead (between runs only).
 * **Stop Mission** — graceful SIGINT-first shutdown; the station stays open.
-  The ONLY button here that ends the mission.
+  The ONLY button here that ends the mission. In a real-robot run session it
+  reads **Turn Off Connection** (an active run is stopped first).
 * **E-STOP** — publishes ``stop``: ``robot_interface`` zeroes the thrust, closes
   the motor gate, disarms and latches. Leaves the parameter mode alone and
   leaves every node running.  Never disabled while ROS is up.
@@ -13,10 +16,14 @@ Buttons (left → right):
   confirmation sequence, handing the servo mapping back. Also leaves the nodes
   running: it used to terminate them, which made "give the mapping back" and
   "end the mission" impossible to ask for separately.
+* **Release E-STOP** — appears only while a run session's E-STOP is latched
+  and the session was launched with motors enabled; publishes ``enable``.
 * **Publish Default/Override Control Mode** — alternates the two commands.
 * **Manual Target** / **Continue Original Mission** — Manual Target arms the
   next map click and publishes nothing by itself; only Continue Original
-  Mission publishes the ``[0.0, 0.0]`` resume sentinel (CLAUDE.md N2).
+  Mission publishes the ``[0.0, 0.0]`` resume sentinel (CLAUDE.md N2). Between
+  the runs of a session there is no mission to continue: the same button
+  reads **Release Target** (the boat then holds zero thrust).
 * **Measure** — toggles the distance tool.
 * A one-line launch console + launch state LED.
 """
@@ -52,6 +59,7 @@ class BottomToolbar(QWidget):
     create_pattern_clicked = Signal()
     mission_launched = Signal(object)   # LaunchParameters
     mission_stopped = Signal()
+    update_mission_requested = Signal()  # run session: open the next-run window
 
     def __init__(self, cfg: AppConfig, bus: SignalBus, launcher: LaunchManager,
                  commands: CommandCenter, parent: QWidget | None = None) -> None:
@@ -60,6 +68,7 @@ class BottomToolbar(QWidget):
         self._bus = bus
         self._launcher = launcher
         self._commands = commands
+        self._session_active = False      # a real-robot run session is launched
 
         outer = QVBoxLayout(self)
         self.setSizePolicy(
@@ -116,6 +125,22 @@ class BottomToolbar(QWidget):
             "One click, no confirmation dialog.")
         self.estop_button.clicked.connect(self._commands.emergency_stop)
         row.addWidget(self.estop_button)
+
+        # Shown only while a run session's E-STOP is latched (see
+        # set_session_ui); its footprint is reserved meanwhile so the toolbar
+        # never reflows when it appears.
+        self.release_estop_button = QPushButton("Release E-STOP")
+        self.release_estop_button.setObjectName("releaseEstopButton")
+        self.release_estop_button.setToolTip(
+            "Publish 'enable': clears robot_interface's E-STOP latch and turns "
+            "the motor gate back ON. After E-STOP + Stop Override, also publish "
+            "'override' with the mode button to take the thrusters back.")
+        self.release_estop_button.clicked.connect(self._commands.release_estop)
+        self.release_estop_button.setVisible(False)
+        policy = self.release_estop_button.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.release_estop_button.setSizePolicy(policy)
+        row.addWidget(self.release_estop_button)
 
         self.mode_button = QPushButton()
         self.mode_button.clicked.connect(self._on_mode_toggle)
@@ -202,6 +227,7 @@ class BottomToolbar(QWidget):
             self.stop_button,
             self.estop_button,
             self.estop_kill_button,
+            self.release_estop_button,
             self.mode_button,
             self.manual_button,
             self.continue_button,
@@ -223,6 +249,10 @@ class BottomToolbar(QWidget):
 
     # ================================================================ actions
     def _on_launch(self) -> None:
+        if self._session_active:
+            # The button reads "Update Mission" while a session is connected.
+            self.update_mission_requested.emit()
+            return
         dialog = LaunchDialog(self._cfg, self._launcher.last_parameters, self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -243,6 +273,32 @@ class BottomToolbar(QWidget):
         # simulator's mavros shim owns the GPS feed (the station's SimGps
         # stays disarmed — see MainWindow._on_mission_launched) and
         # full_mission_launch.py declares no spawn_yaw.
+        if params.replay_bag:
+            # Replay of a recorded run: the personalized worlds its GPS track
+            # touches. No sea-state dialog: the recording already holds the
+            # real sea, and the replayed boat feels no force.
+            from pathlib import Path
+
+            from mcs.core.replay import bag_gps_track
+            from mcs.core.worlds import eligible_worlds_for_track
+            track = bag_gps_track(params.replay_bag,
+                                  self._cfg.replay.world_track_points)
+            worlds = eligible_worlds_for_track(
+                Path(self._cfg.launch.worlds_root), track)
+            if worlds:
+                from mcs.gui.dialogs.world_dialog import WorldChoiceDialog
+                wdlg = WorldChoiceDialog(worlds, self, intro_text=(
+                    f"This recorded run took place inside {len(worlds)} "
+                    "personalized world(s). Replay it inside one of them (the "
+                    "boat placed at its recorded GPS position in the world's "
+                    "geometry), or in the empty Gazebo world (in the run's "
+                    "own launch frame)."))
+                if wdlg.exec() != wdlg.DialogCode.Accepted:
+                    return
+                params.world_dir = wdlg.selected_world_dir or ""
+            if self._launcher.start(params):
+                self.mission_launched.emit(params)
+            return
         if params.simulation and params.gps_simulated \
                 and params.gps_anchored_source:
             from pathlib import Path
@@ -299,12 +355,69 @@ class BottomToolbar(QWidget):
         """Show 'Continue Original Mission' while a manual target is active."""
         self.continue_button.setVisible(active)
 
+    def set_replay_ui(self, replaying: bool) -> None:
+        """A bag replay has no controller to command: Manual Target and the
+        Default/Override toggle are greyed while one runs."""
+        if replaying and self.manual_button.isChecked():
+            self.manual_button.setChecked(False)
+        for button in (self.manual_button, self.mode_button):
+            if button.isEnabled() == replaying:
+                button.setEnabled(not replaying)
+
+    def set_session_ui(self, active: bool, can_update: bool = False,
+                       run_active: bool = False,
+                       release_visible: bool = False) -> None:
+        """Relabel the mission buttons for a real-robot run session.
+
+        Called on the shared tick. Outside a session (no launch, or Gazebo)
+        every label is the v1.0 one."""
+        launching = self._launcher.state in ("starting", "running")
+        self._session_active = active and launching
+        if self._session_active:
+            text, enabled = "Update Mission", can_update
+            tip = ("Choose the next run's path or pinger, controller and log "
+                   "note (between runs only).")
+        else:
+            text, enabled = "Launch Mission", self._launcher.state == "idle"
+            tip = "Configure and start a mission."
+        if self.launch_button.text() != text:
+            self.launch_button.setText(text)
+            self.launch_button.setToolTip(tip)
+        self.launch_button.setEnabled(enabled)
+
+        stop_text = "Turn Off Connection" if self._session_active else "Stop Mission"
+        if self.stop_button.text() != stop_text:
+            self.stop_button.setText(stop_text)
+            self.stop_button.setToolTip(
+                ("Stop a run still active, publish 'default' and wait for the "
+                 "boat to leave override, then shut every node down.")
+                if self._session_active else
+                ("Publishes 'default' on /blueboat/input_str, waits for "
+                 "confirmed transmission, then gracefully stops every launched "
+                 "node."))
+
+        self.release_estop_button.setVisible(self._session_active and release_visible)
+
+        # Between the runs of a session there is no original mission to
+        # continue: the [0, 0] sentinel just releases the target.
+        cont = ("Release Target" if self._session_active and not run_active
+                else "Continue Original Mission")
+        if self.continue_button.text() != cont:
+            self.continue_button.setText(cont)
+            self.continue_button.setToolTip(
+                "Publish the [0.0, 0.0] manual target: master_control resumes "
+                "the original mission. This button does nothing else."
+                if cont.startswith("Continue") else
+                "Publish the [0.0, 0.0] manual target: the boat stops holding "
+                "the target and keeps zero thrust (no run is active).")
+
     # ================================================================ feedback
     def _on_launch_state(self, state: str) -> None:
         led = {"idle": "never", "starting": "warn",
                "running": "ok", "stopping": "warn"}.get(state, "warn")
         self._launch_led.set_status(led)
-        self.launch_button.setEnabled(state == "idle")
+        if not self._session_active:
+            self.launch_button.setEnabled(state == "idle")
         self.stop_button.setEnabled(state in ("starting", "running"))
 
     def _on_launch_output(self, line: str) -> None:
@@ -321,7 +434,8 @@ class BottomToolbar(QWidget):
         self._refresh_mode_button()
 
     def _on_estop_state(self, state: str) -> None:
-        text = {"estop": "E-STOP: 'stop' published, awaiting robot ack…",
+        text = {"estop-released": "E-STOP released: 'enable' published",
+                "estop": "E-STOP: 'stop' published, awaiting robot ack…",
                 "estop-confirmed": "E-STOP: confirmed — thrust cut and latched",
                 "estop-timeout": "E-STOP: published, no ack (check robot_interface)",
                 "estop-sim": "E-STOP: simulation — no robot to acknowledge",

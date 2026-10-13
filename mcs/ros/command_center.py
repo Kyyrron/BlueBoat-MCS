@@ -11,8 +11,20 @@ Action                       Publishes                  Terminates the launch?
 ===========================  =========================  ===========================
 E-STOP                       ``stop``                   **no**
 E-STOP + Stop Override       ``stop`` then ``default``  **no**
+Release E-STOP               ``enable``                 **no**
 Stop Mission / App Exit      ``default``                yes, after confirmation
+(Turn Off Connection in a
+real-robot run session)
 ===========================  =========================  ===========================
+
+In a run session (real-robot launches since 2026-10-09) the two terminating
+paths first end a run that is still active (``stop`` on
+``/blueboat/run_command``, so its CSV is closed and filed by the control stack
+rather than by the teardown), then run the same sequence, unchanged.
+``Release E-STOP`` exists because a session stays connected between runs: it
+publishes ``enable``, the only token that clears ``robot_interface``'s latch --
+which also re-opens the motor gate, so the station offers it only in a session
+launched with motors enabled.
 
 ``stop`` is what an emergency stop should be: ``robot_interface`` zeroes the thrust,
 disables the motor gate, disarms and **latches** until an explicit ``enable``, all
@@ -81,6 +93,7 @@ asynchronous callers (Application Exit) can proceed.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from enum import Enum, auto
 
 from PySide6.QtCore import QObject, QTimer
@@ -136,10 +149,18 @@ class CommandCenter(QObject):
         # in _phase: the panic button must never be blocked by, and must never
         # block, an in-flight 'default' sequence.
         self._estop_pending = False
+        # Latched since the last 'stop' this station published, until it
+        # publishes 'enable' (Release E-STOP). What the robot really holds is
+        # confirmed by controller_ready; this is the station's own record.
+        self._estop_latched = False
         self._estop_timer = QTimer(self)
         self._estop_timer.setSingleShot(True)
         self._estop_timer.timeout.connect(self._on_estop_timeout)
         bus.controller_ready_received.connect(self._on_controller_ready)
+
+        # Run sessions: called before a terminating sequence so an active run
+        # is stopped (and filed) first. Set by RunSession; None outside one.
+        self._before_terminate: Callable[[], None] | None = None
 
     # ------------------------------------------------------------- commands
     def _node(self):
@@ -209,6 +230,55 @@ class CommandCenter(QObject):
         node.publish_sea_state_command(payload)
         return True
 
+    def send_replay_command(self, cmd: str, rate: float | None = None) -> bool:
+        """Pause / resume / re-rate the Gazebo replay of a recorded run."""
+        from mcs.core.replay import command_json
+        node = self._ros.node
+        if node is None:
+            return False
+        node.publish_replay_command(command_json(cmd, rate))
+        return True
+
+    # ---------------------------------------------------------- run sessions
+    def send_run_command(self, payload: dict) -> bool:
+        """Publish one run-session command on /blueboat/run_command."""
+        node = self._node()
+        if node is None:
+            return False
+        try:
+            node.publish_run_command(payload)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            _LOG.error("run_command publish raised: %s", exc)
+            self._bus.ros_log.emit(f"Run command not sent: {exc}")
+            return False
+        return True
+
+    def run_command_subscriber_count(self) -> int:
+        """Matched master_control subscriptions; -1 when unknown."""
+        node = self._ros.node
+        if node is None:
+            return -1
+        try:
+            return int(node.run_command_subscriber_count())
+        except Exception:  # noqa: BLE001 - graph query is diagnostic only
+            return -1
+
+    def publish_arrow_thrust(self, right: float, left: float) -> None:
+        """Arrow-key stream tick: [right, left] N (silent when ROS is down)."""
+        node = self._ros.node
+        if node is not None:
+            node.publish_arrow_thrust([right, left])
+
+    def release_arrows(self) -> None:
+        """Release arrow control in master_control (an empty array)."""
+        node = self._ros.node
+        if node is not None:
+            node.publish_arrow_thrust([])
+
+    def set_before_terminate(self, hook: Callable[[], None] | None) -> None:
+        """Run-session hook called by the terminating paths before 'default'."""
+        self._before_terminate = hook
+
     def set_simulation_mode(self, simulation: bool) -> None:
         """Adapt the safe-shutdown sequence to the running graph.
 
@@ -251,6 +321,7 @@ class CommandCenter(QObject):
             return
 
         self._estop_pending = True
+        self._estop_latched = True
         self._bus.estop_state_changed.emit("estop")
         self._estop_timer.start(int(self._cfg.estop_confirm_timeout_s * 1000))
 
@@ -265,6 +336,28 @@ class CommandCenter(QObject):
         _LOG.warning("E-STOP + Stop Override triggered")
         self.emergency_stop()
         self.safe_shutdown(terminate_nodes=False, reason="Stop Override")
+
+    @property
+    def estop_latched(self) -> bool:
+        """True from a published 'stop' until 'enable' is published."""
+        return self._estop_latched
+
+    def release_estop(self) -> None:
+        """Release E-STOP: publish 'enable', the only token that clears
+        robot_interface's latch. It ALSO turns the motor gate back on
+        (release_estop -> set_motors(True)), so the GUI only offers it in a
+        session launched with motors enabled. It does not touch the parameter
+        mode: after E-STOP + Stop Override the boat is in 'default' and the
+        operator publishes 'override' again with the mode button."""
+        node = self._node()
+        if node is None:
+            return
+        _LOG.warning("Release E-STOP: publishing 'enable'")
+        node.publish_input_str("enable")
+        self._estop_latched = False
+        self._estop_pending = False
+        self._estop_timer.stop()
+        self._bus.estop_state_changed.emit("estop-released")
 
     def _on_controller_ready(self, _t: float, ready: bool) -> None:
         """robot_interface withdraws readiness the instant it latches the stop."""
@@ -287,14 +380,26 @@ class CommandCenter(QObject):
     # ------------------------------------------------------- shutdown paths
 
     def safe_stop_mission(self) -> None:
-        """Stop Mission button: guarantee 'default' before graceful teardown."""
+        """Stop Mission / Turn Off Connection: guarantee 'default' before
+        graceful teardown (an active run is stopped first, in a session)."""
         _LOG.info("Stop Mission requested — running safe-shutdown sequence")
+        self._stop_active_run()
         self.safe_shutdown(terminate_nodes=True, reason="Stop Mission")
 
     def safe_app_exit(self) -> None:
         """Application Exit with a mission running: same guarantee."""
         _LOG.info("Application exit requested — running safe-shutdown sequence")
+        self._stop_active_run()
         self.safe_shutdown(terminate_nodes=True, reason="Application Exit")
+
+    def _stop_active_run(self) -> None:
+        hook = self._before_terminate
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as exc:  # noqa: BLE001 - never blocks the shutdown
+            _LOG.error("stopping the active run before shutdown failed: %s", exc)
 
     # ------------------------------------------------------------- sequence
     def safe_shutdown(self, terminate_nodes: bool, reason: str) -> None:

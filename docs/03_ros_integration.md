@@ -19,7 +19,10 @@ defaults below match the stack as provided.
 | `/thruster_input` | `Float32MultiArray[2]` `[right, left]` (N) | `master_control.py` | Motor command display and history |
 | `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface.py` | Mission-readiness aggregation |
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set.py` | Confirmation echo of `default`/`override`; E-STOP acknowledgement |
-| `/sim/sea_state` | `std_msgs/String` (JSON) | BlueBoat-SSS-Sim `sea_state_node` | **Simulation only.** The live sea situation (current preset / mean and instantaneous speed / from-bearing, wave preset / Hs / Tp / from-bearing / surface elevation / status, next scheduled change, summary) shown in the floating SEA STATE box (top-left of the map view). Subscribed **TRANSIENT_LOCAL depth 1** to match the node's latched publisher, so a station started after the simulator still gets the current situation at once |
+| `/blueboat/run_state` | `std_msgs/String` (JSON) | `master_control.py` | **Real-robot run session only.** `{seq, ok, detail, state: idle/loading/running/error, controller_type, use_pinger, note, mission, run, npy}`: the answer to every run command (`seq`) and a 1 Hz heartbeat. Drives the RUN box and START RUN's gating; it is the truth about whether a run is active |
+| `/blueboat/run_log` | `std_msgs/String` (JSON) | `robot_interface.py` | **Real-robot run session only.** `{run, logging, csv, layout, bag_enabled, bag_recording, bag}`, 1 Hz: confirms the run's position CSV is being written (RUN box "Log" row; flagged if a started run is not confirmed within 3 s) and, since v1.1, its ros2bag (RUN box "Bag" row, flagged the same way; the `bag_*` fields are absent from an older control stack) |
+| `/replay/state` | `std_msgs/String` (JSON) | `bag_replay` (BlueBoat-Control) | **Bag replay only (v1.1).** `{bag, t, duration, rate, paused, finished, frame, world, world_offset, pose_source, gazebo}` at 2 Hz → the floating REPLAY box. Subscribed **TRANSIENT_LOCAL depth 1**, like the sea state |
+| `/sim/sea_state` | `std_msgs/String` (JSON) | BlueBoat-SSS-Sim `sea_state_node` | **Simulation only.** The live sea situation (current mean / instantaneous speed and direction at the boat / variation level, waves strength / Hs / Tp / from-bearing / status / passing wake, the boat's roll / pitch / heave std over 30 s, next planned change or blend progress, summary) shown in the floating SEA STATE box (top-left of the map view). Subscribed **TRANSIENT_LOCAL depth 1** to match the node's latched publisher, so a station started after the simulator still gets the current situation at once |
 
 ## Published commands
 
@@ -28,9 +31,13 @@ defaults below match the stack as provided.
 | `/blueboat/input_str` | `std_msgs/String` | `"default"` | `robot_interface.str_input_callback` → forwarded to `param_set` → safe parameters; echoed on `/blueboat/param_mode`. Published by **Stop Mission** / app exit (the safe-shutdown sequence), by **E-STOP + Stop Override**, and by the Default/Override toggle. **Not** by E-STOP alone. |
 | `/blueboat/input_str` | `std_msgs/String` | `"override"` | Direct-control parameters; the other state of the toggle button. |
 | `/blueboat/input_str` | `std_msgs/String` | `"stop"` | **The emergency primitive.** `robot_interface.full_stop()` zeroes the thrust, closes the motor gate, disarms and **latches** until an explicit `enable`. Stays in override and terminates nothing. Published by both E-STOP buttons. |
+| `/blueboat/input_str` | `std_msgs/String` | `"enable"` | `robot_interface.release_estop()`: clears the E-STOP latch **and turns the motor gate on**. Published by **Release E-STOP**, offered only in a run session launched with motors enabled, while the latch is on. |
 | `/blueboat/manual_target` | `Float32MultiArray[2]` | `[x, y]` world metres | `master_control` steers to it with LoS, overriding the mission. |
-| `/blueboat/manual_target` | `Float32MultiArray[2]` | `[0.0, 0.0]` | Sentinel: `master_control` resumes the original mission. Published **only** by the explicit **Continue Original Mission** action (`main_window._on_continue_mission`); arming or disarming Manual Target publishes nothing, and a genuine origin click is nudged by `1e-3` (N2). |
-| `/sim/sea_state/command` | `std_msgs/String` (JSON) | `{"current": {"preset": "strong", "from_deg": 90}, "waves": {"preset": "slight", "from_deg": 45}, "ramp_s": 20}` or `{"schedule": <blueboat_sea_schedule/1>, "t0": "now"}` | **Simulation only.** "Modify situation…" in the floating SEA STATE box; the simulator ramps to the new situation, never steps. |
+| `/blueboat/manual_target` | `Float32MultiArray[2]` | `[0.0, 0.0]` | Sentinel: `master_control` resumes the original mission (between the runs of a session: just releases the target). Published **only** by the explicit **Continue Original Mission** / **Release Target** action (`main_window._on_continue_mission`); arming or disarming Manual Target publishes nothing, and a genuine origin click is nudged by `1e-3` (N2). Turning arrow control off publishes the boat's own position here (hold where released). |
+| `/blueboat/run_command` | `std_msgs/String` (JSON) | `{"cmd": "configure", "controller_type": "PID", "use_pinger": false, "note": "dock", "mission": "lawn_a", "seq": 7}` · `{"cmd": "start", "seq": 8}` · `{"cmd": "stop", "seq": 9}` | **Real-robot run session only** (`master_control`). `configure` sets the next run (refused during a run; MPC with the pinger refused; MPC built on a worker thread → `state: loading`), `start` starts following + logging (refused unless `state: idle`), `stop` ends the run. `configure` is re-sent until acknowledged; `start` / `stop` are sent once (RUN box, Turn Off Connection). |
+| `/blueboat/arrow_thrust` | `Float32MultiArray` | `[right, left]` N, or `[]` | ARROW CONTROL box, 20 Hz while on (`[0, 0]` with no key held); `[]` releases. `master_control` gives it priority over every branch, freezes `tau` (a run is paused) and keeps logging the last target; a gap longer than `arrow_timeout` (0.5 s) commands zero and stays in arrow control. Any manual target also releases it. Both graphs (simulation too). |
+| `/replay/command` | `std_msgs/String` (JSON) | `{"cmd": "pause"}` · `{"cmd": "resume"}` · `{"cmd": "rate", "rate": 2.0}` | **Bag replay only (v1.1).** The REPLAY box's Pause/Resume and rate combo; `bag_replay` freezes or re-paces its bag clock (the boat holds its pose while paused). |
+| `/sim/sea_state/command` | `std_msgs/String` (JSON) | `{"current": {"speed_mps": 0.3, "from_deg": 0, "variation": "natural"}, "waves": {"preset": "smooth", "from_deg": 45, "crest": "short", "wakes": "occasional"}, "ramp_s": 20}` (a disabled card sends `{"preset": "none"}` / `{"preset": "calm"}`; a custom height sends `hs_m` + `tp_s: "auto"`) or `{"schedule": <blueboat_sea_schedule/1>, "t0": "now"}` | **Simulation only.** "Change sea state…" in the floating SEA STATE box; the simulator resolves the plain-language keys and ramps to the new situation, never steps. |
 
 Equivalent shell commands (what the buttons do):
 
@@ -47,9 +54,12 @@ origin is nudged to `(0.001, 0)` before publishing.
 
 `/path_request` (`blueboat_interfaces/RequestPath`): the station requests
 `linspace(0, total_time, n)` and renders the returned `nav_msgs/Path` as the
-mission-path layer. It is requested for a launch with a non-empty controller
-and `use_pinger:=False` (the launch file only starts `path_generation` in that
-case), and for the simulation.
+mission-path layer, with a circled **S** on its first point (where the run
+begins). In simulation it is requested at launch (path_generation always runs).
+In a real-robot run session it previews the session file: a GPS-anchored mission
+as soon as it is deployed (at connection, or after Update Mission), a non-anchored
+one only once START RUN has placed it at the boat; between runs of a placed
+mission the preview is cleared, and nothing is previewed in pinger mode.
 
 The request is **held until the map frame is anchored**
 (`MainWindow._on_tick` keeps it in `_pending_preview_trajectory` until
@@ -69,9 +79,64 @@ so depending on it would break every real-robot run (`CLAUDE.md` §3 N7).
 
 ```
 ros2 launch blueboat_control BlueBoat_launch.py \
-    enable_motors:=<bool> note:=<str> controller_type:=<''|PID|LoS|MPC> \
-    trajectory:=<name> use_pinger:=<bool> [extra:=args]
+    enable_motors:=<bool> trajectory:=from_yaml:<session file> \
+    use_pinger:=<bool> controller_type:=<PID|LoS|MPC> [note:=<str>] \
+    session_mode:=True [extra:=args]
 ```
+
+**Every real-robot launch is a run session (2026-10-09).** The boat connects and
+goes into override (`robot_interface`'s handshake, unchanged), then `master_control`
+**idles**: Manual Target and the arrow keys drive the boat, nothing follows a path or
+the pinger, `robot_interface` writes no CSV and `master_control` no `.npy`. The
+lifecycle, all on `/blueboat/run_command` / `/blueboat/run_state`:
+
+1. **Connect** — the first `run_state` heartbeat makes the station send `configure`
+   with the dialog's choices; START RUN waits for its acknowledgement.
+2. **START RUN** — the station writes the run's path into the session file
+   (`LaunchConfig.session_trajectory_file`, `~/.config/blueboat_mcs/trajectories/.session/run.yaml`,
+   which `path_generation` watches): a GPS-anchored mission re-deployed with the
+   current fit, any other mission **placed at the boat** (`io_yaml.place_mission`). Only
+   then does it publish `start`; `master_control` resets τ and its controller state,
+   reserves the run's `.npy` and starts following at once; `robot_interface` opens the
+   run's CSV on the `running` state and reports it on `/blueboat/run_log`.
+3. **STOP RUN** — `stop`: thrust zero, still in override; the `.npy` is written, the CSV
+   closed and filed (report PNG, `Robot_data/<stem>/`) in a background process.
+4. **Update Mission** (between runs) — `configure` with the next path / pinger,
+   controller and log note. A controller change is loaded at once (MPC on a worker
+   thread, the loop keeps running); an anchored path is deployed and previewed at once,
+   a non-anchored one is placed only when its run starts.
+5. **Turn Off Connection** — an active run is stopped first, then the safe-shutdown
+   sequence below, unchanged.
+
+The station passes `session_mode:=True` on every real launch; without it (CLI)
+`BlueBoat_launch.py` keeps the one-launch-one-mission behaviour. Built-in shapes are
+not offered for a session: only designer missions can be placed or deployed into the
+session file.
+
+**Run bags (v1.1, 2026-10-13).** Every run of a session also records a ros2bag —
+every topic except `/side_scan_sonar/*`, `/sss_processor/*`, `/sss_ai/*` (the `.svlog`
+is the sonar's record) — by a separate `ros2 bag record` process that `robot_interface`
+pre-arms paused between runs and resumes the instant a run starts. At STOP RUN it is
+closed and filed with the CSV: `Robot_data/<stem>/<date>-<note>-bag/`, plus
+`<date>-<note>-path.yaml` (the mission the run followed). `record_bag:=false` on the
+launch disables it; the station never does. The RUN box's **Bag** row follows it.
+
+**Bag replay — Gazebo Source "From a ros2bag" (v1.1)** runs:
+
+```
+ros2 launch blueboat_control Replay_launch.py bag:=<run folder or its bag> \
+    rate:=<x> [world_dir:=<personalized world>] [extra:=args]
+```
+
+`bag_replay` moves the boat along the recording with Gazebo's `set_pose` (the boat is
+spawned with `blueboat_description replay:=true`: no force can act on it, so no sea
+state is offered and no companion starts) and republishes the recording: the recorded
+`/mavros/*` (GPS fixes, compass, IMU, state — the station's SimGps stays disarmed),
+`/blueboat/odom` rebuilt with the full attitude, `/monitoring_data`, `/thruster_input`,
+the pinger topics and `/set_path`; commands and session plumbing go under `/replay/`.
+The map therefore anchors on the recorded GPS exactly as on real water
+(`map_frame_ready()` waits for `geo.is_valid`). Stop Mission runs the simulation
+shutdown sequence (`set_simulation_mode(True)`).
 
 **Gazebo simulation alternative** — the dialog's "Gazebo simulation" mode
 runs instead:
@@ -157,24 +222,34 @@ spawn is deterministic too). It does declare `note` and `data_dir`
 `simulation_interface`), so the **Log note** reaches this target as well. Requires `blueboat_sss_sim` built in the sourced workspace;
 `ros2 launch` fails fast otherwise and the launch manager returns to idle.
 
-**Sea state (2026-09-03).** Every Gazebo launch — empty world or
-personalized world — ends with a third dialog choosing the current and
-the waves (presets + compass FROM bearings, optional timeline). In a
-personalized world the choice rides `full_mission_launch.py` as
-`sea_current:= sea_current_from_deg:= sea_waves:= sea_waves_from_deg:=
-[sea_schedule:= sea_seed:=]`, placed before the operator's extra
-arguments. `Sim_launch.py` declares no sea argument, so in the empty world
-the station spawns a **companion** process,
+**Sea state (2026-09-03; plain-language model 2026-10-08).** Every Gazebo
+launch — empty world or personalized world — ends with a third dialog
+choosing the current and the waves (`mcs/core/sea.py`: a Current card, a
+Waves card, optionally a timeline of segments). Every non-null choice is
+written as the simulator's schedule document
+(`~/.config/blueboat_mcs/sea_states/last_launch.yaml`,
+`blueboat_sea_schedule/1`: `hold` keyframes with the plain keys
+`variation`, `tp_s: auto`, `crest`, `wakes` and per-keyframe `ramp_s`,
+which the simulator resolves) and rides the launch as
+`sea_schedule:=<file> sea_seed:=<n>` — in a personalized world on
+`full_mission_launch.py`, placed before the operator's extra arguments.
+`Sim_launch.py` declares no sea argument, so in the empty world the
+station spawns a **companion** process,
 
 ```
 ros2 launch blueboat_sss_sim sea_state_launch.py world_name:=ocean \
-    sea_current:=… sea_current_from_deg:=… sea_waves:=… sea_waves_from_deg:=…
+    sea_schedule:=…/last_launch.yaml sea_seed:=…
 ```
 
 in its own session (stdout prefixed `[sea]` in the console, signalled
-with the mission on Stop/E-STOP, its failure never aborts the mission); a
-null choice (no current, calm) starts nothing, keeping that path
-byte-identical to before. The preset table is read from the simulator's
+with the mission on Stop/E-STOP, its failure never aborts the mission).
+Since 2026-10-09 it starts for every empty-world launch, a null choice (no
+current, calm) included — then with only `world_name:=ocean` — because the
+simulator's catamaran hydrostatics carry the hull in every run (and a live
+"Change sea state…" needs a listener). The readback's additive
+`hull.model` (`catamaran` | `gazebo_box`) is shown as an amber
+"hull: Gazebo box" on the SEA STATE Status row when the box is in charge.
+The preset table is read from the simulator's
 installed `share/blueboat_sss_sim/config/sea_states.yaml` (CM-3: a file,
 never an import; built-in names when it is missing); timelines are saved
 under `~/.config/blueboat_mcs/sea_states/`.
@@ -197,7 +272,14 @@ the mission" could not be asked for one at a time.
 |---|---|---|---|
 | **E-STOP** | `stop` | `/blueboat/controller_ready` → `False` | no |
 | **E-STOP + Stop Override** | `stop`, then `default` | the above, then the `param_mode` transition | no |
-| **Stop Mission**, **Application Exit** | `default` | the `param_mode` transition | yes, after confirmation |
+| **Release E-STOP** (run session, motors enabled, latched) | `enable` | — (`controller_ready` returns to `True`) | no |
+| **Stop Mission** / **Turn Off Connection** (run session), **Application Exit** | (`stop` on `/blueboat/run_command` if a run is active, then) `default` | the `param_mode` transition | yes, after confirmation |
+
+E-STOP + Stop Override is **not** Turn Off Connection: it disarms and latches
+(`stop`) before handing the servo mapping back (`default`) and leaves every node
+running, so the session survives; Turn Off Connection does not disarm and ends the
+session. After either E-STOP the latch holds until **Release E-STOP**; after E-STOP +
+Stop Override also publish `override` again (mode button) to take the thrusters back.
 
 `stop` is the emergency primitive. In the control stack, `robot_interface.full_stop()`
 zeroes the thrust, closes the `enable_motors` gate, disarms, publishes
@@ -213,9 +295,12 @@ action, not part of a panic button.
 
 ## Safe-shutdown sequence (normative — guards **every** termination path)
 
-**Stop Mission** and **Application Exit** — the only two paths that terminate
-anything — run the same sequence (`CommandCenter.safe_shutdown`); nothing in the
-application terminates nodes outside of it. "E-STOP + Stop Override" runs the
+**Stop Mission** (**Turn Off Connection** in a run session) and **Application Exit** —
+the only two paths that terminate anything — run the same sequence
+(`CommandCenter.safe_shutdown`); nothing in the application terminates nodes outside of
+it. In a run session an active run is stopped first (`stop` on
+`/blueboat/run_command`, through `CommandCenter.set_before_terminate`), so its CSV is
+closed and filed by `robot_interface` itself rather than by the teardown. "E-STOP + Stop Override" runs the
 same sequence with termination switched off:
 
 1. Verify the ROS graph: `get_subscription_count()` on the reliable

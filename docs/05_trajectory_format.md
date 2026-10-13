@@ -137,6 +137,41 @@ ros2 launch blueboat_control BlueBoat_launch.py \
 ```
 
 The station's Launch Mission dialog builds this string automatically when a
-"custom: …" entry is selected. An optional dedicated `yaml_path` node
-parameter is also supported (`trajectory:=from_yaml yaml_path:=<path>`) for
-hand-written launch files.
+"custom: …" entry is selected in a Gazebo launch. An optional dedicated
+`yaml_path` node parameter is also supported (`trajectory:=from_yaml
+yaml_path:=<path>`) for hand-written launch files.
+
+## 4. Run sessions — one watched file, rewritten per run
+
+A real-robot launch from the station is a **run session** (2026-10-09):
+`path_generation` is always pointed at one file,
+
+```
+~/.config/blueboat_mcs/trajectories/.session/run.yaml     (LaunchConfig.session_trajectory_file)
+```
+
+and the station rewrites it — atomically, a sibling file then `os.replace` —
+just **before** each `start` on `/blueboat/run_command`, so the first window
+`master_control` requests after the start already reads the new run's path
+(the watcher reloads on the mtime change). The file is a normal
+`blueboat_trajectory/1` runtime file plus provenance, and is never hand-edited:
+
+* **GPS-anchored mission** — `io_yaml.deploy_mission` into this file, with the
+  georeference fit current at START RUN (a long session never runs on the
+  anchor of its first minute); `deployed_from`, `deployed_fit_rms_m`. It is
+  also deployed as soon as it is chosen (at connection or by Update Mission),
+  so the map shows it with its start circled **S** before the run.
+* **Any other mission** — `io_yaml.place_mission`: the whole path moved
+  **rigidly** so its first sample sits on the boat's odom position at START RUN
+  and its first heading on the boat's odom heading (every sample rotated by
+  `yaw_boat − yaw_first` about the first one, then translated; every yaw gains
+  the same angle; `t` unchanged). The path therefore begins where the boat is
+  and runs out ahead of it, wherever the boat was driven since the launch —
+  start alignment (`(not start-aligned)` badge) no longer matters there.
+  `deployed_from`, `placed_at: {x, y, yaw}`. Refused for an anchored mission.
+
+The file is deleted at connection, when Update Mission picks a non-anchored
+path or the pinger, and after a placed run stops, so neither the station nor
+the GCS ever shows a previous run's path as the next one. A missing file
+leaves `path_generation` on what it last loaded — harmless, since an idle
+session requests no path. Built-in shapes are not offered in a session.
