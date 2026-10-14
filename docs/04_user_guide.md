@@ -28,18 +28,45 @@ it.
 
 ## Screen layout
 
-Left: live information and diagnostics. Center: the interactive mission map.
-Right: monitoring (distance plot, timeline, statistics). Bottom: the mission
+Left: the link guardian, live information and diagnostics. Center: the
+interactive mission map. Right: map layers and tools, then monitoring (distance
+plot, timeline, statistics). Bottom: the mission
 control toolbar and its one-line launch console. Status bar: last click
 inspection, georeference quality, ROS connection state.
 
 ## Left panel
 
-**Layers** — checkboxes toggling every map layer: satellite imagery, robot
-trajectory, published mission path, pinger position and trajectory, the thin
-robot→target line, the heading arrow and the metric grid. The satellite box
-unlocks as soon as the map frame is anchored — a second or so of GPS, no
-driving needed; watch "georef" in the status bar.
+**Guardian** (v1.1, real-robot sessions) — the **link guardian** brings the boat
+back to HOME by itself when this laptop goes silent (WiFi lost, laptop switched
+off, station crashed). It is an ArduPilot script on the boat, installed once
+(superproject `link_guardian/README.md` §3), and it is **ON by default in every
+real-robot session**: at connection the control stack arms the autopilot before
+going to override, and the station starts its companion, which switches the
+guardian ON. The box shows a one-line state (ON / OFF / NOT READY / TAKEN OVER /
+LINK LOST), the link, the autopilot (armed · ArduPilot mode — the autopilot's
+own arming, not the motor gate), the guardian flag, the setup check (tooltip:
+every item), HOME (session start, or the current run's start) and the boat's
+last guardian / pre-arm messages. Buttons, each enabled only when it can act
+(the tooltip says why not):
+
+* **Check** — re-run the readiness check (script, failsafe parameters, laptop
+  identity).
+* **Apply settings** — write the recommended ArduPilot failsafe parameters
+  (one-time setup; restart the autopilot afterwards if scripting was off).
+* **Turn OFF / Turn ON** — the guardian for this session (asks before turning
+  OFF: the boat would then drift on a link loss).
+* **Arm again** — re-arm the autopilot (the boat briefly leaves override);
+  needed after an E-STOP, which disarms, or when arming failed at connection.
+  The guardian also arms the boat itself if it has to take over.
+* **Take back control** — after the guardian (or an ArduPilot failsafe) has
+  taken the boat: HOLD, thrusters back to the station, MANUAL. Press STOP RUN
+  first if a run was active.
+
+The E-STOP does **not** switch the guardian off. **Turn Off Connection** and
+closing the station ask, while the guardian is ON, whether to turn it **OFF and
+disarm** first (the boat stays put), to **keep it ON** (the boat sees the laptop
+go silent and returns HOME), or to cancel. Outside a real-robot session (Gazebo,
+bag replay) the box is greyed.
 
 **Robot** — world coordinates, GPS (when fixed), heading, speed, active
 controller, mission state (an aggregated readiness count over FCU connection,
@@ -186,6 +213,13 @@ distance and both coordinates. Deactivating the tool clears any frozen
 measurement from the map.
 
 ## Right panel
+
+**Layers** — checkboxes toggling every map layer: satellite imagery, robot
+trajectory, published mission path, pinger position and trajectory, the thin
+robot→target line and the metric grid (the robot heading arrow was removed in
+v1.1 — the boat glyph itself points along the heading). The satellite box
+unlocks as soon as the map frame is anchored — a second or so of GPS, no
+driving needed; watch "georef" in the status bar.
 
 **Map tools** — **Zoom +**, **Zoom −** (view-center anchored), **Center
 Robot**, which recenters the view on the boat exactly once (the camera then

@@ -93,6 +93,7 @@ asynchronous callers (Application Exit) can proceed.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from enum import Enum, auto
 
@@ -161,6 +162,21 @@ class CommandCenter(QObject):
         # Run sessions: called before a terminating sequence so an active run
         # is stopped (and filed) first. Set by RunSession; None outside one.
         self._before_terminate: Callable[[], None] | None = None
+
+        # Link guardian (v1.1): commands to its companion are seq-numbered; the
+        # turn-off pre-step watches the companion's report and /mavros/state.
+        self._guardian_seq = 0
+        self._guardian = None               # last GuardianReadout
+        self._fcu_armed = False
+        self._goff_done: Callable[[bool, str], None] | None = None
+        self._goff_phase = ""               # '' | 'off' | 'disarm'
+        self._goff_seq = -1
+        self._goff_deadline = 0.0
+        self._goff_timer = QTimer(self)
+        self._goff_timer.setInterval(100)
+        self._goff_timer.timeout.connect(self._poll_guardian_off)
+        bus.guardian_status_received.connect(self._on_guardian_status)
+        bus.mavros_state_received.connect(self._on_mavros_state)
 
     # ------------------------------------------------------------- commands
     def _node(self):
@@ -262,6 +278,100 @@ class CommandCenter(QObject):
             return int(node.run_command_subscriber_count())
         except Exception:  # noqa: BLE001 - graph query is diagnostic only
             return -1
+
+    # ---------------------------------------------------------- link guardian
+    def _on_guardian_status(self, t: float, payload: dict) -> None:
+        from mcs.core.guardian import GuardianReadout
+        r = GuardianReadout.from_json(payload, received_mono=t)
+        if r is not None:
+            self._guardian = r
+
+    def _on_mavros_state(self, _t: float, _connected: bool, armed: bool, _mode: str) -> None:
+        self._fcu_armed = armed
+
+    def send_guardian_command(self, cmd: str, **extra) -> int | None:
+        """One command to the guardian companion; returns its seq (None = not sent)."""
+        from mcs.core.guardian import command_json
+        node = self._node()
+        if node is None:
+            return None
+        self._guardian_seq += 1
+        try:
+            node.publish_guardian_command(command_json(cmd, self._guardian_seq, **extra))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            _LOG.error("guardian command publish raised: %s", exc)
+            self._bus.ros_log.emit(f"Guardian command not sent: {exc}")
+            return None
+        return self._guardian_seq
+
+    def rearm(self) -> None:
+        """'rearm': robot_interface re-runs its arm-before-override sequence
+        (normal mapping -> arm -> override; refused during a run or E-STOP)."""
+        node = self._node()
+        if node is not None:
+            node.publish_input_str("rearm")
+
+    def guardian_off_and_disarm(self, done: Callable[[bool, str], None]) -> None:
+        """Turn Off Connection / exit, "turn the guardian off first".
+
+        Sends ``off`` and waits for the companion to report the autopilot's
+        confirmation (its ack, or ``guardian_on`` False), then publishes
+        ``disarm`` and waits for ``/mavros/state`` to show it. ``done(ok,
+        detail)`` is called once: ``ok`` False means the guardian may still be
+        ON and the caller must not terminate. A disarm that is not confirmed
+        does not fail the step - with the guardian OFF the boat stays put.
+        """
+        if self._goff_done is not None:
+            done(False, "already turning the guardian off")
+            return
+        seq = self.send_guardian_command("off")
+        if seq is None:
+            done(False, "the guardian companion could not be reached")
+            return
+        self._goff_done = done
+        self._goff_phase = "off"
+        self._goff_seq = seq
+        self._goff_deadline = time.monotonic() + self._cfg.guardian.off_confirm_timeout_s
+        self._goff_timer.start()
+
+    def _poll_guardian_off(self) -> None:
+        now = time.monotonic()
+        if self._goff_phase == "off":
+            r = self._guardian
+            ack = r.ack if r is not None else None
+            if ack and ack.get("seq") == self._goff_seq:
+                if not ack.get("ok"):
+                    self._goff_finish(False, f"the autopilot refused: {ack.get('detail', '?')}")
+                    return
+                self._goff_phase = "disarm"
+            elif now > self._goff_deadline:
+                self._goff_finish(False, "no confirmation that the guardian is OFF")
+                return
+            else:
+                return
+            # Guardian confirmed OFF: disarm (skipped when already disarmed).
+            if not self._fcu_armed:
+                self._goff_finish(True, "guardian OFF, autopilot disarmed")
+                return
+            node = self._node()
+            if node is not None:
+                node.publish_input_str("disarm")
+            self._goff_deadline = now + self._cfg.guardian.disarm_confirm_timeout_s
+            return
+        if self._goff_phase == "disarm":
+            if not self._fcu_armed:
+                self._goff_finish(True, "guardian OFF, autopilot disarmed")
+            elif now > self._goff_deadline:
+                self._goff_finish(True, "guardian OFF (disarm not confirmed)")
+
+    def _goff_finish(self, ok: bool, detail: str) -> None:
+        self._goff_timer.stop()
+        done, self._goff_done = self._goff_done, None
+        self._goff_phase = ""
+        _LOG.info("guardian off-and-disarm: %s (%s)", "ok" if ok else "FAILED", detail)
+        self._bus.ros_log.emit(f"Link guardian: {detail}.")
+        if done is not None:
+            done(ok, detail)
 
     def publish_arrow_thrust(self, right: float, left: float) -> None:
         """Arrow-key stream tick: [right, left] N (silent when ROS is down)."""

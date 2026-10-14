@@ -149,6 +149,9 @@ class BridgeNode(Node):
         # on the default profile at both ends (CM-4).
         self.create_subscription(String, t.run_state, self._on_run_state, 10)
         self.create_subscription(String, t.run_log, self._on_run_log, 10)
+        # Link guardian companion (guardian.py watch, real sessions): JSON
+        # report heartbeated at 1 Hz on the default profile at both ends.
+        self.create_subscription(String, t.guardian_status, self._on_guardian_status, 10)
 
         # ---- Publishers ----------------------------------------------------
         self._pub_input_str = self.create_publisher(String, t.input_str, 10)
@@ -157,6 +160,7 @@ class BridgeNode(Node):
         self._pub_replay_command = self.create_publisher(String, t.replay_command, 10)
         self._pub_run_command = self.create_publisher(String, t.run_command, 10)
         self._pub_arrow_thrust = self.create_publisher(Float32MultiArray, t.arrow_thrust, 10)
+        self._pub_guardian_command = self.create_publisher(String, t.guardian_command, 10)
 
         # ---- Simulated GPS (Gazebo runs of GPS-anchored missions) ----------
         # The station itself publishes NavSatFix on the real GPS topic, which
@@ -308,6 +312,12 @@ class BridgeNode(Node):
         if payload is not None:
             self._bus.run_log_received.emit(t, payload)
 
+    def _on_guardian_status(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.guardian_status)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.guardian_status_received.emit(t, payload)
+
     # =============================================================== outputs
     # publish() on rclpy publishers is safe to call from other threads; the
     # lock only serialises our own bookkeeping.
@@ -359,6 +369,15 @@ class BridgeNode(Node):
             msg.data = text
             self._pub_run_command.publish(msg)
         self._bus.command_sent.emit(f"run_command ← {payload.get('cmd', '?')}")
+
+    def publish_guardian_command(self, payload: dict) -> None:
+        """Publish one command (JSON) to the guardian companion."""
+        text = json.dumps(payload)
+        with self._pub_lock:
+            msg = String()
+            msg.data = text
+            self._pub_guardian_command.publish(msg)
+        self._bus.command_sent.emit(f"link_guardian/command ← {payload.get('cmd', '?')}")
 
     def run_command_subscriber_count(self) -> int:
         """Matched subscriptions on /blueboat/run_command (master_control in

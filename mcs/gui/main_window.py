@@ -34,6 +34,7 @@ from mcs.core.signals import SignalBus
 from mcs.gui import theme
 from mcs.gui.arrow_box import FloatingArrowBox
 from mcs.gui.bottom_toolbar import BottomToolbar
+from mcs.gui.guardian_box import GuardianBox, ask_turn_off_choice
 from mcs.gui.left_panel import LeftPanel
 from mcs.gui.map.map_view import MapMode, MapView
 from mcs.gui.mission_stats import FloatingStatsBox
@@ -84,6 +85,12 @@ class MainWindow(QMainWindow):
         # DIAGNOSTICS, never scrolled away); visible during a run session.
         self.run_panel = RunPanel(self.store, self.run_session)
         self.left_panel.set_footer(self.run_panel)
+        # GUARDIAN box (v1.1): the link guardian, at the top of the left
+        # column; active during a real-robot session.
+        self.guardian_box = GuardianBox()
+        self.left_panel.set_header(self.guardian_box)
+        self._guardian_ack_seq = None
+        self.toolbar.set_stop_guard(self._guardian_stop_guard)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.left_panel)
@@ -168,6 +175,7 @@ class MainWindow(QMainWindow):
         bus.param_mode_received.connect(store.on_param_mode)
         bus.sea_state_received.connect(store.on_sea_state)
         bus.replay_state_received.connect(store.on_replay_state)
+        bus.guardian_status_received.connect(store.on_guardian_status)
         bus.mission_path_received.connect(store.on_mission_path)
         bus.mission_path_failed.connect(self._on_mission_path_failed)
 
@@ -193,7 +201,7 @@ class MainWindow(QMainWindow):
         bus.launch_output.connect(lambda line: _LOG.debug("[launch] %s", line))
 
         # Panels ↔ map
-        self.left_panel.layer_toggled.connect(self.map_view.set_layer_visible)
+        self.right_panel.layer_toggled.connect(self.map_view.set_layer_visible)
         self.right_panel.time_window_changed.connect(self.map_view.set_time_window)
         self.right_panel.clear_paths_requested.connect(self._on_clear_paths)
         self.right_panel.zoom_in_requested.connect(self.map_view.zoom_in)
@@ -230,6 +238,7 @@ class MainWindow(QMainWindow):
         self.run_session.arrows_release_requested.connect(
             lambda: self.arrow_box.set_active(False, hold=False))
         self.run_session.manual_target_cleared.connect(self._clear_manual_target_ui)
+        self.guardian_box.action_requested.connect(self._on_guardian_action)
         self.arrow_box.engaged.connect(self._on_arrows_engaged)
         self.arrow_box.released.connect(self._on_arrows_released)
 
@@ -277,6 +286,8 @@ class MainWindow(QMainWindow):
                 self.arrow_box.move(pos)
                 self.arrow_box.raise_()
 
+        self._refresh_guardian()
+
         # Run session: RUN box + session labels of the toolbar.
         ss = self.store.session
         self.run_panel.refresh()
@@ -297,7 +308,7 @@ class MainWindow(QMainWindow):
                 f"georef: {quality} (rms {geo.fit.rms_m:.1f} m, "
                 f"{geo.fit.n_pairs} fixes)")
             self._geo_label.setStyleSheet(f"color: {color};")
-        self.left_panel.set_satellite_available(geo.is_valid)
+        self.right_panel.set_satellite_available(geo.is_valid)
         # Map orientation is handled inside MapView (QGC-style: north-up
         # fixed, the scene is ENU by construction, only the glyph rotates)
         # — nothing to drive from here.
@@ -589,6 +600,70 @@ class MainWindow(QMainWindow):
                 self.toolbar.manual_button.setChecked(False)
             self.arrow_box.set_active(False, hold=False)
             self.run_session.end()
+            self.store.guardian = None
+
+    # ============================================================ link guardian
+    def _real_session(self) -> bool:
+        m = self.store.mission
+        return m.launch_running and not m.simulation and not m.replay
+
+    def _refresh_guardian(self) -> None:
+        from pathlib import Path
+
+        from mcs.core.guardian import summarize
+        g = self.cfg.guardian
+        ss, r = self.store.session, self.store.robot
+        view = summarize(
+            self.store.guardian, real_session=self._real_session(),
+            companion_found=g.enabled and Path(g.script).expanduser().is_file(),
+            fcu_connected=r.fcu_connected, armed=r.armed, mode=r.fcu_mode,
+            run_active=ss.run_active or ss.run_pending == "start",
+            estop_latched=self.commands.estop_latched)
+        self.guardian_box.update_view(view, self.store.guardian)
+        # Report each answered command once, in the status bar.
+        ack = self.store.guardian.ack if self.store.guardian is not None else None
+        if ack and ack.get("seq") != self._guardian_ack_seq:
+            self._guardian_ack_seq = ack.get("seq")
+            ok = "done" if ack.get("ok") else "FAILED"
+            self._status.showMessage(
+                f"Guardian {ack.get('cmd')}: {ok} — {ack.get('detail', '')}", 10000)
+
+    def _on_guardian_action(self, action: str) -> None:
+        if action == "rearm":
+            self.commands.rearm()
+            self._status.showMessage(
+                "Arm again: the boat briefly leaves override, the autopilot arms, "
+                "then override resumes.", 8000)
+            return
+        if self.commands.send_guardian_command(action) is None:
+            QMessageBox.warning(self, "Guardian", "The command could not be sent "
+                                "(ROS layer not running).")
+
+    def _guardian_stop_guard(self, proceed) -> None:
+        """Turn Off Connection: ask what the guardian does (user's order,
+        2026-10-14), then proceed - or not."""
+        from mcs.core.guardian import needs_turn_off_choice
+        if not needs_turn_off_choice(self.store.guardian, real_session=self._real_session()):
+            proceed()
+            return
+        choice = ask_turn_off_choice(self, exiting=False)
+        if choice == "keep":
+            proceed()
+        elif choice == "off":
+            self._guardian_off_then(proceed)
+
+    def _guardian_off_then(self, proceed) -> None:
+        self._status.showMessage("Turning the link guardian OFF and disarming…", 8000)
+
+        def done(ok: bool, detail: str) -> None:
+            if ok:
+                proceed()
+                return
+            QMessageBox.critical(
+                self, "Guardian still ON",
+                f"The guardian could not be turned off: {detail}.\n\nNothing was "
+                "terminated. Try again, or choose 'Keep ON' to let the boat come home.")
+        self.commands.guardian_off_and_disarm(done)
 
     # ============================================================ manual target
     def _on_manual_mode(self, armed: bool) -> None:
@@ -757,6 +832,18 @@ class MainWindow(QMainWindow):
             return
         if self.launcher.running:
             if not self._exit_in_progress:
+                from mcs.core.guardian import needs_turn_off_choice
+                if needs_turn_off_choice(self.store.guardian,
+                                         real_session=self._real_session()):
+                    # Link guardian ON (v1.1): the same choice as Turn Off
+                    # Connection, in place of the plain confirmation.
+                    choice = ask_turn_off_choice(self, exiting=True)
+                    if choice == "keep":
+                        self._start_exit_sequence()
+                    elif choice == "off":
+                        self._guardian_off_then(self._start_exit_sequence)
+                    event.ignore()
+                    return
                 answer = QMessageBox.question(
                     self, "Mission running",
                     "A mission is still running. Publish 'default', stop the "
@@ -766,13 +853,19 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     event.ignore()
                     return
-                self._exit_in_progress = True
-                self.bus.shutdown_sequence_finished.connect(self._on_exit_sequence_done)
-                self.commands.safe_app_exit()
+                self._start_exit_sequence()
             event.ignore()  # keep the process (and the DDS writer) alive
             return
         self.ros.stop()
         event.accept()
+
+    def _start_exit_sequence(self) -> None:
+        """Safe app exit: the N1 sequence, then close once the launch is gone."""
+        if self._exit_in_progress:
+            return
+        self._exit_in_progress = True
+        self.bus.shutdown_sequence_finished.connect(self._on_exit_sequence_done)
+        self.commands.safe_app_exit()
 
     def _on_exit_sequence_done(self) -> None:
         """Safe-shutdown confirmed; now wait for the launch tree to exit."""

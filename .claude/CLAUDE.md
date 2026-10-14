@@ -25,7 +25,8 @@ overrides); `core/` and `models/` import no widgets and no rclpy (only `QObject`
 (`ros_manager`), `bridge_node` (**the only file that knows message types**), `launch_manager`,
 `command_center` and `run_session` (the station's half of a real-robot run session, §2);
 `gui/` the window, panels, `map/`, `plot/`, `dialogs/`, plus `run_panel.py` (the RUN box),
-`arrow_box.py` (ARROW CONTROL) and `replay_box.py` (REPLAY, v1.1); `designer/` the Survey
+`arrow_box.py` (ARROW CONTROL), `replay_box.py` (REPLAY, v1.1) and `guardian_box.py` (GUARDIAN,
+v1.1, top of the left column; its rules in the Qt-free `core/guardian.py`); `designer/` the Survey
 Pattern Designer (its own `CLAUDE.md`). `core/arrows.py` is the Qt-free arrow-key thrust law.
 `core/worlds.py` reimplements the SSS-Sim world-folder contract locally and never imports it
 (CM-3). `core/replay.py` (v1.1) reads a recorded run's bag folder (`metadata.yaml` with PyYAML;
@@ -108,7 +109,8 @@ emission), expose a semantic method on `CommandCenter`, call it from the GUI.
 constant-pixel lines, `ItemIgnoresTransformations` for constant-pixel glyphs),
 add it to the scene in `MapView.__init__`, update it in `MapView.refresh()`,
 register a key in `MapView.set_layer_visible`, add one entry to `_LAYERS` in
-`left_panel.py`. That is the whole checklist.
+`right_panel.py` (the LAYERS section moved there, above MAP TOOLS, in v1.1). That is the
+whole checklist.
 
 **A plot.** Follow `DistancePlot`: a `QWidget` reading one `TimeSeries`, honouring
 `set_time_window`, painting in `paintEvent`. Add it to a `CollapsibleSection` in
@@ -119,7 +121,10 @@ dialog: `LaunchParameters.to_cli()` (the main argument list, which splices in
 `params.sea_args()`), `companion_command()` (the empty-world sea companion),
 `launch_target()` (which of the four launch files runs), and
 `gui/dialogs/launch_dialog.py` for the widget. The replay branch (`replay_bag` set) comes first
-in `to_cli()` and `launch_target()`, and `companion_command()` returns None for it.
+in `to_cli()` and `launch_target()`, and `companion_command()` returns None for it. The second
+companion, `guardian_command()` (the link guardian's `guardian.py watch`), runs for every
+real-robot launch and never for a simulation or a replay; `LaunchManager._companions` holds
+both, signalled together by `stop()` and `_finalise()`.
 
 ---
 
@@ -137,7 +142,7 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 | `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | pose, yaw, speed, trail | **Local ENU**: position translated at that node's first callback (world origin = boat position at launch), axes East/North, yaw **absolute ENU** (0 = East, CCW+; NOT re-zeroed). Same frame kind as the simulator's Gazebo-bridged odom — only the origin differs. The pre-2026-08-31 hybrid (translated position, launch-relative yaw) is gone; see `docs/03_ros_integration.md` §Observations. |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS (real) · **the station's own bridge node** (Gazebo run of a GPS-anchored mission: a 5 Hz timer synthesises fixes from the sim odom — world metres → lat/lon about a receiver origin placed `SimGpsConfig.offset_north_m` north of the mission's first point — received back through its own subscription, so the whole pipeline incl. diagnostics runs as on real water) | georeference, GPS read-out | BEST_EFFORT QoS. `lat==0 and lon==0` means no fix and is discarded. |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **robot glyph heading (preferred)** | Degrees **clockwise from north** (0=N, 90=E). Converted to the app-wide convention (radians CCW from east) as `radians(90 - hdg)`. Fallback: the odom yaw directly (absolute ENU). Subscribed **BEST_EFFORT** — this, the GPS fix and the battery are the three sensor streams that are; every other subscription uses the default reliable depth-10 profile. |
-| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connection** flag, one of the three inputs to the readiness count | Only subscribed when `mavros_msgs` imports; absent in simulation. `armed` and `mode` ride the same message but nothing displays them, so the store does not keep them. |
+| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connection** flag, one of the three inputs to the readiness count; `armed` / `mode` for the GUARDIAN box (v1.1) | Only subscribed when `mavros_msgs` imports; absent in simulation. `armed` is the **autopilot's** arming (`RobotState.armed`), not `robot_interface`'s motor gate; `mode` is `RobotState.fcu_mode`. |
 | `/mavros/battery` | `sensor_msgs/BatteryState` | MAVROS (`sys_status`) | battery charge read-out (left panel, ROBOT) | BEST_EFFORT QoS. `percentage` is a **0..1 fraction**, not a percent — MAVROS divides the MAVLink value by 100. A field the FCU does not report arrives NaN, is passed on as `None` and never overwrites the last good reading; the row greys out after 15 s of silence. No simulation graph publishes this topic. |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface.py` | USBL pinger marker | **ROBOT/BODY frame.** With `fixed_pinger=False` (the default) it is seeded from the Waterlinked *filtered* (`filaco`) position and dead-reckoned at odom rate between USBL updates. |
 | `/uw_gps_data` | `std_msgs/Float32MultiArray` | `uwgps_log.py` | raw USBL freshness | 19 values: date(7), aco xyz, ant xyz, lat/lon/dep, filaco xyz. |
@@ -147,6 +152,7 @@ names there, never inline. Peer module for all of these is `blueboat_control`
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set` | safe-shutdown acknowledgement | `'default'` / `'override'`, or `''` for "alive but no mode locked". **Heartbeated at 1 Hz** since 2026-09-04, so a late station sees the mode without waiting for a transition — which is exactly why the shutdown sequence requires a transition rather than any matching value (N1). |
 | `/blueboat/run_state` | `std_msgs/String` (JSON) | `master_control` (run session only) | RUN box, START RUN gating, run acknowledgement | `{seq, ok, detail, state: idle\|loading\|running\|error, controller_type, use_pinger, note, mission, run, npy}`. Answers every run command (`seq`) and is heartbeated at 1 Hz. The truth about whether a run is active. |
 | `/blueboat/run_log` | `std_msgs/String` (JSON) | `robot_interface` (run session only) | RUN box "Log" and "Bag" rows | `{run, logging, csv, layout, bag_enabled, bag_recording, bag}` (the `bag_*` fields since v1.1, absent from an older control stack → "—"), heartbeated at 1 Hz: confirms the run's position CSV is being written (a run it does not confirm within 3 s is flagged) and its ros2bag recorded (flagged the same way: the CSV is there but the run will not be replayable). |
+| `/link_guardian/status` | `std_msgs/String` (JSON) | `guardian.py watch` (superproject `link_guardian/`, the station's companion, real-robot sessions only) | GUARDIAN box | 1 Hz, default profile: `{connected, armed, mode, want_on, guardian_on, check, home, run_running, messages, busy, ack}` → `DataStore.guardian` (`mcs.core.guardian.GuardianReadout`). Stale after 4 s = "companion not reporting". |
 | `/replay/state` | `std_msgs/String` (JSON) | `bag_replay` (bag replay only, v1.1) | REPLAY box | **TRANSIENT_LOCAL depth 1** (like the sea state), 2 Hz: `{bag, t, duration, rate, paused, finished, frame, world, gazebo, …}` → `DataStore.replay` (`mcs.core.replay.ReplayReadout`). |
 
 **Sea state (sim only, 2026-09-03; plain-language redesign 2026-10-08, by
@@ -232,13 +238,32 @@ the SEA STATE box's corner — never shown together) shows the run, time / durat
 with Pause/Resume and the rate. Manual Target and the Default/Override toggle are greyed:
 nothing commands the replayed boat. Stop Mission runs the simulation shutdown sequence.
 
+**Link guardian (v1.1, 2026-10-14, by the user's order).** An ArduPilot Lua script on the
+autopilot (superproject `link_guardian/`, the one owner-ordered exception to "nothing of ours on
+the boat") brings the boat HOME by itself when this laptop goes silent. It is **ON by default
+in every real-robot session**: `robot_interface` arms the autopilot at connection *before*
+override (ArduPilot refuses to arm on passthrough), and the station starts `guardian.py watch`,
+which sets the autopilot's session flag `LGRD_ON = 1`, moves HOME to each run's start and back,
+and serves the **GUARDIAN box** (top of the left column; `gui/guardian_box.py` over the
+Qt-free `core/guardian.py::summarize`). Buttons: Check, Apply settings, Turn OFF/ON, Arm again
+(`rearm`), Take back control (`reclaim`); each enabled only when it can act. The E-STOP does
+not turn the guardian off (the script arms the boat itself if it has to take over).
+**Turn Off Connection and app exit ask while the guardian may be ON**
+(`needs_turn_off_choice`: a silent companion counts as ON): *Guardian OFF + disarm* runs
+`CommandCenter.guardian_off_and_disarm` (`off` → its ack → `disarm` → `/mavros/state`
+disarmed) before the unchanged N1 sequence, and terminates nothing if the OFF is not
+confirmed; *Keep ON* runs N1 directly (the boat then returns HOME); *Cancel*. Since v1.1 the
+LAYERS section sits in the right column above MAP TOOLS, and the robot heading arrow is gone
+(the glyph rotates; N6 unchanged).
+
 ### Publications
 
 | Topic | Type | Consumed by | Contract |
 |---|---|---|---|
-| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `move <l> <r> <s>`. Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override`, — from either E-STOP button — `stop`, and — from **Release E-STOP** (run session, motors enabled, latched) — `enable`, the only thing that clears `robot_interface`'s E-STOP latch (it also re-opens the motor gate). |
+| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `rearm` (v1.1, session: re-run the arm-before-override sequence), `move <l> <r> <s>`. The GUARDIAN box publishes `rearm` (**Arm again**) and the turn-off choice `disarm`. Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override`, — from either E-STOP button — `stop`, and — from **Release E-STOP** (run session, motors enabled, latched) — `enable`, the only thing that clears `robot_interface`'s E-STOP latch (it also re-opens the motor gate). |
 | `/blueboat/manual_target` | `std_msgs/Float32MultiArray` | `master_control.py` | `[x, y]` in the **WORLD frame**. `[0.0, 0.0]` is the *resume-original-mission sentinel*, not a coordinate — a genuine click at the origin is nudged by `1e-3`. Only the explicit "Continue Original Mission" action (labelled "Release Target" between the runs of a session) may publish `[0,0]`. Turning arrow control off publishes the boat's own position here (hold where released). |
 | `/blueboat/run_command` | `std_msgs/String` (JSON) | `master_control.py` (run session only) | `{"cmd": "configure", controller_type, use_pinger, note, mission, seq}` / `{"cmd": "start", seq}` / `{"cmd": "stop", seq}`. `configure` is re-sent until acknowledged (idempotent); `start`/`stop` are sent once. |
+| `/link_guardian/command` | `std_msgs/String` (JSON) | `guardian.py watch` (real-robot sessions, v1.1) | `{"cmd": "on"\|"off"\|"check"\|"setup"\|"reclaim", "seq": n}` from the GUARDIAN box and the turn-off pre-step (`CommandCenter.send_guardian_command`, `mcs.core.guardian.command_json`); answered in the status's `ack`. |
 | `/replay/command` | `std_msgs/String` (JSON) | `bag_replay` (bag replay only, v1.1) | `{"cmd": "pause"\|"resume"}` / `{"cmd": "rate", "rate": x}` from the REPLAY box (`CommandCenter.send_replay_command`, `mcs.core.replay.command_json`). |
 | `/blueboat/arrow_thrust` | `std_msgs/Float32MultiArray` | `master_control.py` (every mode) | `[right, left]` N at 20 Hz while ARROW CONTROL is on (`[0,0]` with no key held); `[]` releases. Overrides every branch, pauses a run like a manual target; `master_control`'s dead-man (`arrow_timeout` 0.5 s) zeroes a gap and stays engaged. No `command_sent` per tick (it would flood the log). |
 
@@ -264,7 +289,8 @@ nothing commands the replayed boat. Stop Mission runs the simulation shutdown se
 
 Violating any of these breaks another module, hardware safety, or field data.
 
-**N1 — Safe shutdown before terminating a launch.** **Stop Mission** (labelled
+**N1 — Safe shutdown before terminating a launch.** (Since v1.1 a real-robot session first
+offers the link-guardian choice, §2; the sequence itself is unchanged.) **Stop Mission** (labelled
 **Turn Off Connection** in a real-robot run session) and **app exit** — the only
 two paths that terminate anything — must run the `command_center` sequence (in a
 session, a run still active is stopped first through `/blueboat/run_command`, so
@@ -568,7 +594,11 @@ gate, refused start, Update Mission, E-STOP latch / Release E-STOP, and Turn Off
 order: run `stop` → `default` → terminate), `start marker ok` and `session window ok`. v1.1 adds
 `replay ok` (the replay launch arguments, target and absent companion, bag discovery from a
 run folder, the dialog's Source row and bag validation, the REPLAY box and its commands, the
-map waiting for GPS, greyed controls, the RUN box's Bag row incl. a pre-v1.1 control stack).
+map waiting for GPS, greyed controls, the RUN box's Bag row incl. a pre-v1.1 control stack),
+`layers ok` (LAYERS in the right column above MAP TOOLS, no heading arrow, the GUARDIAN box
+heading the left column) and `guardian ok` (the companion only for real launches; status
+decoding; every box state and button gate; the turn-off choice — cancel / keep / off, nothing
+terminated when OFF is not confirmed; `off` → ack → `disarm` ordering).
 
 Still uncovered: the rest of the designer UI (`designer_map.py`, `panels.py`,
 `designer_window.py`, including the `_push_undo` contract). A green run is not field

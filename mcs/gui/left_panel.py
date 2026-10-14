@@ -1,7 +1,8 @@
 """Left information panel.
 
 Sections (all collapsible):
-* **Layers** — visibility checkboxes for every map layer.
+* **Guardian** (v1.1) — the link guardian's box (``mcs/gui/guardian_box.py``),
+  hosted at the very top via :meth:`set_header`.
 * **Robot** — live pose, GPS, heading, speed, controller, mission state,
   motor commands, battery charge, travelled distance, elapsed time.
 * **Pinger** — world & robot-frame coordinates, live distance, last update.
@@ -11,17 +12,17 @@ Sections (all collapsible):
   sits under ROS DIAGNOSTICS and never scrolls away: START RUN / STOP RUN and
   the run's status (``mcs/gui/run_panel.py``, hosted via :meth:`set_footer`).
 
-The panel is read-only except for the checkboxes; all values are pulled
-from the :class:`~mcs.models.store.DataStore` on the shared 10 Hz tick.
+The map-layer checkboxes moved to the right column (v1.1). The panel is
+read-only; all values are pulled from the :class:`~mcs.models.store.DataStore`
+on the shared 10 Hz tick.
 """
 
 from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox,
     QGridLayout,
     QLabel,
     QScrollArea,
@@ -40,22 +41,8 @@ _BATTERY_WARN_FRAC = 0.40
 _BATTERY_ERR_FRAC = 0.20
 _BATTERY_STALE_S = 15.0
 
-_LAYERS: list[tuple[str, str, bool]] = [
-    ("satellite", "Satellite map layer", False),
-    ("robot_track", "Robot trajectory", True),
-    ("mission_path", "Published mission path", True),
-    ("pinger", "USBL pinger position", True),
-    ("pinger_track", "USBL pinger trajectory", True),
-    ("target_line", "Robot → target line", True),
-    ("heading", "Robot heading arrow", False),
-    ("grid", "World grid", True),
-]
-
-
 class LeftPanel(QWidget):
     """Live-information sidebar."""
-
-    layer_toggled = Signal(str, bool)
 
     def __init__(self, cfg: AppConfig, store: DataStore,
                  parent: QWidget | None = None) -> None:
@@ -78,21 +65,7 @@ class LeftPanel(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
-
-        # ---- Layers ---------------------------------------------------------
-        sec_layers = CollapsibleSection("LAYERS")
-        self._layer_boxes: dict[str, QCheckBox] = {}
-        for key, label, default in _LAYERS:
-            box = QCheckBox(label)
-            box.setChecked(default)
-            box.toggled.connect(lambda on, k=key: self.layer_toggled.emit(k, on))
-            self._layer_boxes[key] = box
-            sec_layers.add_widget(box)
-        self._layer_boxes["satellite"].setEnabled(False)
-        self._layer_boxes["satellite"].setToolTip(
-            "Enabled once the odom ↔ GPS georeference is anchored "
-            "(a few GPS fixes, real or simulated — no motion needed).")
-        layout.addWidget(sec_layers)
+        self._content_layout = layout
 
         # ---- Robot -----------------------------------------------------------
         sec_robot = CollapsibleSection("ROBOT")
@@ -240,14 +213,13 @@ class LeftPanel(QWidget):
         self._diag_grid.addWidget(value, row, 2)
         self._diag_rows[topic] = (led, name, value)
 
+    def set_header(self, widget: QWidget) -> None:
+        """Put *widget* at the very top of the panel (the GUARDIAN box)."""
+        self._content_layout.insertWidget(0, widget)
+
     def set_footer(self, widget: QWidget) -> None:
         """Pin *widget* below the scroll area (the run session's RUN box)."""
         self._outer.addWidget(widget)
-
-    def set_satellite_available(self, available: bool) -> None:
-        box = self._layer_boxes["satellite"]
-        if box.isEnabled() != available:
-            box.setEnabled(available)
 
 
 def _battery_text(r) -> tuple[str, str]:

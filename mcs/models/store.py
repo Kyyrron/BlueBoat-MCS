@@ -61,6 +61,8 @@ class RobotState:
     lon: float | None = None
     compass_heading: float | None = None    # true heading, rad CCW-from-east
     fcu_connected: bool = False
+    armed: bool = False                     # /mavros/state: the AUTOPILOT's arming
+    fcu_mode: str = ""                      # /mavros/state: ArduPilot mode name
     battery_v: float | None = None          # pack voltage, None = not reported
     battery_pct: float | None = None        # charge fraction 0..1
     battery_t: float | None = None          # reception time of the last message
@@ -197,6 +199,7 @@ class DataStore:
         self._t0: float | None = None             # experiment time origin
         self.sea = None                           # SeaReadout | None (sim only)
         self.replay = None                        # ReplayReadout | None (bag replay)
+        self.guardian = None                      # GuardianReadout | None (real sessions)
 
     # -------------------------------------------------------------- updates
     def on_odom(self, t: float, pose, twist) -> None:
@@ -237,6 +240,13 @@ class DataStore:
         if r is not None:
             self.sea = r
 
+    def on_guardian_status(self, t: float, payload: dict) -> None:
+        """Latest link-guardian report (``/link_guardian/status`` JSON)."""
+        from mcs.core.guardian import GuardianReadout
+        r = GuardianReadout.from_json(payload, received_mono=t)
+        if r is not None:
+            self.guardian = r
+
     def on_replay_state(self, t: float, payload: dict) -> None:
         """Latest bag-replay state (``/replay/state`` JSON)."""
         from mcs.core.replay import parse_state
@@ -264,11 +274,12 @@ class DataStore:
             self.geo.add_pair(t, r.x, r.y, lat, lon)
 
     def on_mavros_state(self, t: float, connected: bool, armed: bool, mode: str) -> None:
-        # Only the connection flag is consumed (the readiness count in the left
-        # panel). `armed` and `mode` are kept in the signal signature because
-        # they ride the same mavros_msgs/State message, but nothing displays
-        # them -- storing them would be state no widget ever reads.
+        # The connection flag feeds the readiness count; the arming state and
+        # the ArduPilot mode the GUARDIAN box (v1.1) - the autopilot's own
+        # arming, distinct from robot_interface's motor gate.
         self.robot.fcu_connected = connected
+        self.robot.armed = armed
+        self.robot.fcu_mode = mode
 
     def on_battery(self, t: float, volts, pct) -> None:
         """A field the FCU does not report arrives as None and must not

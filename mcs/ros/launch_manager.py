@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -212,6 +213,27 @@ def companion_command(cfg, params: LaunchParameters) -> list[str] | None:
             f"world_name:={cfg.sea.stock_world_name}", *params.sea_args()]
 
 
+def guardian_command(cfg, params: LaunchParameters) -> list[str] | None:
+    """The link-guardian companion for a real-robot launch, or None.
+
+    ``guardian.py watch`` (superproject ``link_guardian/laptop/``) switches the
+    on-boat guardian ON for the session, moves HOME to each run start, reports
+    on ``/link_guardian/status`` and obeys ``/link_guardian/command`` (the
+    GUARDIAN box). Every real-robot launch gets it (by the user's order,
+    2026-10-14: the boat must be able to return home whenever this laptop
+    disappears); simulation and bag replay never do. ``cfg`` is the
+    ``AppConfig``. Module scope and Qt-free so the smoke test can pin it; None
+    also when the script is missing (the box then says so)."""
+    if params.simulation or params.replay_bag or not cfg.guardian.enabled:
+        return None
+    script = Path(cfg.guardian.script).expanduser()
+    if not script.is_file():
+        return None
+    # The station's own interpreter: rclpy comes from the sourced workspace,
+    # exactly as for the station itself.
+    return [sys.executable, "-u", str(script), "watch"]
+
+
 def launch_target(cfg, params: LaunchParameters) -> tuple[str, str]:
     """(package, launch file) for the given parameters.
 
@@ -235,7 +257,10 @@ class LaunchManager(QObject):
         self._cfg = cfg
         self._bus = bus
         self._proc: subprocess.Popen[bytes] | None = None
-        self._sea_proc: subprocess.Popen[bytes] | None = None
+        # Companion processes of the current launch, each in its own session:
+        # ('sea', sea_state_launch.py) for an empty-world Gazebo run,
+        # ('guardian', guardian.py watch) for a real-robot run.
+        self._companions: list[tuple[str, subprocess.Popen[bytes]]] = []
         self._reader: threading.Thread | None = None
         self._state = "idle"
         self._exit_poll_active = False
@@ -296,55 +321,64 @@ class LaunchManager(QObject):
             target=self._pump_output, name="launch-output", daemon=True
         )
         self._reader.start()
-        self._start_companion(params, launch_cwd)
+        self._companions = []
+        self._start_companion("sea", companion_command(self._cfg, params), launch_cwd,
+                              "mission continues without sea state")
+        guardian = guardian_command(self._cfg, params)
+        self._start_companion("guardian", guardian, launch_cwd,
+                              "the link guardian is NOT supervised from the station")
+        if (guardian is None and not params.simulation and not params.replay_bag
+                and self._cfg.guardian.enabled):
+            self._bus.launch_output.emit(
+                f"[guardian] {self._cfg.guardian.script} not found - the link guardian "
+                "cannot be switched on from the station.")
         # Watch for the process dying on its own (crash, bad launch argument):
         # without this the state machine stayed at 'starting'/'running' forever
         # and the Launch button never re-enabled.
         self._watch_exit()
         return True
 
-    def _start_companion(self, params: LaunchParameters, cwd: Path) -> None:
-        """Best effort: the sea-state companion never aborts a mission."""
-        cmd = companion_command(self._cfg, params)
+    def _start_companion(self, tag: str, cmd: list[str] | None, cwd: Path,
+                         consequence: str) -> None:
+        """Best effort: a companion never aborts a mission."""
         if cmd is None:
             return
-        self._bus.launch_output.emit("$ " + " ".join(cmd) + "   [sea]")
+        self._bus.launch_output.emit("$ " + " ".join(cmd) + f"   [{tag}]")
         try:
-            self._sea_proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 cwd=str(cwd), start_new_session=True)
         except OSError as exc:
             self._bus.launch_output.emit(
-                f"[sea] companion launch failed ({exc}); mission continues "
-                "without sea state")
-            self._sea_proc = None
+                f"[{tag}] companion launch failed ({exc}); {consequence}")
             return
-        threading.Thread(target=self._pump_companion, name="sea-output",
-                         daemon=True).start()
+        self._companions.append((tag, proc))
+        threading.Thread(target=self._pump_companion, args=(tag, proc),
+                         name=f"{tag}-output", daemon=True).start()
 
-    def _pump_companion(self) -> None:
-        proc = self._sea_proc
-        if proc is None or proc.stdout is None:
+    def _pump_companion(self, tag: str, proc: subprocess.Popen[bytes]) -> None:
+        if proc.stdout is None:
             return
         for raw in proc.stdout:
             line = raw.decode(errors="replace").rstrip()
             if line:
-                self._bus.launch_output.emit("[sea] " + line)
+                self._bus.launch_output.emit(f"[{tag}] " + line)
 
-    def _signal_companion(self, sig: signal.Signals, proc=None) -> None:
-        """Signal the sea-state companion.
+    def _signal_companions(self, sig: signal.Signals, procs=None) -> None:
+        """Signal the companions.
 
-        `proc` is passed explicitly by the escalation chain, which must act on
-        the companion it was started for and never on whatever happens to be in
-        `self._sea_proc` by the time it fires.
+        `procs` is passed explicitly by the escalation chain, which must act on
+        the companions it was started for and never on whatever happens to be
+        in `self._companions` by the time it fires.
         """
-        proc = self._sea_proc if proc is None else proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(os.getpgid(proc.pid), sig)
-        except ProcessLookupError:
-            pass
+        procs = [p for _, p in self._companions] if procs is None else procs
+        for proc in procs:
+            if proc.poll() is not None:
+                continue
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except ProcessLookupError:
+                pass
 
     def notify_running(self) -> None:
         """Promote 'starting' -> 'running' once telemetry says the graph is up.
@@ -367,7 +401,7 @@ class LaunchManager(QObject):
         self._set_state("stopping")
         pgid = os.getpgid(self._proc.pid)
         self._bus.launch_output.emit("Stopping mission (SIGINT to launch group)…")
-        self._signal_companion(signal.SIGINT)
+        self._signal_companions(signal.SIGINT)
         try:
             os.killpg(pgid, signal.SIGINT)
         except ProcessLookupError:
@@ -376,16 +410,17 @@ class LaunchManager(QObject):
 
         # The escalation fires seconds later, and the Launch button re-enables
         # the moment the state goes idle. Both lambdas therefore capture the
-        # process they were armed for: reading self._proc / self._sea_proc at
+        # process they were armed for: reading self._proc / the companions at
         # fire time meant a relaunch inside the 12 s window killpg'd a recycled
         # pgid and SIGTERM'd the NEW sea companion. They are also cancelled by
         # _finalise() as soon as the tree is actually gone.
-        doomed, doomed_sea = self._proc, self._sea_proc
+        doomed = self._proc
+        doomed_companions = [p for _, p in self._companions]
 
         def escalate(sig: signal.Signals, label: str) -> None:
             if self._proc is not doomed:
                 return          # that launch is long gone; this is a later one
-            self._signal_companion(sig, doomed_sea)
+            self._signal_companions(sig, doomed_companions)
             if self.running:
                 self._bus.launch_output.emit(f"Nodes still alive — sending {label}.")
                 try:
@@ -435,9 +470,9 @@ class LaunchManager(QObject):
             code = self._proc.poll()
             self._bus.launch_output.emit(f"Mission process exited (code {code}).")
         self._proc = None
-        if self._sea_proc is not None:
-            self._signal_companion(signal.SIGTERM)
-            self._sea_proc = None
+        if self._companions:
+            self._signal_companions(signal.SIGTERM)
+            self._companions = []
         self._set_state("idle")
 
     def _pump_output(self) -> None:

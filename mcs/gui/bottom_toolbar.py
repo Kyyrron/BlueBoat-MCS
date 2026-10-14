@@ -69,6 +69,9 @@ class BottomToolbar(QWidget):
         self._launcher = launcher
         self._commands = commands
         self._session_active = False      # a real-robot run session is launched
+        # Link guardian (v1.1): consulted before Turn Off Connection; it calls
+        # the continuation when the stop may go ahead (MainWindow sets it).
+        self._stop_guard = None
 
         outer = QVBoxLayout(self)
         self.setSizePolicy(
@@ -331,12 +334,23 @@ class BottomToolbar(QWidget):
         if self._launcher.start(params):
             self.mission_launched.emit(params)
 
+    def set_stop_guard(self, guard) -> None:
+        """``guard(proceed)`` runs before every Stop Mission / Turn Off
+        Connection and calls ``proceed()`` only when the stop may go ahead
+        (the link-guardian choice, v1.1)."""
+        self._stop_guard = guard
+
     def _on_stop(self) -> None:
+        if self._stop_guard is not None:
+            self._stop_guard(self._do_stop)
+            return
+        self._do_stop()
+
+    def _do_stop(self) -> None:
         # Stop Mission is also a node-termination path, so it runs the same
         # guarantee as E-STOP: publish 'default', confirm transmission, and
         # only then terminate (CommandCenter.safe_shutdown — never a direct
         # launcher.stop()).
-        
         self._commands.safe_stop_mission()
         self.mission_stopped.emit()
 

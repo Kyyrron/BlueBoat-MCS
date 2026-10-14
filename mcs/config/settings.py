@@ -43,6 +43,9 @@ class TopicsConfig:
     # (String JSON, heartbeated 1 Hz) and robot_interface's per-run log state.
     run_state: str = "/blueboat/run_state"
     run_log: str = "/blueboat/run_log"
+    # Link guardian (v1.1, real-robot sessions): the report of its laptop
+    # companion guardian.py watch (String JSON, 1 Hz).
+    guardian_status: str = "/link_guardian/status"
 
     # --- Simulation only (BlueBoat-SSS-Sim sea_state_node): the live sea
     # state (String JSON, latched, 2 Hz) and the command that changes it.
@@ -60,6 +63,9 @@ class TopicsConfig:
     # stop) and the arrow-key thrust stream ([right, left] N, [] = release).
     run_command: str = "/blueboat/run_command"
     arrow_thrust: str = "/blueboat/arrow_thrust"
+    # Link guardian commands to guardian.py watch (String JSON:
+    # {cmd: on|off|check|setup|reclaim, seq}).
+    guardian_command: str = "/link_guardian/command"
 
     # --- Services ---
     path_request: str = "/path_request"
@@ -89,6 +95,7 @@ class DiagnosticsConfig:
         "/sim/sea_state": 3.0,
         "/blueboat/run_state": 3.0,
         "/blueboat/run_log": 3.0,
+        "/link_guardian/status": 3.0,
     })
     stale_age_multiplier: float = 4.0
     expected_hz: dict[str, float] = field(default_factory=lambda: {
@@ -104,6 +111,7 @@ class DiagnosticsConfig:
         "/sim/sea_state": 2.0,
         "/blueboat/run_state": 1.0,
         "/blueboat/run_log": 1.0,
+        "/link_guardian/status": 1.0,
     })
     rate_window_s: float = 5.0
     update_period_s: float = 1.0
@@ -206,6 +214,28 @@ class ReplayConfig:
     state_fresh_s: float = 3.0
     # GPS points sampled from the bag to choose eligible worlds.
     world_track_points: int = 400
+
+
+def _default_guardian_script() -> str:
+    # The superproject's link_guardian/ sits beside this repository
+    # (<superproject>/BlueBoat-MCS/mcs/config/settings.py).
+    return str(Path(__file__).resolve().parents[3]
+               / "link_guardian" / "laptop" / "guardian.py")
+
+
+@dataclass
+class GuardianConfig:
+    """Link guardian (v1.1): its laptop companion, started with every
+    real-robot session (``launch_manager.guardian_command``)."""
+
+    enabled: bool = True
+    # guardian.py of the superproject's link_guardian/ (absent in a standalone
+    # clone of this repository: the GUARDIAN box then says so).
+    script: str = field(default_factory=_default_guardian_script)
+    # Turn Off Connection / exit, "turn the guardian off first": how long to
+    # wait for the autopilot to confirm LGRD_ON = 0, then for the disarm.
+    off_confirm_timeout_s: float = 6.0
+    disarm_confirm_timeout_s: float = 4.0
 
 
 @dataclass
@@ -356,6 +386,7 @@ class AppConfig:
     run: RunConfig = field(default_factory=RunConfig)
     arrows: ArrowConfig = field(default_factory=ArrowConfig)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
+    guardian: GuardianConfig = field(default_factory=GuardianConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
 

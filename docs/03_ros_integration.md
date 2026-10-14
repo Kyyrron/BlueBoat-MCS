@@ -11,7 +11,7 @@ defaults below match the stack as provided.
 | `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface.py` | World pose in **local ENU** (origin = launch point, axes East/North, yaw **absolute** ENU — 0 = East, CCW+), heading fallback, speed, trajectory, travelled distance, georeference input |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | MAVROS | Robot GPS read-out, georeference input (BEST_EFFORT QoS) |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **Robot glyph heading (preferred source)** — degrees clockwise from north (0=N, 90=E), converted to the app convention (radians CCW from east) as `radians(90 - hdg)`. The fallback is the odom yaw directly, which is absolute ENU too. BEST_EFFORT QoS |
-| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connected** flag (one of the three readiness inputs); `armed`/`mode` arrive on the same message but nothing displays them. Only subscribed when `mavros_msgs` imports; absent in simulation |
+| `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connected** flag (one of the three readiness inputs); since v1.1 also `armed` (the **autopilot's** arming, not the motor gate) and `mode` for the GUARDIAN box. Only subscribed when `mavros_msgs` imports; absent in simulation |
 | `/mavros/battery` | `sensor_msgs/BatteryState` | MAVROS (`sys_status`) | Battery charge in the left panel's ROBOT section. `percentage` is a **0..1 fraction** (MAVROS divides the MAVLink percent by 100); `percentage`/`voltage` arrive NaN when the FCU reports neither and are then shown as "no data" rather than as a number. BEST_EFFORT QoS. Real boat only — no simulation graph publishes it |
 | `/blueboat/pinger_coordinates` | `Float32MultiArray[3]` | `robot_interface.py` | Pinger in **robot/body frame** (sensor-fused); distance; world position computed once per message, with the pose concurrent with it, and held fixed in between (§3 N4) |
 | `/uw_gps_data` | `Float32MultiArray[19]` | `uwgps_log.py` | Timestamp of the last raw USBL packet ("Last update" field) |
@@ -21,6 +21,7 @@ defaults below match the stack as provided.
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set.py` | Confirmation echo of `default`/`override`; E-STOP acknowledgement |
 | `/blueboat/run_state` | `std_msgs/String` (JSON) | `master_control.py` | **Real-robot run session only.** `{seq, ok, detail, state: idle/loading/running/error, controller_type, use_pinger, note, mission, run, npy}`: the answer to every run command (`seq`) and a 1 Hz heartbeat. Drives the RUN box and START RUN's gating; it is the truth about whether a run is active |
 | `/blueboat/run_log` | `std_msgs/String` (JSON) | `robot_interface.py` | **Real-robot run session only.** `{run, logging, csv, layout, bag_enabled, bag_recording, bag}`, 1 Hz: confirms the run's position CSV is being written (RUN box "Log" row; flagged if a started run is not confirmed within 3 s) and, since v1.1, its ros2bag (RUN box "Bag" row, flagged the same way; the `bag_*` fields are absent from an older control stack) |
+| `/link_guardian/status` | `std_msgs/String` (JSON) | `guardian.py watch` (superproject `link_guardian/`, started by the station) | **Real-robot session only (v1.1).** 1 Hz: `{connected, armed, mode, want_on, guardian_on, check{ready, script, items[{name, level, text}]}, home{lat, lon, source}, run_running, messages[], busy, ack{seq, cmd, ok, detail}}` → the GUARDIAN box (`mcs.core.guardian`) |
 | `/replay/state` | `std_msgs/String` (JSON) | `bag_replay` (BlueBoat-Control) | **Bag replay only (v1.1).** `{bag, t, duration, rate, paused, finished, frame, world, world_offset, pose_source, gazebo}` at 2 Hz → the floating REPLAY box. Subscribed **TRANSIENT_LOCAL depth 1**, like the sea state |
 | `/sim/sea_state` | `std_msgs/String` (JSON) | BlueBoat-SSS-Sim `sea_state_node` | **Simulation only.** The live sea situation (current mean / instantaneous speed and direction at the boat / variation level, waves strength / Hs / Tp / from-bearing / status / passing wake, the boat's roll / pitch / heave std over 30 s, next planned change or blend progress, summary) shown in the floating SEA STATE box (top-left of the map view). Subscribed **TRANSIENT_LOCAL depth 1** to match the node's latched publisher, so a station started after the simulator still gets the current situation at once |
 
@@ -32,6 +33,9 @@ defaults below match the stack as provided.
 | `/blueboat/input_str` | `std_msgs/String` | `"override"` | Direct-control parameters; the other state of the toggle button. |
 | `/blueboat/input_str` | `std_msgs/String` | `"stop"` | **The emergency primitive.** `robot_interface.full_stop()` zeroes the thrust, closes the motor gate, disarms and **latches** until an explicit `enable`. Stays in override and terminates nothing. Published by both E-STOP buttons. |
 | `/blueboat/input_str` | `std_msgs/String` | `"enable"` | `robot_interface.release_estop()`: clears the E-STOP latch **and turns the motor gate on**. Published by **Release E-STOP**, offered only in a run session launched with motors enabled, while the latch is on. |
+| `/blueboat/input_str` | `std_msgs/String` | `"rearm"` | **Real-robot session (v1.1).** `robot_interface` re-runs its arm-before-override sequence (`default` mapping → arm → `override`; refused during a run or while the E-STOP latch is on). GUARDIAN box **Arm again**. |
+| `/blueboat/input_str` | `std_msgs/String` | `"disarm"` | Disarms the autopilot. Published only by the Turn Off Connection / exit choice "Guardian OFF + disarm", after the guardian is confirmed OFF. |
+| `/link_guardian/command` | `std_msgs/String` (JSON) | `{"cmd": "on"\|"off"\|"check"\|"setup"\|"reclaim", "seq": n}` | **Real-robot session only (v1.1).** To `guardian.py watch`: the guardian flag `LGRD_ON` on the autopilot, the readiness check, the recommended failsafe parameters, and Take back control (HOLD → servo mapping back to `param_set`'s → MANUAL). Answered in `/link_guardian/status.ack`. |
 | `/blueboat/manual_target` | `Float32MultiArray[2]` | `[x, y]` world metres | `master_control` steers to it with LoS, overriding the mission. |
 | `/blueboat/manual_target` | `Float32MultiArray[2]` | `[0.0, 0.0]` | Sentinel: `master_control` resumes the original mission (between the runs of a session: just releases the target). Published **only** by the explicit **Continue Original Mission** / **Release Target** action (`main_window._on_continue_mission`); arming or disarming Manual Target publishes nothing, and a genuine origin click is nudged by `1e-3` (N2). Turning arrow control off publishes the boat's own position here (hold where released). |
 | `/blueboat/run_command` | `std_msgs/String` (JSON) | `{"cmd": "configure", "controller_type": "PID", "use_pinger": false, "note": "dock", "mission": "lawn_a", "seq": 7}` · `{"cmd": "start", "seq": 8}` · `{"cmd": "stop", "seq": 9}` | **Real-robot run session only** (`master_control`). `configure` sets the next run (refused during a run; MPC with the pinger refused; MPC built on a worker thread → `state: loading`), `start` starts following + logging (refused unless `state: idle`), `stop` ends the run. `configure` is re-sent until acknowledged; `start` / `stop` are sent once (RUN box, Turn Off Connection). |
@@ -85,7 +89,9 @@ ros2 launch blueboat_control BlueBoat_launch.py \
 ```
 
 **Every real-robot launch is a run session (2026-10-09).** The boat connects and
-goes into override (`robot_interface`'s handshake, unchanged), then `master_control`
+goes into override (`robot_interface`'s handshake; since v1.1 it first **arms the
+autopilot** in the normal mapping — ArduPilot refuses to arm on passthrough — for the
+link guardian, and proceeds anyway after `arm_timeout`), then `master_control`
 **idles**: Manual Target and the arrow keys drive the boat, nothing follows a path or
 the pinger, `robot_interface` writes no CSV and `master_control` no `.npy`. The
 lifecycle, all on `/blueboat/run_command` / `/blueboat/run_state`:
@@ -107,6 +113,13 @@ lifecycle, all on `/blueboat/run_command` / `/blueboat/run_state`:
    a non-anchored one is placed only when its run starts.
 5. **Turn Off Connection** — an active run is stopped first, then the safe-shutdown
    sequence below, unchanged.
+
+**Link guardian companion (v1.1).** With every real-robot launch the station also
+starts `python3 <superproject>/link_guardian/laptop/guardian.py watch`
+(`launch_manager.guardian_command`, `GuardianConfig.script`; console prefix
+`[guardian]`, stopped with the launch like the sea companion). It switches the
+on-boat guardian ON (`LGRD_ON = 1`), moves HOME to each run's start and back
+(`/mavros/cmd/set_home`), and serves the GUARDIAN box over `/link_guardian/*`.
 
 The station passes `session_mode:=True` on every real launch; without it (CLI)
 `BlueBoat_launch.py` keeps the one-launch-one-mission behaviour. Built-in shapes are
@@ -294,6 +307,13 @@ to whatever else is transmitting — which is the operator's separate second
 action, not part of a panic button.
 
 ## Safe-shutdown sequence (normative — guards **every** termination path)
+
+**Link guardian pre-step (v1.1).** In a real-robot session, while the guardian may be
+ON (`mcs.core.guardian.needs_turn_off_choice` — a silent companion counts as ON), Turn
+Off Connection and Application Exit first ask: *Guardian OFF + disarm* (`off` on
+`/link_guardian/command`, wait for its acknowledgement, then `disarm`, then the
+sequence below — and if the OFF cannot be confirmed, nothing terminates), *Keep ON*
+(the sequence below; the boat then returns HOME on its own), or *Cancel*.
 
 **Stop Mission** (**Turn Off Connection** in a run session) and **Application Exit** —
 the only two paths that terminate anything — run the same sequence

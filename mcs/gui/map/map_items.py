@@ -55,17 +55,16 @@ class PolylineItem(QGraphicsPathItem):
 
 
 class RobotItem(QGraphicsItemGroup):
-    """Boat glyph (constant pixel size) + world-scaled heading arrow.
+    """Boat glyph (constant pixel size), rotated to the boat's heading.
 
     Yaw convention: identical to the stack (``master_control`` /
     ``bridge_node`` both take yaw from ``R.from_quat(...).as_euler('xyz')``:
-    CCW-positive about +z in the y-up world frame). The *heading arrow* is a
-    plain world-coordinate line, so the view's y-flip orients it correctly
-    for free. The *glyph*, however, uses ``ItemIgnoresTransformations`` and
-    is therefore rotated in **device** space, where +y points down and Qt
-    rotations are clockwise-positive — a world yaw θ must be applied as
-    ``setRotation(-degrees(θ))`` there, otherwise the glyph renders mirrored
-    about the x-axis (the original "arrow not properly oriented" defect).
+    CCW-positive about +z in the y-up world frame). The glyph uses
+    ``ItemIgnoresTransformations`` and is therefore rotated in **device**
+    space, where +y points down and Qt rotations are clockwise-positive — a
+    world yaw θ must be applied as ``setRotation(-degrees(θ))`` there,
+    otherwise the glyph renders mirrored about the x-axis (the original
+    "arrow not properly oriented" defect).
     """
 
     def __init__(self) -> None:
@@ -79,12 +78,6 @@ class RobotItem(QGraphicsItemGroup):
         self._glyph.setPen(QPen(QColor("white"), 1.2))
         self._glyph.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.addToGroup(self._glyph)
-        # Heading arrow: world-scaled SOLID white line ahead of the boat
-        # (solid, so it can never be confused with the dashed target line).
-        self._arrow = QGraphicsLineItem()
-        self._arrow.setPen(_cosmetic_pen(QColor("white"), 1.8))
-        self.addToGroup(self._arrow)
-        self._arrow_visible = False
 
     def set_pose(self, x: float, y: float, heading: float) -> None:
         """Place the glyph at scene (x, y) pointing at scene ``heading``.
@@ -93,20 +86,11 @@ class RobotItem(QGraphicsItemGroup):
         is axis-aligned: the caller passes coordinates and heading already in
         scene axes (ENU true heading once georeferenced, raw world yaw
         before). The glyph ignores view transforms and is rotated in
-        **device** space (y-down, CW-positive), hence ``-degrees(heading)``;
-        the arrow is a plain scene line and picks up the view's y-flip for
-        free. This is the whole orientation contract — there is no separate
+        **device** space (y-down, CW-positive), hence ``-degrees(heading)``.
+        This is the whole orientation contract — there is no separate
         view-rotation term any more."""
         self._glyph.setPos(x, y)
         self._glyph.setRotation(-math.degrees(heading))
-        length = 4.0  # metres of look-ahead
-        self._arrow.setLine(QLineF(
-            x, y, x + length * math.cos(heading), y + length * math.sin(heading)))
-        self._arrow.setVisible(self._arrow_visible)
-
-    def set_heading_visible(self, visible: bool) -> None:
-        self._arrow_visible = visible
-        self._arrow.setVisible(visible)
 
 
 class MarkerItem(QGraphicsItemGroup):

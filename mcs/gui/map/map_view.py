@@ -23,7 +23,7 @@ Provides:
 
 * smooth wheel zoom anchored under the cursor, drag panning;
 * toggleable layers: satellite, robot trajectory, mission path, pinger
-  (position + trajectory), robot↔target line, heading arrow, metric grid;
+  (position + trajectory), robot↔target line, metric grid;
 * a click inspector (world + GPS coordinates + live distance to robot);
 * the Distance Tool (two-click measurement, ported from the SSS viewer);
 * the Manual Target tool (publishes ``/blueboat/manual_target``, highlights
@@ -238,7 +238,6 @@ class MapView(QGraphicsView):
             "pinger": self._set_pinger_layer_enabled,
             "pinger_track": _intent("_pinger_track_enabled", self.pinger_track),
             "target_line": _intent("_target_line_enabled", self.target_line),
-            "heading": self.robot_item.set_heading_visible,
             "grid": self._set_grid_visible,
         }
         fn = mapping.get(layer)

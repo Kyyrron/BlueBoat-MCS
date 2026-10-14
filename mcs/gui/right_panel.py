@@ -4,6 +4,8 @@ Restructured as a vertical splitter so monitoring and the launch console
 share the column without crowding each other:
 
 * **Top part** (scrollable stack)
+  * **Layers** — visibility checkboxes for every map layer (moved here from the
+    left column in v1.1, directly above the map tools they go with).
   * **Map tools** — Zoom +, Zoom −, and *Center Robot* (a one-shot recenter;
     the camera stays completely free afterwards — never a follow mode).
   * **Live distance plot** — robot ↔ current target distance vs time.
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -37,12 +40,24 @@ from mcs.gui.plot.distance_plot import DistancePlot
 from mcs.gui.widgets import CollapsibleSection, RangeSlider
 from mcs.models.store import DataStore, TargetMode
 
+#: (key, label, visible by default) — keys as MapView.set_layer_visible knows them.
+_LAYERS: list[tuple[str, str, bool]] = [
+    ("satellite", "Satellite map layer", False),
+    ("robot_track", "Robot trajectory", True),
+    ("mission_path", "Published mission path", True),
+    ("pinger", "USBL pinger position", True),
+    ("pinger_track", "USBL pinger trajectory", True),
+    ("target_line", "Robot → target line", True),
+    ("grid", "World grid", True),
+]
+
 
 class RightPanel(QWidget):
     """Monitoring sidebar: map tools, plot, timeline, statistics, console."""
 
     #: rel_t0, rel_t1, live
     time_window_changed = Signal(float, float, bool)
+    layer_toggled = Signal(str, bool)
     zoom_in_requested = Signal()
     zoom_out_requested = Signal()
     center_robot_requested = Signal()
@@ -71,6 +86,21 @@ class RightPanel(QWidget):
         layout = QVBoxLayout(top)
         layout.setContentsMargins(0, 0, 0, 4)
         layout.setSpacing(6)
+
+        # ---- Layers -----------------------------------------------------------
+        sec_layers = CollapsibleSection("LAYERS")
+        self._layer_boxes: dict[str, QCheckBox] = {}
+        for key, label, default in _LAYERS:
+            box = QCheckBox(label)
+            box.setChecked(default)
+            box.toggled.connect(lambda on, k=key: self.layer_toggled.emit(k, on))
+            self._layer_boxes[key] = box
+            sec_layers.add_widget(box)
+        self._layer_boxes["satellite"].setEnabled(False)
+        self._layer_boxes["satellite"].setToolTip(
+            "Enabled once the odom ↔ GPS georeference is anchored "
+            "(a few GPS fixes, real or simulated — no motion needed).")
+        layout.addWidget(sec_layers)
 
         # ---- Map tools ------------------------------------------------------
         sec_tools = CollapsibleSection("MAP TOOLS")
@@ -136,6 +166,11 @@ class RightPanel(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([560, 320])
+
+    def set_satellite_available(self, available: bool) -> None:
+        box = self._layer_boxes["satellite"]
+        if box.isEnabled() != available:
+            box.setEnabled(available)
 
     # ------------------------------------------------------------------ ticks
     def refresh(self) -> None:

@@ -46,6 +46,8 @@ class SignalBus(QObject):
     run_log_received = Signal(float, object)
     #: t_mono, decoded /replay/state JSON (bag_replay, Gazebo replay of a run)
     replay_state_received = Signal(float, object)
+    #: t_mono, decoded /link_guardian/status JSON (guardian.py watch, real sessions)
+    guardian_status_received = Signal(float, object)
 
     # ---- Mission path ----------------------------------------------------
     #: list[(x, y, yaw)] returned by the /path_request service

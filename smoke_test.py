@@ -1868,7 +1868,7 @@ _os.killpg(_os.getpgid(_doomed.pid), _signal.SIGKILL); _doomed.wait()
 
 _survivor = _deaf_child()                        # the NEW launch
 _lm._proc = _survivor
-_lm._sea_proc = None
+_lm._companions = []
 for _t in _pending:
     _t.stop()
     _t.timeout.emit()                       # fire as if the delay had elapsed
@@ -2463,6 +2463,231 @@ try:
 finally:
     _rss.log, _rss.run_active = _r_log, _r_active
 print("replay ok")
+
+# --- Layers in the right column, no heading arrow (v1.1) ---
+# LAYERS moved from the left column to the right one, directly above MAP
+# TOOLS; the robot heading arrow is gone from the map entirely (the glyph
+# keeps rotating to its heading).
+from PySide6.QtWidgets import QToolButton as _QTB
+
+assert not hasattr(w.left_panel, "_layer_boxes"), "layers still in the left column"
+assert "heading" not in w.right_panel._layer_boxes
+assert not hasattr(w.map_view.robot_item, "set_heading_visible")
+assert not hasattr(w.map_view.robot_item, "_arrow")
+_titles = [b.text() for b in w.right_panel.findChildren(_QTB)]
+assert _titles.index("LAYERS") < _titles.index("MAP TOOLS"), _titles
+_lb = w.right_panel._layer_boxes
+_lb["robot_track"].setChecked(False)
+assert w.map_view._robot_track_enabled is False
+_lb["robot_track"].setChecked(True)
+assert w.map_view._robot_track_enabled is True
+w.right_panel.set_satellite_available(True)
+assert _lb["satellite"].isEnabled()
+w.right_panel.set_satellite_available(False)
+assert not _lb["satellite"].isEnabled()
+# The GUARDIAN box heads the left column.
+assert w.left_panel._content_layout.itemAt(0).widget() is w.guardian_box
+print("layers ok")
+
+# --- Link guardian (v1.1, 2026-10-14) ---
+import types as _types
+
+from mcs.core import guardian as _g
+from mcs.ros.launch_manager import LaunchParameters as _LP
+from mcs.ros.launch_manager import guardian_command as _gcmd
+
+# The companion: every real-robot launch, never a simulation or a replay.
+_gc_cfg = AppConfig()
+_gc = _gcmd(_gc_cfg, _LP(session=True))
+assert _gc is not None and _gc[0] == sys.executable and _gc[-1] == "watch", _gc
+assert _gc[-2].endswith(os.path.join("link_guardian", "laptop", "guardian.py"))
+assert _gcmd(_gc_cfg, _LP(simulation=True)) is None
+assert _gcmd(_gc_cfg, _LP(simulation=True, replay_bag="/b")) is None
+_gc_cfg.guardian.enabled = False
+assert _gcmd(_gc_cfg, _LP(session=True)) is None
+_gc_cfg.guardian.enabled = True
+_gc_cfg.guardian.script = "/nonexistent/guardian.py"
+assert _gcmd(_gc_cfg, _LP(session=True)) is None
+
+# The companion's report, decoded.
+_now = time.monotonic()
+_ready = {"ready": True, "script": True, "items": [
+    {"name": "Script", "level": "ok", "text": "installed"},
+    {"name": "FS_THR_ENABLE", "level": "warn", "text": "1 (recommended 0)"}]}
+_rd = _g.GuardianReadout.from_json(
+    {"connected": True, "armed": True, "mode": "MANUAL", "want_on": True,
+     "guardian_on": True, "check": _ready,
+     "home": {"lat": 33.93, "lon": 130.73, "source": "run start"},
+     "messages": [{"text": "LinkGuard: ON - return HOME after 5 s without laptop"}],
+     "busy": None, "ack": {"seq": 3, "cmd": "check", "ok": True, "detail": "READY"}},
+    received_mono=_now)
+assert _rd.guardian_on is True and _rd.ready and _rd.script_installed
+assert _g.GuardianReadout.from_json("nope") is None
+
+
+def _sum(r, **kw):
+    args = {"real_session": True, "companion_found": True, "fcu_connected": True,
+            "armed": True, "mode": "MANUAL", "run_active": False,
+            "estop_latched": False, "now": _now}
+    args.update(kw)
+    return _g.summarize(r, **args)
+
+
+_v = _sum(_rd, real_session=False)
+assert _v.state.startswith("OFF") and not any(
+    a.enabled for a in (_v.check, _v.setup_action, _v.toggle, _v.rearm, _v.reclaim))
+_v = _sum(_rd)
+assert _v.state.startswith("ON — returns HOME"), _v.state
+assert _v.level == "ok" and _v.setup[0].startswith("READY (1 advice)")
+assert _v.home[0].endswith("(run start)")
+assert _v.check.enabled and _v.toggle.enabled and not _v.toggle_on
+assert not _v.rearm.enabled and "already armed" in _v.rearm.reason
+assert not _v.reclaim.enabled                        # nothing to take back
+_v = _sum(_rd, armed=False)
+assert "arms itself" in _v.state and _v.level == "warn" and _v.rearm.enabled
+assert not _sum(_rd, armed=False, estop_latched=True).rearm.enabled
+assert not _sum(_rd, armed=False, run_active=True).rearm.enabled
+_v = _sum(_rd, mode="RTL")
+assert _v.state.startswith("TAKEN OVER") and _v.reclaim.enabled
+_v = _sum(_rd, mode="RTL", run_active=True)
+assert not _v.reclaim.enabled and "STOP RUN" in _v.reclaim.reason
+_v = _sum(_rd, fcu_connected=False)
+assert _v.state.startswith("LINK LOST") and not _v.check.enabled
+assert _sum(None).state.startswith("Starting the guardian companion")
+assert _sum(_rd, companion_found=False).state.startswith("UNAVAILABLE")
+_stale = _g.GuardianReadout.from_json({"guardian_on": True}, received_mono=_now - 60)
+assert not _sum(_stale).check.enabled                # companion not reporting
+_ni = _g.GuardianReadout.from_json(
+    {"connected": True, "guardian_on": None,
+     "check": {"ready": False, "script": False, "items": []}}, received_mono=_now)
+assert _sum(_ni).state.startswith("NOT INSTALLED") and not _sum(_ni).toggle.enabled
+_off = _g.GuardianReadout.from_json(
+    {"connected": True, "want_on": False, "guardian_on": False, "check": _ready},
+    received_mono=_now)
+_v = _sum(_off)
+assert _v.state.startswith("OFF — the boat will NOT") and _v.toggle_on
+_busy = _g.GuardianReadout.from_json(
+    {"connected": True, "guardian_on": True, "check": _ready, "busy": "setup"},
+    received_mono=_now)
+assert not _sum(_busy).check.enabled and "busy" in _sum(_busy).check.reason
+
+# Turn Off Connection must ask whenever the guardian may still be ON.
+assert not _g.needs_turn_off_choice(_rd, real_session=False, now=_now)
+assert _g.needs_turn_off_choice(None, real_session=True, now=_now)
+assert _g.needs_turn_off_choice(_stale, real_session=True, now=_now)
+assert _g.needs_turn_off_choice(_rd, real_session=True, now=_now)
+assert not _g.needs_turn_off_choice(_off, real_session=True, now=_now)
+assert not _g.needs_turn_off_choice(_ni, real_session=True, now=_now)
+assert _g.command_json("off", 4) == {"cmd": "off", "seq": 4}
+
+# The box in the window: greyed outside a real session, live inside one.
+_gm = w.store.mission
+_g_saved = (_gm.launch_running, _gm.simulation, _gm.replay)
+_rb = w.store.robot
+_r_saved = (_rb.fcu_connected, _rb.armed, _rb.fcu_mode)
+try:
+    _gm.launch_running, _gm.simulation, _gm.replay = False, False, False
+    w._on_tick()
+    assert w.guardian_box.state_label.text().startswith("OFF")
+    assert not w.guardian_box.check_button.isEnabled()
+    _gm.launch_running = True
+    _rb.fcu_connected, _rb.armed, _rb.fcu_mode = True, True, "RTL"
+    w.bus.guardian_status_received.emit(time.monotonic(), {
+        "connected": True, "armed": True, "mode": "RTL", "want_on": True,
+        "guardian_on": True, "check": _ready, "ack": None})
+    app.processEvents()
+    w._on_tick()
+    assert w.guardian_box.state_label.text().startswith("TAKEN OVER")
+    assert w.guardian_box.reclaim_button.isEnabled()
+    assert w.guardian_box.toggle_button.text() == "Turn OFF"
+    assert w.guardian_box.grid._values["Autopilot"].text() == "ARMED · RTL"
+    _sent = []
+    _orig_send = w.commands.send_guardian_command
+    _orig_rearm = w.commands.rearm
+    w.commands.send_guardian_command = lambda cmd, **kw: _sent.append(cmd) or 1
+    w.commands.rearm = lambda: _sent.append("rearm")
+    w.guardian_box.action_requested.emit("check")
+    w.guardian_box.action_requested.emit("rearm")
+    assert _sent == ["check", "rearm"], _sent
+    w.commands.send_guardian_command = _orig_send
+    w.commands.rearm = _orig_rearm
+
+    # Turn Off Connection guard: cancel / keep / off.
+    import mcs.gui.main_window as _mw_mod
+    _orig_ask = _mw_mod.ask_turn_off_choice
+    _orig_off = w.commands.guardian_off_and_disarm
+    _orig_crit = _mw_mod.QMessageBox.critical
+    _proceeded, _crit = [], []
+    _mw_mod.QMessageBox.critical = staticmethod(lambda *a, **k: _crit.append(a[2]))
+    try:
+        _mw_mod.ask_turn_off_choice = lambda parent, exiting: "cancel"
+        w._guardian_stop_guard(lambda: _proceeded.append("stop"))
+        assert _proceeded == []
+        _mw_mod.ask_turn_off_choice = lambda parent, exiting: "keep"
+        w._guardian_stop_guard(lambda: _proceeded.append("stop"))
+        assert _proceeded == ["stop"]
+        _mw_mod.ask_turn_off_choice = lambda parent, exiting: "off"
+        w.commands.guardian_off_and_disarm = lambda done: done(True, "ok")
+        w._guardian_stop_guard(lambda: _proceeded.append("stop2"))
+        assert _proceeded == ["stop", "stop2"]
+        w.commands.guardian_off_and_disarm = lambda done: done(False, "no answer")
+        w._guardian_stop_guard(lambda: _proceeded.append("stop3"))
+        assert _proceeded == ["stop", "stop2"] and _crit, "terminated with the guardian ON"
+        # Outside a real session nothing is asked.
+        _gm.launch_running = False
+        _mw_mod.ask_turn_off_choice = lambda parent, exiting: "cancel"
+        w._guardian_stop_guard(lambda: _proceeded.append("sim"))
+        assert _proceeded[-1] == "sim"
+    finally:
+        _mw_mod.ask_turn_off_choice = _orig_ask
+        _mw_mod.QMessageBox.critical = _orig_crit
+        w.commands.guardian_off_and_disarm = _orig_off
+finally:
+    _gm.launch_running, _gm.simulation, _gm.replay = _g_saved
+    _rb.fcu_connected, _rb.armed, _rb.fcu_mode = _r_saved
+    w.store.guardian = None
+    w._on_tick()
+
+# CommandCenter: 'off' confirmed by the companion, THEN 'disarm', then done -
+# and nothing terminates when the guardian cannot be confirmed OFF.
+from mcs.core.signals import SignalBus as _SB
+from mcs.ros.command_center import CommandCenter as _CC
+
+_go_cfg = AppConfig()
+_go_cfg.guardian.off_confirm_timeout_s = 0.3
+_go_cfg.guardian.disarm_confirm_timeout_s = 0.3
+_go_bus = _SB()
+_go_log = []
+_go_node = _types.SimpleNamespace(
+    publish_guardian_command=lambda p: _go_log.append(("guardian", p["cmd"], p["seq"])),
+    publish_input_str=lambda c: _go_log.append(("input", c)))
+_go_cc = _CC(_go_cfg, _go_bus, _types.SimpleNamespace(node=_go_node),
+             _types.SimpleNamespace(stop=lambda: _go_log.append(("terminate",))))
+_go_done = []
+_go_bus.mavros_state_received.emit(time.monotonic(), True, True, "MANUAL")
+_go_cc.guardian_off_and_disarm(lambda ok, d: _go_done.append((ok, d)))
+assert _go_log[0][:2] == ("guardian", "off")
+_seq = _go_log[0][2]
+_go_bus.guardian_status_received.emit(time.monotonic(), {
+    "guardian_on": False, "ack": {"seq": _seq, "cmd": "off", "ok": True}})
+assert _pump(lambda: ("input", "disarm") in _go_log, 2.0), _go_log
+assert not _go_done                                   # waits for the disarm
+_go_bus.mavros_state_received.emit(time.monotonic(), True, False, "MANUAL")
+assert _pump(lambda: bool(_go_done), 2.0)
+assert _go_done[-1][0] is True and "disarmed" in _go_done[-1][1]
+assert ("terminate",) not in _go_log                  # the caller terminates, later
+# No confirmation -> not ok, no disarm sent.
+_go_log.clear(); _go_done.clear()
+_go_cc.guardian_off_and_disarm(lambda ok, d: _go_done.append((ok, d)))
+assert _pump(lambda: bool(_go_done), 2.0)
+assert _go_done[-1][0] is False and ("input", "disarm") not in _go_log
+# A refused 'off' is not ok either.
+_go_log.clear(); _go_done.clear()
+_go_cc.guardian_off_and_disarm(lambda ok, d: _go_done.append((ok, d)))
+_go_bus.guardian_status_received.emit(time.monotonic(), {
+    "ack": {"seq": _go_log[0][2], "cmd": "off", "ok": False, "detail": "refused"}})
+assert _pump(lambda: bool(_go_done), 2.0) and _go_done[-1][0] is False
+print("guardian ok")
 
 w.close()
 print("window ok")
