@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,10 @@ from mcs.core.sea import SeaChoice
 from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
+
+#: BlueBoat-Perception session modes (the launch dialog's Session row).
+PERCEPTION_NORMAL = "normal"
+PERCEPTION_DATASET = "dataset"
 
 #: Marker every simulated run's log note carries, so a Gazebo poslog can never
 #: be mistaken for a field record. Matches ``Sim_launch.py``'s own ``note``
@@ -94,6 +99,12 @@ class LaunchParameters:
     ``spawn_yaw:=`` is emitted only when ``spawn_yaw_rad`` is set, before
     ``extra_args`` — so an operator ``spawn_yaw:=`` in Extra args overrides
     it (in ``ros2 launch`` the last occurrence wins).
+
+    ``perception_mode`` (2026-10-16) is no launch argument of any of the
+    four files -- ``to_cli`` ignores it. It is the BlueBoat-Perception
+    companion's mode (:func:`perception_command`): ``normal`` or
+    ``dataset`` for a personalized-world Gazebo run; a real-robot launch
+    always runs it ``normal``.
     """
 
     enable_motors: bool = False
@@ -132,6 +143,9 @@ class LaunchParameters:
     replay_bag: str = ""
     replay_rate: float = 1.0
     extra_args: dict[str, str] = field(default_factory=dict)
+    # BlueBoat-Perception companion mode (launch dialog's Session row); not a
+    # launch argument (see the class docstring).
+    perception_mode: str = PERCEPTION_NORMAL
 
     def wire_note(self) -> str:
         """The ``note:=`` value, or "" when no argument should be emitted.
@@ -234,6 +248,60 @@ def guardian_command(cfg, params: LaunchParameters) -> list[str] | None:
     return [sys.executable, "-u", str(script), "watch"]
 
 
+def perception_dataset_name(params: LaunchParameters, now: float | None = None) -> str:
+    """``<YYYY_MM_DD-HH_MM_SS>-<note>``: the dataset folder of a
+    dataset-creation run (local launch time; the note as the run's log
+    carries it, so a Gazebo dataset is tagged ``sim``)."""
+    stamp = time.strftime("%Y_%m_%d-%H_%M_%S", time.localtime(now))
+    return f"{stamp}-{params.wire_note() or 'dataset'}"
+
+
+def perception_command(cfg, params: LaunchParameters,
+                       now: float | None = None) -> list[str] | None:
+    """The BlueBoat-Perception companion launch, or None.
+
+    By the user's order (2026-10-16): every **personalized-world** Gazebo
+    run (``world_dir`` set -- the only simulation with a sonar, hence with
+    seabed images) in the operator's chosen mode, and every **real-robot**
+    launch in ``normal`` mode. Never for the empty Gazebo world (no sonar)
+    nor for a bag replay (no live sonar; recorded sessions are processed
+    offline). Dataset mode adds the dataset folder name and the world
+    folder, which the Perception launch file uses for its manifest and its
+    archival ground-truth recording. ``cfg`` is the ``AppConfig``. Module
+    scope and Qt-free so the smoke test can pin it."""
+    pc = cfg.perception
+    if not pc.enabled or params.replay_bag:
+        return None
+    if params.simulation and not params.world_dir:
+        return None
+    mode = PERCEPTION_NORMAL
+    if params.simulation and params.perception_mode == PERCEPTION_DATASET:
+        mode = PERCEPTION_DATASET
+    cmd = ["ros2", "launch", pc.package, pc.launch_file, f"mode:={mode}"]
+    if mode == PERCEPTION_DATASET:
+        cmd.append(f"dataset_name:={perception_dataset_name(params, now)}")
+    if params.simulation:
+        cmd.append(f"world_dir:={params.world_dir}")
+    return cmd
+
+
+def _ros_package_available(name: str) -> bool | None:
+    """True / False when the ament index can say, None when it cannot
+    (no sourced ROS: then ``ros2 launch`` itself reports it)."""
+    try:
+        from ament_index_python.packages import (
+            PackageNotFoundError,
+            get_package_share_directory,
+        )
+    except ImportError:
+        return None
+    try:
+        get_package_share_directory(name)
+        return True
+    except PackageNotFoundError:
+        return False
+
+
 def launch_target(cfg, params: LaunchParameters) -> tuple[str, str]:
     """(package, launch file) for the given parameters.
 
@@ -259,7 +327,9 @@ class LaunchManager(QObject):
         self._proc: subprocess.Popen[bytes] | None = None
         # Companion processes of the current launch, each in its own session:
         # ('sea', sea_state_launch.py) for an empty-world Gazebo run,
-        # ('guardian', guardian.py watch) for a real-robot run.
+        # ('guardian', guardian.py watch) for a real-robot run,
+        # ('perception', perception_launch.py) for a personalized-world
+        # Gazebo run or a real-robot run.
         self._companions: list[tuple[str, subprocess.Popen[bytes]]] = []
         self._reader: threading.Thread | None = None
         self._state = "idle"
@@ -332,11 +402,32 @@ class LaunchManager(QObject):
             self._bus.launch_output.emit(
                 f"[guardian] {self._cfg.guardian.script} not found - the link guardian "
                 "cannot be switched on from the station.")
+        self._start_perception(params, launch_cwd)
         # Watch for the process dying on its own (crash, bad launch argument):
         # without this the state machine stayed at 'starting'/'running' forever
         # and the Launch button never re-enabled.
         self._watch_exit()
         return True
+
+    def _start_perception(self, params: LaunchParameters, cwd: Path) -> None:
+        """BlueBoat-Perception, best effort (it has no actuator: a missing
+        package costs the map its detections, never the mission)."""
+        cmd = perception_command(self._cfg, params)
+        if cmd is None:
+            if (params.simulation and not params.world_dir and not params.replay_bag
+                    and params.perception_mode == PERCEPTION_DATASET):
+                self._bus.launch_output.emit(
+                    "[perception] not started: the empty Gazebo world has no sonar, "
+                    "so there are no seabed images to make a dataset from.")
+            return
+        if _ros_package_available(self._cfg.perception.package) is False:
+            self._bus.launch_output.emit(
+                f"[perception] package {self._cfg.perception.package} not found "
+                "(colcon build --packages-select blueboat_perception) - no "
+                "detections will reach the GCS map.")
+            return
+        self._start_companion("perception", cmd, cwd,
+                              "no detections will reach the GCS map")
 
     def _start_companion(self, tag: str, cmd: list[str] | None, cwd: Path,
                          consequence: str) -> None:

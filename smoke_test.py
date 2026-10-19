@@ -2689,6 +2689,92 @@ _go_bus.guardian_status_received.emit(time.monotonic(), {
 assert _pump(lambda: bool(_go_done), 2.0) and _go_done[-1][0] is False
 print("guardian ok")
 
+# --- BlueBoat-Perception companion (2026-10-16, by the user's order) --------
+# Started for every personalized-world Gazebo run (Session row: normal or
+# dataset creation) and every real-robot launch (always normal); never for
+# the empty world (no sonar) or a bag replay. Additive: no existing launch's
+# command line changes.
+import dataclasses as _pdc
+
+from mcs.gui.dialogs.launch_dialog import LaunchDialog as _PLD
+from mcs.ros import launch_manager as _plm
+from mcs.ros.launch_manager import LaunchParameters as _PLP
+from mcs.ros.launch_manager import perception_command as _pcmd
+from mcs.ros.launch_manager import perception_dataset_name as _pname
+
+_pc_cfg = AppConfig()
+_pt0 = time.mktime((2026, 10, 16, 10, 0, 0, 0, 0, -1))
+_PBASE = ["ros2", "launch", "blueboat_perception", "perception_launch.py"]
+assert _pcmd(_pc_cfg, _PLP(simulation=True, world_dir="/w/a"), now=_pt0) == \
+    _PBASE + ["mode:=normal", "world_dir:=/w/a"]
+_pc = _pcmd(_pc_cfg, _PLP(simulation=True, world_dir="/w/a", note="dam test",
+                          perception_mode="dataset"), now=_pt0)
+assert _pc == _PBASE + ["mode:=dataset",
+                        "dataset_name:=2026_10_16-10_00_00-sim-dam-test",
+                        "world_dir:=/w/a"], _pc
+assert _pname(_PLP(simulation=True), _pt0) == "2026_10_16-10_00_00-sim"
+# A real-robot launch: always normal, whatever the field says.
+assert _pcmd(_pc_cfg, _PLP(session=True, perception_mode="dataset")) == \
+    _PBASE + ["mode:=normal"]
+# Never the empty world, never a replay, never when disabled.
+assert _pcmd(_pc_cfg, _PLP(simulation=True)) is None
+assert _pcmd(_pc_cfg, _PLP(simulation=True, perception_mode="dataset")) is None
+assert _pcmd(_pc_cfg, _PLP(simulation=True, replay_bag="/b", world_dir="/w/a")) is None
+_pc_cfg.perception.enabled = False
+assert _pcmd(_pc_cfg, _PLP(session=True)) is None
+_pc_cfg.perception.enabled = True
+# The field is no launch argument: every target's command line is unchanged.
+for _pp0 in (_PLP(session=True, trajectory="from_yaml:/s.yaml"), _PLP(simulation=True),
+             _PLP(simulation=True, world_dir="/w/a", controller_type="PID"),
+             _PLP(simulation=True, replay_bag="/b")):
+    _pp1 = _pdc.replace(_pp0, perception_mode="dataset")
+    assert _pp1.to_cli() == _pp0.to_cli()
+    assert not any("mode:=" in a and "session_mode" not in a for a in _pp1.to_cli())
+    assert _plm.launch_target(_pc_cfg.launch, _pp1) == _plm.launch_target(_pc_cfg.launch, _pp0)
+    assert _plm.companion_command(_pc_cfg, _pp1) == _plm.companion_command(_pc_cfg, _pp0)
+
+# LaunchManager: best effort, with a console line for the two refusals.
+_pl_out: list[str] = []
+_pl_bus = SignalBus()
+_pl_bus.launch_output.connect(_pl_out.append)
+_pl = _plm.LaunchManager(_pc_cfg, _pl_bus)
+_pl_started: list = []
+_pl._start_companion = lambda tag, cmd, cwd, why: _pl_started.append((tag, cmd))
+_pl._start_perception(_PLP(simulation=True, perception_mode="dataset"), Path("/tmp"))
+assert not _pl_started and "no sonar" in _pl_out[-1]
+_orig_avail = _plm._ros_package_available
+try:
+    _plm._ros_package_available = lambda name: False
+    _pl._start_perception(_PLP(session=True), Path("/tmp"))
+    assert not _pl_started and "not found" in _pl_out[-1]
+    _plm._ros_package_available = lambda name: None      # unknown: try anyway
+    _pl._start_perception(_PLP(simulation=True, world_dir="/w/a"), Path("/tmp"))
+    assert _pl_started == [("perception", _PBASE + ["mode:=normal", "world_dir:=/w/a"])]
+finally:
+    _plm._ros_package_available = _orig_avail
+
+# The launch dialog's Session row: Gazebo + Controller only, round-tripped.
+_pd = _PLD(cfg, None)
+assert not _pd._session.isVisibleTo(_pd)                  # Real robot first
+_pd._mode.setCurrentText("Gazebo simulation")
+assert _pd._session.isVisibleTo(_pd) and _pd._session.currentData() == "normal"
+assert _pd.parameters().perception_mode == "normal"
+_pd._session.setCurrentIndex(_pd._session.findData("dataset"))
+_pd_par = _pd.parameters()
+assert _pd_par.simulation and _pd_par.perception_mode == "dataset"
+_pd2 = _PLD(cfg, _pd_par)
+assert _pd2._session.currentData() == "dataset"
+_pd2._source.setCurrentText("From a ros2bag")
+assert not _pd2._session.isVisibleTo(_pd2)
+assert _pd2.parameters().perception_mode == "normal"
+_pd2._source.setCurrentText("Controller")
+_pd2._mode.setCurrentText("Real robot")
+assert not _pd2._session.isVisibleTo(_pd2)
+assert _pd2.parameters().perception_mode == "normal"
+_pd.deleteLater()
+_pd2.deleteLater()
+print("perception ok")
+
 w.close()
 print("window ok")
 print("SMOKE TEST PASSED")

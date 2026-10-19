@@ -34,6 +34,12 @@ Two mission types, matching the two launch files of the stack:
   playback rate, and the boat moves exactly as it did in the water — no
   controller, trajectory, robot file or note apply, and no sea state is asked
   for (the recording already holds the real sea).
+  **Session** (Gazebo + Controller only, 2026-10-16): *Normal session* or
+  *Dataset creation* -- the mode BlueBoat-Perception runs in for a
+  personalized-world run (``LaunchParameters.perception_mode``; the world is
+  chosen after this dialog, and the empty world has no sonar, so no
+  Perception). A real-robot launch always runs it normal. Its own row, so a
+  future per-run row (e.g. a path source) can sit beside it.
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -65,12 +71,18 @@ from mcs.config.settings import AppConfig
 from mcs.core import replay as replay_core
 from mcs.designer import io_yaml
 from mcs.gui import theme
-from mcs.ros.launch_manager import LaunchParameters
+from mcs.ros.launch_manager import (
+    PERCEPTION_DATASET,
+    PERCEPTION_NORMAL,
+    LaunchParameters,
+)
 
 _REAL = "Real robot"
 _SIM = "Gazebo simulation"
 _SRC_CONTROL = "Controller"
 _SRC_BAG = "From a ros2bag"
+_SESSION_NORMAL = "Normal session"
+_SESSION_DATASET = "Dataset creation"
 
 
 def list_custom_paths(cfg: AppConfig) -> list[tuple[str, Path]]:
@@ -228,6 +240,20 @@ class LaunchDialog(QDialog):
         self._robot_file_label = QLabel("Robot file")
         form.addRow(self._robot_file_label, self._robot_file)
 
+        # BlueBoat-Perception session mode (Gazebo + Controller source).
+        self._session = QComboBox()
+        self._session.addItem(_SESSION_NORMAL, PERCEPTION_NORMAL)
+        self._session.addItem(_SESSION_DATASET, PERCEPTION_DATASET)
+        self._session.setToolTip(
+            "BlueBoat-Perception runs with every personalized-world run (the\n"
+            "only simulation with a sonar). Normal session: detections on the\n"
+            "GCS map and one record per image. Dataset creation: the same, and\n"
+            "every seabed image is also saved as a training sample in\n"
+            "data/Dataset_data/<date>-<note>/, with the simulator's ground truth\n"
+            "recorded beside it. The empty world has no sonar: no Perception.")
+        self._session_label = QLabel("Session")
+        form.addRow(self._session_label, self._session)
+
         # ---- Free-form extras ------------------------------------------------------
         self._extra = QLineEdit()
         self._extra.setPlaceholderText("extra launch args, e.g. foo:=bar baz:=1")
@@ -272,6 +298,9 @@ class LaunchDialog(QDialog):
                 idx = self._rate.findData(float(last.replay_rate))
                 if idx >= 0:
                     self._rate.setCurrentIndex(idx)
+            idx = self._session.findData(last.perception_mode)
+            if idx >= 0:
+                self._session.setCurrentIndex(idx)
         self._on_mode_changed(self._mode.currentText())
         if last is not None and last.controller_type in self._items(self._controller):
             self._controller.setCurrentText(last.controller_type)
@@ -352,6 +381,7 @@ class LaunchDialog(QDialog):
         for w in (self._controller, self._trajectory, self._note):
             self._set_row_visible(w, not replay)
         self._set_row_visible(self._robot_file, sim and not replay)
+        self._set_row_visible(self._session, sim and not replay)
         launch_file = (self._cfg.launch.sim_launch_file if sim
                        else self._cfg.launch.launch_file)
         if replay:
@@ -522,4 +552,6 @@ class LaunchDialog(QDialog):
             gps_simulated=gps_simulated,
             spawn_yaw_rad=spawn_yaw,
             extra_args=extra,
+            perception_mode=(self._session.currentData() or PERCEPTION_NORMAL)
+            if sim else PERCEPTION_NORMAL,
         )

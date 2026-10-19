@@ -239,6 +239,20 @@ class GuardianConfig:
 
 
 @dataclass
+class PerceptionConfig:
+    """BlueBoat-Perception companion (2026-10-16, by the user's order):
+    ``ros2 launch <package> <launch_file> mode:=...`` started with every
+    personalized-world Gazebo run (the launch dialog's Session row: normal
+    session or dataset creation) and every real-robot launch (normal),
+    never for the empty world (no sonar) or a bag replay
+    (``launch_manager.perception_command``)."""
+
+    enabled: bool = True
+    package: str = "blueboat_perception"
+    launch_file: str = "perception_launch.py"
+
+
+@dataclass
 class ArrowConfig:
     """Arrow-key thrust control (the floating box at the map's bottom-right)."""
 
@@ -387,6 +401,7 @@ class AppConfig:
     arrows: ArrowConfig = field(default_factory=ArrowConfig)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     guardian: GuardianConfig = field(default_factory=GuardianConfig)
+    perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
 

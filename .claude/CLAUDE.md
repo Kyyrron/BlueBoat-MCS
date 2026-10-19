@@ -124,7 +124,12 @@ dialog: `LaunchParameters.to_cli()` (the main argument list, which splices in
 in `to_cli()` and `launch_target()`, and `companion_command()` returns None for it. The second
 companion, `guardian_command()` (the link guardian's `guardian.py watch`), runs for every
 real-robot launch and never for a simulation or a replay; `LaunchManager._companions` holds
-both, signalled together by `stop()` and `_finalise()`.
+both, signalled together by `stop()` and `_finalise()`. The third, `perception_command()`
+(BlueBoat-Perception, 2026-10-16), runs for every real-robot launch (`mode:=normal`) and every
+personalized-world Gazebo launch (the dialog's **Session** row, `perception_mode`: normal |
+dataset), never for the empty world or a replay. `perception_mode` is not a launch argument:
+`to_cli()` ignores it. A future per-run dialog row (e.g. Control's requested path source) is
+its own row and its own field, exactly like Session.
 
 ---
 
@@ -237,6 +242,14 @@ water, and SimGps stays disarmed (one GPS publisher). The floating **REPLAY** bo
 the SEA STATE box's corner — never shown together) shows the run, time / duration and status,
 with Pause/Resume and the rate. Manual Target and the Default/Override toggle are greyed:
 nothing commands the replayed boat. Stop Mission runs the simulation shutdown sequence.
+
+**BlueBoat-Perception companion (2026-10-16, by the user's order).** The station starts
+`ros2 launch blueboat_perception perception_launch.py mode:=… [dataset_name:=…]
+[world_dir:=…]` with every real-robot launch (normal) and every personalized-world Gazebo
+launch (the launch dialog's Session row: *Normal session* / *Dataset creation*; the dataset
+folder is `<YYYY_MM_DD-HH_MM_SS>-<note>`), best effort, signalled with the other companions.
+It subscribes to none of Perception's topics (the GCS draws the detections) and imports
+nothing from it. `PerceptionConfig` (`enabled`, `package`, `launch_file`).
 
 **Link guardian (v1.1, 2026-10-14, by the user's order).** An ArduPilot Lua script on the
 autopilot (superproject `link_guardian/`, the one owner-ordered exception to "nothing of ours on
@@ -598,7 +611,11 @@ map waiting for GPS, greyed controls, the RUN box's Bag row incl. a pre-v1.1 con
 `layers ok` (LAYERS in the right column above MAP TOOLS, no heading arrow, the GUARDIAN box
 heading the left column) and `guardian ok` (the companion only for real launches; status
 decoding; every box state and button gate; the turn-off choice — cancel / keep / off, nothing
-terminated when OFF is not confirmed; `off` → ack → `disarm` ordering).
+terminated when OFF is not confirmed; `off` → ack → `disarm` ordering). 2026-10-16 adds
+`perception ok` (the BlueBoat-Perception companion: world runs in the chosen mode, real runs
+normal, never the empty world / a replay / disabled; the dataset name; every existing
+`to_cli()`, launch target and sea companion unchanged by the new field; the two console
+refusals; the Session row's visibility and round trip).
 
 Still uncovered: the rest of the designer UI (`designer_map.py`, `panels.py`,
 `designer_window.py`, including the `_push_undo` contract). A green run is not field

@@ -279,6 +279,20 @@ in Extra args overrides it for one run. On OK the station runs the ROS2 launch f
 orange while nodes come up and green once the required ones report
 (FCU connected + odometry flowing). Launch output streams to the console line.
 
+**Session — normal or dataset creation (2026-10-16).** In *Gazebo simulation* with
+Source *Controller*, the **Session** row chooses how BlueBoat-Perception runs alongside a
+**personalized-world** run (the world is picked in the next dialog; it is the only
+simulation with a sonar). *Normal session*: the seabed images are analysed and the
+detections appear on the GCS map, with one record per image. *Dataset creation*: the same,
+and every seabed image is also saved as a training sample under
+`~/ros2_ws/data/Dataset_data/<date>-<note>/`, a ready YOLO dataset: every image, one
+label file per image (each object's highlight and shadow, its World Builder class, from
+the simulator's ground truth) and `data.yaml`; split it into train/val yourself, by run
+or site. The ground truth is also archived beside it. In the empty world nothing starts
+(no sonar). A real-robot
+launch always runs Perception in the normal mode. The station only starts and stops it;
+detections are shown by the GCS.
+
 **From a ros2bag — replay a recorded run (v1.1).** In *Gazebo simulation*
 the **Source** row chooses between *Controller* (the simulation above) and
 *From a ros2bag*. The latter replaces the controller, trajectory, robot file

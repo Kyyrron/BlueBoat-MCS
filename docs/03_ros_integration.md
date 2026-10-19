@@ -121,6 +121,24 @@ starts `python3 <superproject>/link_guardian/laptop/guardian.py watch`
 on-boat guardian ON (`LGRD_ON = 1`), moves HOME to each run's start and back
 (`/mavros/cmd/set_home`), and serves the GUARDIAN box over `/link_guardian/*`.
 
+**BlueBoat-Perception companion (2026-10-16).** With every real-robot launch and every
+**personalized-world** Gazebo launch the station also starts
+
+```
+ros2 launch blueboat_perception perception_launch.py mode:=<normal|dataset> \
+    [dataset_name:=<YYYY_MM_DD-HH_MM_SS>-<note>] [world_dir:=<world>]
+```
+
+(`launch_manager.perception_command`, `PerceptionConfig`; console prefix `[perception]`,
+signalled with the launch like the other companions, best effort: it has no actuator, a
+missing package only costs the GCS map its detections). A real-robot launch always runs it
+`normal`; a personalized-world run in the launch dialog's **Session** mode (*Normal session*
+/ *Dataset creation*, `LaunchParameters.perception_mode` — not a launch argument of any
+file, so no existing command line changes). Never for the empty world (no sonar, so no
+seabed images; a dataset request there gets one console line) nor for a bag replay. The
+station itself subscribes to none of Perception's topics: its detections reach the GCS map
+on `/sss_ai/detections` (contract: `BlueBoat-Perception/docs/topics.md`).
+
 The station passes `session_mode:=True` on every real launch; without it (CLI)
 `BlueBoat_launch.py` keeps the one-launch-one-mission behaviour. Built-in shapes are
 not offered for a session: only designer missions can be placed or deployed into the
