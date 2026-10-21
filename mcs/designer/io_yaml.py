@@ -11,6 +11,12 @@ Two files per mission, in ``designer.trajectories_dir``:
   (groups, locks, segment interpolation settings, comments). The runtime
   never reads it; without it a runtime file can still be re-imported as
   plain waypoints (decimated), so nothing is ever lost beyond styling.
+
+The read-only helpers the launch dialogs call once per saved mission
+(:func:`read_geo_anchor`, :func:`read_first_point`,
+:func:`read_start_misalignment`) parse through libyaml when it is installed and
+memoize the parsed file by ``(mtime, size)``, so a dialog that badges every
+saved path costs one ``stat`` per file once the files have been read.
 """
 
 from __future__ import annotations
@@ -32,6 +38,30 @@ if TYPE_CHECKING:  # annotation only -- see mcs/designer/sampling.py
 
 FORMAT = "blueboat_trajectory/1"
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+# libyaml's loader when the build has it (~9x faster on the dense sample files);
+# same constructors as SafeLoader, so the parsed data is identical.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+# path -> ((mtime_ns, size), parsed data). Read-only for callers.
+_DATA_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
+def _read_data(yaml_path: Path) -> dict:
+    """Parsed content of a runtime file, memoized until the file changes.
+
+    Raises ``OSError`` / ``yaml.YAMLError`` like a direct parse and caches only
+    successes. The returned dict is shared: callers must not mutate it."""
+    stat = yaml_path.stat()
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    key = str(yaml_path)
+    hit = _DATA_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    loaded = yaml.load(yaml_path.read_text(), Loader=_SAFE_LOADER) or {}
+    data = loaded if isinstance(loaded, dict) else {}
+    _DATA_CACHE[key] = (stamp, data)
+    return data
 
 
 def valid_name(name: str) -> bool:
@@ -99,12 +129,12 @@ def save_mission(directory: Path, name: str, model: MissionModel,
 def read_geo_anchor(yaml_path: Path) -> dict | None:
     """Return the geo_anchor block of a runtime file, if any."""
     try:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
+        data = _read_data(yaml_path)
     except OSError:
         return None
     anchor = data.get("geo_anchor")
     if isinstance(anchor, dict) and "lat0" in anchor and "lon0" in anchor:
-        return anchor
+        return dict(anchor)
     return None
 
 
@@ -115,7 +145,7 @@ def read_first_point(yaml_path: Path) -> tuple[float, float] | None:
     Never raises: an unreadable, non-YAML or malformed file answers None.
     """
     try:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
+        data = _read_data(yaml_path)
     except (OSError, yaml.YAMLError):
         return None
     points = data.get("points") or []
@@ -143,7 +173,7 @@ def read_start_misalignment(yaml_path: Path, tol_m: float, tol_deg: float
     misalignment to report" so it cannot break the launch dialog.
     """
     try:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
+        data = _read_data(yaml_path)
     except (OSError, yaml.YAMLError):
         return None
     try:
