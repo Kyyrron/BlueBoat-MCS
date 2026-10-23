@@ -347,17 +347,28 @@ same sequence with termination switched off:
    reported and the sequence continues (publish + late-discovery hold).
 2. Publish `String("default")` — synchronous into the reliable DDS writer.
 3. Wait for the end-to-end `param_mode == "default"` echo (proves the
-   command was received *and acted on*), up to `estop_confirm_timeout_s`
-   (2 s default), republishing once at half-timeout (idempotent).
+   command was received *and acted on*), up to `shutdown_confirm_timeout_s`
+   (25 s default, above `param_set`'s own 20 s give-up bound: its pull + three
+   writes + read-back over WiFi outlast a couple of seconds, and the old 2 s
+   killed it mid-sequence, leaving the thrusters on passthrough), republishing
+   once at half-timeout (idempotent).
    Since `param_set` now heartbeats that topic at 1 Hz, the echo must be a
    **transition**: the sequence snapshots the last known mode before publishing
    and ignores repeats, so a heartbeat cannot impersonate an acknowledgement.
    A boat already in `default` is reported as `already-default` — the demanded
    state holds, which is a weaker and honestly-labelled confirmation, not an
    echo.
-4. On timeout, hold the process/writer alive for `estop_flush_delay_s` so
-   the reliable protocol can complete delivery, and tell the operator which
-   confirmation level was obtained.
+4. On timeout, a **terminating** sequence terminates nothing: it asks the
+   operator (*Wait again* republishes `default` and waits again; *Terminate
+   anyway* continues below), and a late echo still confirms. Then — and for a
+   non-terminating Stop Override directly — hold the process/writer alive for
+   `estop_flush_delay_s` so the reliable protocol can complete delivery, and
+   tell the operator which confirmation level was obtained.
+4b. After the *Guardian OFF + disarm* choice only: once `default` holds,
+   publish `manual` (robot_interface → `/mavros/set_mode` MANUAL) unless
+   `/mavros/state` already reads MANUAL, and wait up to
+   `guardian.manual_confirm_timeout_s` (4 s) for it. Never after *Keep ON*,
+   where the guardian is meant to take the boat HOME.
 5. Only then terminate the launch process tree — and only when the caller
    asked for it. `shutdown_sequence_finished` is emitted for asynchronous
    callers (window close waits on it), and `estop_state_changed("idle")`

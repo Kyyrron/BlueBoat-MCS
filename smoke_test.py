@@ -1448,7 +1448,9 @@ def _pump(predicate, timeout_s: float) -> bool:
 
 _es_cfg = AppConfig()
 _es_cfg.estop_confirm_timeout_s = 0.30
+_es_cfg.shutdown_confirm_timeout_s = 0.30
 _es_cfg.estop_flush_delay_s = 0.05
+_es_cfg.guardian.manual_confirm_timeout_s = 0.30
 _es_node = _StubNode()
 _es_ros = _StubRos(_es_node)
 _es_bus = SignalBus()
@@ -1456,6 +1458,8 @@ _es_done: list[int] = []
 _es_states: list[str] = []
 _es_bus.shutdown_sequence_finished.connect(lambda: _es_done.append(1))
 _es_bus.estop_state_changed.connect(_es_states.append)
+_es_unconf: list[str] = []
+_es_bus.shutdown_unconfirmed.connect(_es_unconf.append)
 _es_cc = CommandCenter(_es_cfg, _es_bus, _es_ros, _StubLauncher())
 
 # --- E-STOP: 'stop', an ack, and NOTHING else -----------------------------
@@ -1518,17 +1522,87 @@ assert _es_events == [("publish", "default")], _es_events  # not killed yet
 assert _pump(lambda: bool(_es_done), 3.0), "already-default path never finished"
 assert _es_events == [("publish", "default"), ("terminate",)], _es_events
 
-# Boat in override, heartbeat repeating override: no false confirmation, and
-# the timeout path still republishes ONCE at T/2 and still terminates, so a
-# silent param_set cannot wedge the application.
-_es_events.clear(); _es_done.clear()
+# Boat in override, heartbeat repeating override: no false confirmation, the
+# timeout path republishes ONCE at T/2, and then NOTHING is terminated until the
+# operator chooses (2026-10-23: a launch killed while param_set is still
+# writing leaves the thrusters on passthrough). "Wait again" republishes and
+# waits; "Terminate anyway" flushes and terminates.
+_es_events.clear(); _es_done.clear(); _es_unconf.clear(); _es_states.clear()
 _es_bus.param_mode_received.emit(0.0, "override")
 _es_cc.safe_stop_mission()
 _es_bus.param_mode_received.emit(0.0, "override")          # heartbeat, mid-flight
 assert _es_events == [("publish", "default")], _es_events
-assert _pump(lambda: bool(_es_done), 3.0), "timeout path never finished"
-assert _es_events == [("publish", "default"), ("publish", "default"),
+assert _pump(lambda: bool(_es_unconf), 3.0), "no operator question on timeout"
+assert _es_unconf == ["Stop Mission"] and _es_states[-1] == "unconfirmed", _es_states
+assert _es_events == [("publish", "default"), ("publish", "default")], _es_events
+_pump(lambda: False, 0.5)                                 # no silent terminate
+assert ("terminate",) not in _es_events and not _es_done, _es_events
+_es_cc.shutdown_retry()
+assert _es_events[-1] == ("publish", "default"), _es_events
+assert _pump(lambda: len(_es_unconf) == 2, 3.0), "retry never timed out again"
+assert ("terminate",) not in _es_events, _es_events
+_es_cc.shutdown_force()
+assert _pump(lambda: bool(_es_done), 3.0), "force never finished"
+assert _es_events[-1] == ("terminate",) and _es_events.count(("terminate",)) == 1
+_es_cc.shutdown_force(); _es_cc.shutdown_retry()          # stale answers: no-ops
+assert _es_events.count(("terminate",)) == 1, _es_events
+
+# A late echo while the operator is being asked still confirms.
+_es_events.clear(); _es_done.clear(); _es_unconf.clear()
+_es_bus.param_mode_received.emit(0.0, "override")
+_es_cc.safe_stop_mission()
+assert _pump(lambda: bool(_es_unconf), 3.0)
+_es_bus.param_mode_received.emit(0.0, "default")
+assert _es_events[-1] == ("terminate",) and len(_es_done) == 1, _es_events
+
+# Stop Override (non-terminating) keeps the plain flush fallback: no question.
+_es_events.clear(); _es_done.clear(); _es_unconf.clear()
+_es_bus.param_mode_received.emit(0.0, "override")
+_es_cc.safe_shutdown(terminate_nodes=False, reason="test-weak-timeout")
+assert _pump(lambda: bool(_es_done), 3.0) and not _es_unconf
+assert ("terminate",) not in _es_events, _es_events
+
+# --- Guardian OFF -> 'default' confirmed -> 'manual' -> MANUAL -> terminate --
+# Only after a confirmed guardian OFF, only after the 'default' transition,
+# never when the autopilot already reads MANUAL, and never after "Keep ON".
+_es_events.clear(); _es_done.clear()
+_es_bus.mavros_state_received.emit(0.0, True, False, "HOLD")
+_es_cc._restore_manual = True       # what a successful guardian_off_and_disarm sets
+_es_bus.param_mode_received.emit(0.0, "override")
+_es_cc.safe_stop_mission()
+assert _es_events == [("publish", "default")], _es_events
+_es_bus.param_mode_received.emit(0.0, "default")
+assert _es_events == [("publish", "default"), ("publish", "manual")], _es_events
+assert not _es_done                                       # waits for MANUAL
+_es_bus.mavros_state_received.emit(0.0, True, False, "MANUAL")
+assert _pump(lambda: bool(_es_done), 3.0)
+assert _es_events[-1] == ("terminate",) and not _es_cc._restore_manual
+# MANUAL never reported: bounded, then terminate anyway.
+_es_events.clear(); _es_done.clear()
+_es_bus.mavros_state_received.emit(0.0, True, False, "RTL")
+_es_cc._restore_manual = True
+_es_bus.param_mode_received.emit(0.0, "override")
+_es_cc.safe_stop_mission()
+_es_bus.param_mode_received.emit(0.0, "default")
+assert _pump(lambda: bool(_es_done), 3.0)
+assert _es_events == [("publish", "default"), ("publish", "manual"),
                       ("terminate",)], _es_events
+# Already MANUAL: nothing extra published.
+_es_events.clear(); _es_done.clear()
+_es_bus.mavros_state_received.emit(0.0, True, False, "MANUAL")
+_es_cc._restore_manual = True
+_es_bus.param_mode_received.emit(0.0, "override")
+_es_cc.safe_stop_mission()
+_es_bus.param_mode_received.emit(0.0, "default")
+assert _es_events == [("publish", "default"), ("terminate",)], _es_events
+# Keep ON (no guardian OFF): never 'manual', whatever the mode.
+_es_events.clear(); _es_done.clear()
+_es_bus.mavros_state_received.emit(0.0, True, False, "RTL")
+_es_bus.param_mode_received.emit(0.0, "override")
+_es_cc.safe_stop_mission()
+_es_bus.param_mode_received.emit(0.0, "default")
+assert _es_events == [("publish", "default"), ("terminate",)], _es_events
+_es_bus.mavros_state_received.emit(0.0, True, False, "MANUAL")
 
 # --- A stronger request supersedes a weaker one in flight -----------------
 # Stop Override is confirming when the operator decides to end the mission:
@@ -1553,6 +1627,8 @@ _es_events.clear(); _es_done.clear()
 _es_bus.param_mode_received.emit(0.0, "override")
 _es_cc.safe_shutdown(terminate_nodes=True, reason="test-unmatched")
 assert _es_events == [("publish", "default")], _es_events
+assert _pump(lambda: bool(_es_unconf), 3.0)
+_es_cc.shutdown_force()
 assert _pump(lambda: bool(_es_done), 3.0)
 assert _es_events[-1] == ("terminate",)
 _es_node.matched = 1
@@ -2184,12 +2260,15 @@ try:
     _rs_cfg.launch.session_trajectory_file = str(_rs_dir / ".session" / "run.yaml")
     _rs_cfg.run.ack_timeout_s = 0.3
     _rs_cfg.estop_confirm_timeout_s = 0.2
+    _rs_cfg.shutdown_confirm_timeout_s = 0.2
     _rs_cfg.estop_flush_delay_s = 0.02
     _rs_src = io_yaml.save_mission(_rs_dir, "lawn", _sl_m, _sl_s)
     _rs_bus = SignalBus()
     _rs_store = _RSStore(_rs_cfg)
     _rs_cc = CommandCenter(_rs_cfg, _rs_bus, _StubRos(_RunNode()), _RunLauncher())
     _rs = _RunSession(_rs_cfg, _rs_bus, _rs_store, _rs_cc)
+    # No param_set here: the operator answers "Terminate anyway".
+    _rs_bus.shutdown_unconfirmed.connect(lambda _r: _rs_cc.shutdown_force())
     _rs_previews: list = []
     _rs.preview_requested.connect(_rs_previews.append)
 
@@ -2571,13 +2650,11 @@ _busy = _g.GuardianReadout.from_json(
     received_mono=_now)
 assert not _sum(_busy).check.enabled and "busy" in _sum(_busy).check.reason
 
-# Turn Off Connection must ask whenever the guardian may still be ON.
+# Turn Off Connection asks EVERY time in a real session (2026-10-23), whatever
+# the guardian reports; never outside one.
 assert not _g.needs_turn_off_choice(_rd, real_session=False, now=_now)
-assert _g.needs_turn_off_choice(None, real_session=True, now=_now)
-assert _g.needs_turn_off_choice(_stale, real_session=True, now=_now)
-assert _g.needs_turn_off_choice(_rd, real_session=True, now=_now)
-assert not _g.needs_turn_off_choice(_off, real_session=True, now=_now)
-assert not _g.needs_turn_off_choice(_ni, real_session=True, now=_now)
+for _r in (None, _stale, _rd, _off, _ni):
+    assert _g.needs_turn_off_choice(_r, real_session=True, now=_now), _r
 assert _g.command_json("off", 4) == {"cmd": "off", "seq": 4}
 
 # The box in the window: greyed outside a real session, live inside one.
@@ -2676,11 +2753,13 @@ _go_bus.mavros_state_received.emit(time.monotonic(), True, False, "MANUAL")
 assert _pump(lambda: bool(_go_done), 2.0)
 assert _go_done[-1][0] is True and "disarmed" in _go_done[-1][1]
 assert ("terminate",) not in _go_log                  # the caller terminates, later
+assert _go_cc._restore_manual                          # the shutdown then sets MANUAL
 # No confirmation -> not ok, no disarm sent.
 _go_log.clear(); _go_done.clear()
 _go_cc.guardian_off_and_disarm(lambda ok, d: _go_done.append((ok, d)))
 assert _pump(lambda: bool(_go_done), 2.0)
 assert _go_done[-1][0] is False and ("input", "disarm") not in _go_log
+assert not _go_cc._restore_manual                      # guardian may be ON: no MANUAL
 # A refused 'off' is not ok either.
 _go_log.clear(); _go_done.clear()
 _go_cc.guardian_off_and_disarm(lambda ok, d: _go_done.append((ok, d)))

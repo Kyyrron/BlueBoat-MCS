@@ -71,3 +71,7 @@ class SignalBus(QObject):
     #: terminate nodes) has fully completed. Used by Stop Mission and by the
     #: asynchronous application-exit path.
     shutdown_sequence_finished = Signal()
+    #: A terminating safe-shutdown sequence got no 'default' echo within
+    #: shutdown_confirm_timeout_s. Nothing is terminated until the operator
+    #: answers through CommandCenter.shutdown_retry / shutdown_force.
+    shutdown_unconfirmed = Signal(str)      # the reason ("Stop Mission", …)

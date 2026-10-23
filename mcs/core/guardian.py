@@ -223,18 +223,13 @@ def needs_turn_off_choice(r: GuardianReadout | None, *, real_session: bool,
                           now: float | None = None) -> bool:
     """Should Turn Off Connection / app exit ask what the guardian does?
 
-    True whenever a real-robot session might leave the guardian ON on the
-    autopilot: the boat would then see this laptop go silent and return HOME.
-    Only a fresh report that says the script is absent, or the flag is OFF,
-    makes the question unnecessary — a silent companion is no proof of OFF.
+    Always in a real-robot session (user's order, 2026-10-23). The guardian's
+    report used to be allowed to skip the question (flag OFF, script absent),
+    but a stale or misread report then let the boat see the laptop go silent
+    and take over (HOLD / RTL, re-asserted every 2 s) without the operator
+    ever choosing it. *r* and *now* are kept for the callers' signature.
     """
-    if not real_session:
-        return False
-    if r is None or not r.fresh(now):
-        return True
-    if r.check is not None and not r.script_installed:
-        return False
-    return r.guardian_on is not False
+    return bool(real_session)
 
 
 def command_json(cmd: str, seq: int, **extra) -> dict:

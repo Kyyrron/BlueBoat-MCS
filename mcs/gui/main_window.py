@@ -194,6 +194,8 @@ class MainWindow(QMainWindow):
         bus.estop_state_changed.connect(
             lambda s: _LOG.warning("safe-shutdown phase: %s", s)
             if s != "idle" else None)
+        bus.shutdown_unconfirmed.connect(self._on_shutdown_unconfirmed)
+        bus.estop_state_changed.connect(self._close_unconfirmed_box)
         # Launch process output: dedicated GUI console (right panel) + DEBUG
         # level on the terminal (visible with --verbose), order-preserving in
         # both since one queued signal drives both slots.
@@ -664,6 +666,44 @@ class MainWindow(QMainWindow):
                 f"The guardian could not be turned off: {detail}.\n\nNothing was "
                 "terminated. Try again, or choose 'Keep ON' to let the boat come home.")
         self.commands.guardian_off_and_disarm(done)
+
+    # ===================================================== unconfirmed 'default'
+    def _on_shutdown_unconfirmed(self, reason: str) -> None:
+        """Turn Off Connection / exit got no 'default' echo in time: ask.
+
+        Non-blocking (open(), not exec()) so a late echo, which still confirms,
+        can close the box itself through _close_unconfirmed_box.
+        """
+        self._close_unconfirmed_box("")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("'default' not confirmed")
+        box.setText(
+            f"{reason}: the boat has not confirmed 'default' after "
+            f"{self.cfg.shutdown_confirm_timeout_s:.0f} s.\n\n"
+            "Terminating now may leave the thrusters on RC passthrough and the "
+            "autopilot listening to this laptop only, so BlueOS / QGC cannot "
+            "drive the boat until 'default' is applied (or the autopilot reboots).")
+        wait = box.addButton("Wait again", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Terminate anyway", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(wait)
+
+        def answered(button) -> None:
+            self._unconfirmed_box = None
+            if button is wait:
+                self.commands.shutdown_retry()
+            else:
+                self.commands.shutdown_force()
+        box.buttonClicked.connect(answered)
+        self._unconfirmed_box = box
+        box.open()
+
+    def _close_unconfirmed_box(self, state: str) -> None:
+        box = getattr(self, "_unconfirmed_box", None)
+        if box is not None and state != "unconfirmed":
+            self._unconfirmed_box = None
+            box.buttonClicked.disconnect()
+            box.close()
 
     # ============================================================ manual target
     def _on_manual_mode(self, armed: bool) -> None:

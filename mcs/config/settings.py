@@ -236,6 +236,9 @@ class GuardianConfig:
     # wait for the autopilot to confirm LGRD_ON = 0, then for the disarm.
     off_confirm_timeout_s: float = 6.0
     disarm_confirm_timeout_s: float = 4.0
+    # After 'default' is confirmed with the guardian OFF: how long to wait for
+    # /mavros/state to report MANUAL (the 'manual' token) before terminating.
+    manual_confirm_timeout_s: float = 4.0
 
 
 @dataclass
@@ -404,6 +407,14 @@ class AppConfig:
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
+    # Safe shutdown: how long to wait for param_set's 'default' echo. Its
+    # sequence (pull, three writes, read-back over the WiFi link) routinely
+    # outlasts the E-STOP's 2 s, and a launch torn down mid-sequence leaves
+    # SERVO1/3 on passthrough and the GCS sysid on mavros. Above param_set's
+    # own give-up bound (param_sequence_timeout_s, 20 s). A terminating
+    # sequence still unconfirmed then asks the operator; nothing is killed
+    # before they choose.
+    shutdown_confirm_timeout_s: float = 25.0
 
     # ------------------------------------------------------------------ I/O
     @classmethod

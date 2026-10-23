@@ -457,6 +457,8 @@ class BottomToolbar(QWidget):
                 "confirmed": "safe-shutdown: confirmed by param_mode echo",
                 "already-default": "safe-shutdown: boat was already in 'default'",
                 "timeout": "safe-shutdown: published, flushed (no echo — check chain)",
+                "unconfirmed": "safe-shutdown: no 'default' echo — waiting for your choice",
+                "manual": "safe-shutdown: returning the autopilot to MANUAL…",
                 "sim": "safe-shutdown: simulation — ack skipped",
                 "idle": ""}.get(state, "")
         self._estop_label.setText(text)

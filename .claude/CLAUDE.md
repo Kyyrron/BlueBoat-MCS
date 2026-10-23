@@ -273,7 +273,7 @@ LAYERS section sits in the right column above MAP TOOLS, and the robot heading a
 
 | Topic | Type | Consumed by | Contract |
 |---|---|---|---|
-| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `rearm` (v1.1, session: re-run the arm-before-override sequence), `move <l> <r> <s>`. The GUARDIAN box publishes `rearm` (**Arm again**) and the turn-off choice `disarm`. Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override`, — from either E-STOP button — `stop`, and — from **Release E-STOP** (run session, motors enabled, latched) — `enable`, the only thing that clears `robot_interface`'s E-STOP latch (it also re-opens the motor gate). |
+| `/blueboat/input_str` | `std_msgs/String` | `robot_interface.py` (dispatch), `param_set` | Values: `enable`, `disable`, `default`, `override`, `stop`, `arm`, `disarm`, `rearm` (v1.1, session: re-run the arm-before-override sequence), `manual` (2026-10-23: autopilot flight mode → MANUAL), `move <l> <r> <s>`. The GUARDIAN box publishes `rearm` (**Arm again**) and the turn-off choice `disarm`; a terminating sequence publishes `manual` after a confirmed `default` when the guardian was turned OFF first (N1). Any unrecognised token falls through to `move_callback`; an empty message is ignored. The station publishes `default`, `override`, — from either E-STOP button — `stop`, and — from **Release E-STOP** (run session, motors enabled, latched) — `enable`, the only thing that clears `robot_interface`'s E-STOP latch (it also re-opens the motor gate). |
 | `/blueboat/manual_target` | `std_msgs/Float32MultiArray` | `master_control.py` | `[x, y]` in the **WORLD frame**. `[0.0, 0.0]` is the *resume-original-mission sentinel*, not a coordinate — a genuine click at the origin is nudged by `1e-3`. Only the explicit "Continue Original Mission" action (labelled "Release Target" between the runs of a session) may publish `[0,0]`. Turning arrow control off publishes the boat's own position here (hold where released). |
 | `/blueboat/run_command` | `std_msgs/String` (JSON) | `master_control.py` (run session only) | `{"cmd": "configure", controller_type, use_pinger, note, mission, seq}` / `{"cmd": "start", seq}` / `{"cmd": "stop", seq}`. `configure` is re-sent until acknowledged (idempotent); `start`/`stop` are sent once. |
 | `/link_guardian/command` | `std_msgs/String` (JSON) | `guardian.py watch` (real-robot sessions, v1.1) | `{"cmd": "on"\|"off"\|"check"\|"setup"\|"reclaim", "seq": n}` from the GUARDIAN box and the turn-off pre-step (`CommandCenter.send_guardian_command`, `mcs.core.guardian.command_json`); answered in the status's `ack`. |
@@ -311,7 +311,16 @@ the control stack closes and files its log itself): publish `default` on `/blueb
 matched subscriber via `get_subscription_count()` → wait for the
 `/blueboat/param_mode` echo (one republish at T/2) → flush delay → *only then*
 terminate the process. Killing the launch first can leave the motors in
-override. In a simulation graph (`CommandCenter.set_simulation_mode(True)`) the
+override. The echo wait is `shutdown_confirm_timeout_s` (25 s, above `param_set`'s own
+20 s bound; 2026-10-23 — the old 2 s routinely killed `param_set` mid-sequence, leaving
+SERVO1/3 on passthrough and the GCS sysid on mavros, so BlueOS / QGC could not drive the
+boat). A **terminating** sequence still unconfirmed then **asks the operator**
+(`shutdown_unconfirmed`: *Wait again* republishes, *Terminate anyway* flushes and
+terminates; a late echo still confirms) — nothing is killed before they answer. After the
+*Guardian OFF + disarm* choice, a confirmed `default` is followed by `manual` (unless
+`/mavros/state` already reads MANUAL) and a bounded wait for MANUAL
+(`guardian.manual_confirm_timeout_s`); never after *Keep ON*. In a real-robot session the
+guardian choice is asked **every time** (`needs_turn_off_choice` = `real_session`). In a simulation graph (`CommandCenter.set_simulation_mode(True)`) the
 *acknowledgement wait* is skipped — `Sim_launch.py` starts neither
 `robot_interface` nor `param_set`, so no echo can arrive — but the publish still
 happens before the flush and the terminate, so the ordering guarantee is
@@ -334,7 +343,7 @@ mission):
 | **E-STOP** | `stop` | `/blueboat/controller_ready` → `False` | no |
 | **E-STOP + Stop Override** | `stop`, then `default` | the above, then the `param_mode` transition | no |
 | **Release E-STOP** (run session, motors enabled, while latched) | `enable` | `controller_ready` returning `True` | no |
-| **Stop Mission** / **Turn Off Connection** / app exit | (`stop` run, then) `default` | the `param_mode` transition | yes, after confirmation |
+| **Stop Mission** / **Turn Off Connection** / app exit | (`stop` run, then) `default`, then `manual` after *Guardian OFF* | the `param_mode` transition (unconfirmed: the operator decides) | yes, after confirmation |
 
 `stop` is the real emergency primitive: `robot_interface.full_stop()` zeroes the
 thrust, closes the motor gate, disarms and **latches** until an explicit
