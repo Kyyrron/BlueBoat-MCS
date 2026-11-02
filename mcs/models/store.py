@@ -13,12 +13,12 @@ Design notes
   here (e.g. the current path target comes from ``/monitoring_data``).  The
   only computations performed are pure display transforms: pinger body ->
   world frame, distances, travelled-distance integration, speed statistics.
-* **Run sessions** (real-robot launches, 2026-10-09): histories record only
+* **Run sessions** (real-robot launches): histories record only
   while a RUN is active (:meth:`DataStore.recording`). Between runs the live
   state (boat glyph, pinger, target) keeps updating, but nothing is appended,
   so the trail, statistics, distance plot and timeline stay frozen on the last
   run until the next Start Run resets them. Outside a session (simulation)
-  recording is unconditional, as before.
+  recording is unconditional.
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ class MissionState:
                                             # deferred deploy — runs as on real water
     manual_target: tuple[float, float] | None = None
     world_dir: str = ""                     # personalized world folder ("" = empty Gazebo)
-    # Gazebo replay of a recorded real-robot run (v1.1): the recorded GPS,
+    # Gazebo replay of a recorded real-robot run: the recorded GPS,
     # compass and odom drive the map exactly as on real water, so the map
     # waits for a real GPS anchor; nothing commands the replayed boat.
     replay: bool = False
@@ -165,6 +165,11 @@ class SessionState:
     arrow_active: bool = False
     arrow_cmd: tuple[float, float] = (0.0, 0.0)   # (right, left) N
 
+    @property
+    def run_in_progress(self) -> bool:
+        """A run is active, or its start was sent and is awaiting the ack."""
+        return self.run_active or self.run_pending == "start"
+
     def state_fresh(self, max_age_s: float) -> bool:
         return self.state_t is not None and (now_mono() - self.state_t) <= max_age_s
 
@@ -223,14 +228,10 @@ class DataStore:
 
         self.robot_track.append(t, (r.x, r.y, r.yaw))
         self.speed_hist.append(t, (r.speed,))
-        # NOTE: geo pairing happens in on_gps (at GPS rate, with a freshness
-        # guard on the odom pose) — pairing here at odom rate re-used one GPS
-        # fix against ~4 different odom positions and biased the estimate.
-        # NOTE: the pinger world position is deliberately NOT recomputed here.
-        # Re-anchoring a (possibly stale, dead-reckoned) body-frame pinger
-        # vector to every new robot pose made the pinger marker follow the
-        # robot's motion; it is now computed once per pinger message, with
-        # the pose concurrent with that message (see on_pinger_body).
+        # Geo pairing happens in on_gps (at GPS rate, with a freshness guard
+        # on the odom pose): pairing at odom rate would reuse one GPS fix
+        # against several odom positions and bias the estimate. The pinger
+        # world position is deliberately NOT recomputed here (on_pinger_body).
         self._record_target_distance(t)
 
     def on_sea_state(self, t: float, payload: dict) -> None:
@@ -259,9 +260,8 @@ class DataStore:
         (degrees, clockwise from north). Convert to the math convention used
         everywhere else (radians, CCW from east): east=0, north=pi/2, so
         heading_math = 90 - compass_deg."""
-        import math as _m
-        a = _m.radians(90.0 - float(heading_deg))
-        self.robot.compass_heading = _m.atan2(_m.sin(a), _m.cos(a))
+        a = math.radians(90.0 - float(heading_deg))
+        self.robot.compass_heading = math.atan2(math.sin(a), math.cos(a))
 
     def on_gps(self, t: float, lat: float, lon: float) -> None:
         if lat == 0.0 and lon == 0.0:
@@ -275,8 +275,8 @@ class DataStore:
 
     def on_mavros_state(self, t: float, connected: bool, armed: bool, mode: str) -> None:
         # The connection flag feeds the readiness count; the arming state and
-        # the ArduPilot mode the GUARDIAN box (v1.1) - the autopilot's own
-        # arming, distinct from robot_interface's motor gate.
+        # the ArduPilot mode the GUARDIAN box - the autopilot's own arming,
+        # distinct from robot_interface's motor gate.
         self.robot.fcu_connected = connected
         self.robot.armed = armed
         self.robot.fcu_mode = mode
@@ -294,11 +294,11 @@ class DataStore:
     def on_pinger_body(self, t: float, xyz) -> None:
         """Pinger message received: THIS is the only place the pinger's world
         position is computed, using the robot pose concurrent with the
-        message. Between messages the marker stays fixed in the world —
-        composing an older body-frame vector with newer robot poses (the
-        previous behaviour) dragged the pinger along with the robot.
-        Residual lag now comes only from the source (robot_interface: Waterlinked
-        'filaco' filtering + dead-reckoning drift, see 03_ros_integration)."""
+        message (N4). Between messages the marker stays fixed in the world —
+        composing an older body-frame vector with newer robot poses would
+        drag the pinger along with the robot. Residual lag comes only from
+        the source (robot_interface: Waterlinked 'filaco' filtering +
+        dead-reckoning drift, see 03_ros_integration)."""
         p = self.pinger
         p.t = t
         p.body = (float(xyz[0]), float(xyz[1]), float(xyz[2]) if len(xyz) > 2 else 0.0)
@@ -355,10 +355,7 @@ class DataStore:
         """Do histories record right now? Always, except in a run session
         between runs (a start already sent counts as running, so the first
         samples of a run are never lost waiting for its acknowledgement)."""
-        ss = self.session
-        if not ss.active:
-            return True
-        return ss.run_active or ss.run_pending == "start"
+        return not self.session.active or self.session.run_in_progress
 
     def active_target_world(self) -> tuple[float, float] | None:
         """World position of whatever the boat is currently steering to."""

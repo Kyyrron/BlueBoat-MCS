@@ -1,4 +1,4 @@
-"""GUARDIAN box — top of the left column (v1.1, 2026-10-14, by the user's order).
+"""GUARDIAN box — top of the left column.
 
 The link guardian brings the boat back along its own path when this laptop goes
 silent (WiFi lost, laptop switched off), and gives it back to the station as soon
@@ -219,7 +219,7 @@ def ask_turn_off_choice(parent: QWidget, exiting: bool) -> str:
                         QMessageBox.ButtonRole.AcceptRole)
     keep = box.addButton("Keep ON — the boat comes back",
                          QMessageBox.ButtonRole.DestructiveRole)
-    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+    box.addButton(QMessageBox.StandardButton.Cancel)
     box.setDefaultButton(off)
     box.exec()
     clicked = box.clickedButton()
@@ -227,5 +227,4 @@ def ask_turn_off_choice(parent: QWidget, exiting: bool) -> str:
         return "off"
     if clicked is keep:
         return "keep"
-    _ = cancel
     return "cancel"

@@ -1,9 +1,9 @@
-"""Gazebo replay of a recorded real-robot run ("From a ros2bag", v1.1).
+"""Gazebo replay of a recorded real-robot run ("From a ros2bag").
 
 Qt-free and rclpy-free at import, like the rest of ``core/``: the smoke test
 exercises it offline.
 
-Since v1.1 every real-robot RUN files a ros2bag into its run folder,
+Every real-robot RUN files a ros2bag into its run folder,
 ``Robot_data/<stem>/<date>-<note>-bag/`` (BlueBoat-Control ``robot_interface`` +
 ``run_bag.py``). ``blueboat_control Replay_launch.py`` replays one in Gazebo:
 the boat is moved KINEMATICALLY along the recorded pose (no controller, no sea
@@ -28,6 +28,8 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from mcs.core.clock import format_clock
 
 _LOG = logging.getLogger(__name__)
 
@@ -147,7 +149,7 @@ class ReplayReadout:
     world: str
     gazebo: bool            # set_pose service reachable
     received_mono: float
-    # Additive keys (2026-10-27); absent from an older control stack.
+    # Additive keys; absent from an older control stack.
     attitude_source: str = ""   # mavlink | imu | odom | blueboat_odom
     attitude_rate_hz: float = 0.0
     heave: str = ""             # replayed | pinned_noisy | off
@@ -210,12 +212,3 @@ def command_json(cmd: str, rate: float | None = None) -> str:
             raise ValueError("a rate command needs a positive rate")
         body["rate"] = float(rate)
     return json.dumps(body)
-
-
-def format_clock(seconds: float | None) -> str:
-    if seconds is None:
-        return "0:00"
-    seconds = int(max(0.0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"

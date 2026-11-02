@@ -83,10 +83,10 @@ class LaunchParameters:
       as ``Sim_launch.py`` plus the simulated sonar and a mavros shim that
       publishes the GPS fixes from the world's own anchor. It declares NO
       ``robot_file``/``trajectory``/``spawn_yaw``.
-    * ``Replay_launch.py`` (v1.1, "From a ros2bag", selected when
-      ``replay_bag`` is set): ``bag``, ``rate``, ``world_dir`` (optional, a
-      personalized world), and, only when set, ``placement:=origin`` (the
-      run on the world's origin instead of its GPS position, 2026-10-27).
+    * ``Replay_launch.py`` ("From a ros2bag", selected when ``replay_bag``
+      is set): ``bag``, ``rate``, ``world_dir`` (optional, a personalized
+      world), and, only when set, ``placement:=origin`` (the run on the
+      world's origin instead of its GPS position).
       The boat moves kinematically along a recorded real-robot run; no
       controller, no sea state, no note, no companion -- and no sonar: the
       replay publishes the boat pose a simulated sonar renders from, and the
@@ -104,7 +104,7 @@ class LaunchParameters:
     ``extra_args`` — so an operator ``spawn_yaw:=`` in Extra args overrides
     it (in ``ros2 launch`` the last occurrence wins).
 
-    ``perception_mode`` (2026-10-16) is no launch argument of any of the
+    ``perception_mode`` is no launch argument of any of the
     four files -- ``to_cli`` ignores it. It is the BlueBoat-Perception
     companion's mode (:func:`perception_command`): ``normal`` or
     ``dataset`` for a personalized-world Gazebo run; a real-robot launch
@@ -146,8 +146,8 @@ class LaunchParameters:
     # its initial playback rate. Implies ``simulation``.
     replay_bag: str = ""
     replay_rate: float = 1.0
-    # The run placed on the replay world's origin rather than at its GPS
-    # position (2026-10-27).
+    # "origin": the run placed on the replay world's origin rather than at its
+    # GPS position.
     replay_placement: str = "gps"
     extra_args: dict[str, str] = field(default_factory=dict)
     # BlueBoat-Perception companion mode (launch dialog's Session row); not a
@@ -221,9 +221,9 @@ def companion_command(cfg, params: LaunchParameters) -> list[str] | None:
     ``sea_state_launch.py`` against the stock world name. It runs for
     EVERY empty-world launch, a null choice (no current, calm) included,
     with no ``sea_*`` argument then (the simulator's own calm defaults):
-    since 2026-10-09 the simulator's catamaran hydrostatics carry the hull
-    in every run, so without the companion this path alone floated on
-    Gazebo's URDF box — and a live "Change sea state…" had no listener.
+    the simulator's catamaran hydrostatics carry the hull in every run, so
+    without the companion the boat would float on Gazebo's URDF box — and a
+    live "Change sea state…" would have no listener.
     World mode needs no companion: ``full_mission_launch.py`` includes
     ``sea_state_launch.py`` itself. Module scope and Qt-free so the smoke
     test can pin it."""
@@ -242,9 +242,9 @@ def guardian_command(cfg, params: LaunchParameters) -> list[str] | None:
     ``guardian.py watch`` (superproject ``link_guardian/laptop/``) switches the
     on-boat guardian ON for the session, moves HOME to each run start, reports
     on ``/link_guardian/status`` and obeys ``/link_guardian/command`` (the
-    GUARDIAN box). Every real-robot launch gets it (by the user's order,
-    2026-10-14: the boat must be able to return home whenever this laptop
-    disappears); simulation and bag replay never do. ``cfg`` is the
+    GUARDIAN box). Every real-robot launch gets it (the boat must be able to
+    return home whenever this laptop disappears); simulation and bag replay
+    never do. ``cfg`` is the
     ``AppConfig``. Module scope and Qt-free so the smoke test can pin it; None
     also when the script is missing (the box then says so)."""
     if params.simulation or params.replay_bag or not cfg.guardian.enabled:
@@ -269,7 +269,7 @@ def perception_command(cfg, params: LaunchParameters,
                        now: float | None = None) -> list[str] | None:
     """The BlueBoat-Perception companion launch, or None.
 
-    By the user's order (2026-10-16): every **personalized-world** Gazebo
+    Every **personalized-world** Gazebo
     run (``world_dir`` set -- the only simulation with a sonar, hence with
     seabed images) in the operator's chosen mode, and every **real-robot**
     launch in ``normal`` mode. Never for the empty Gazebo world (no sonar)

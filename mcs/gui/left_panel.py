@@ -1,7 +1,7 @@
 """Left information panel.
 
 Sections (all collapsible):
-* **Guardian** (v1.1) — the link guardian's box (``mcs/gui/guardian_box.py``),
+* **Guardian** — the link guardian's box (``mcs/gui/guardian_box.py``),
   hosted at the very top via :meth:`set_header`.
 * **Robot** — live pose, GPS, heading, speed, controller, mission state,
   motor commands, battery charge, travelled distance, elapsed time.
@@ -12,13 +12,14 @@ Sections (all collapsible):
   sits under ROS DIAGNOSTICS and never scrolls away: START RUN / STOP RUN and
   the run's status (``mcs/gui/run_panel.py``, hosted via :meth:`set_footer`).
 
-The map-layer checkboxes moved to the right column (v1.1). The panel is
-read-only; all values are pulled from the :class:`~mcs.models.store.DataStore`
-on the shared 10 Hz tick.
+The map-layer checkboxes live in the right column. The panel is read-only;
+all values are pulled from the :class:`~mcs.models.store.DataStore` on the
+shared 10 Hz tick.
 """
 
 from __future__ import annotations
 
+import math
 import time
 
 from PySide6.QtCore import Qt
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import format_clock
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection, InfoGrid, StatusLed
 from mcs.models.store import DataStore, TargetMode
@@ -49,8 +51,6 @@ class LeftPanel(QWidget):
         super().__init__(parent)
         self._cfg = cfg
         self._store = store
-        # Freely resizable via the splitter: a small minimum only, no
-        # maximum (a max-width cap prevented widening the panel at will).
         self.setMinimumWidth(220)
 
         outer = QVBoxLayout(self)
@@ -133,7 +133,7 @@ class LeftPanel(QWidget):
         g.set("Battery", *_battery_text(r))
         g.set("Travelled", f"{r.travelled_m:8.1f} m")
         elapsed = s.mission.elapsed_s()
-        g.set("Elapsed", _fmt_hms(elapsed) if elapsed is not None else "—")
+        g.set("Elapsed", format_clock(elapsed) if elapsed is not None else "—")
 
         p = s.pinger
         pg = self.pinger_grid
@@ -249,12 +249,4 @@ def _battery_text(r) -> tuple[str, str]:
 
 
 def _deg(rad: float) -> float:
-    import math
     return math.degrees(rad) % 360.0
-
-
-def _fmt_hms(seconds: float) -> str:
-    seconds = int(max(0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"

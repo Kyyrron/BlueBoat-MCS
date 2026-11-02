@@ -1,4 +1,4 @@
-"""Floating REPLAY box — the Gazebo replay of a recorded run (v1.1).
+"""Floating REPLAY box — the Gazebo replay of a recorded run.
 
 Same look and map-view parenting as the SEA STATE box, and the same place
 (top-left of the map): a replay has no sea state, so the two never show
@@ -30,9 +30,9 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
-from mcs.core.replay import format_clock
+from mcs.core.clock import format_clock
 from mcs.gui import theme
-from mcs.gui.widgets import CollapsibleSection
+from mcs.gui.widgets import CollapsibleSection, elide_middle
 from mcs.models.store import DataStore
 
 _BOX_W = 300
@@ -55,13 +55,7 @@ class FloatingReplayBox(QWidget):
 
         self.setObjectName("floatingReplayBox")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("""
-            QWidget#floatingReplayBox {
-                background-color: rgba(45, 45, 45, 230);
-                border: 1px solid #555;
-                border-radius: 6px;
-            }
-        """)
+        self.setStyleSheet(theme.floating_box_style("floatingReplayBox"))
         self.setFixedWidth(_BOX_W)
 
         layout = QVBoxLayout(self)
@@ -123,8 +117,7 @@ class FloatingReplayBox(QWidget):
     # ---------------------------------------------------------------- refresh
     def _set(self, key: str, text: str, color: str | None = None) -> None:
         label = self._values[key]
-        shown = text if len(text) <= _MAX_CHARS else (
-            text[:_MAX_CHARS // 2 - 1] + "…" + text[-(_MAX_CHARS // 2):])
+        shown = elide_middle(text, _MAX_CHARS)
         if label.text() != shown:
             label.setText(shown)
             label.setToolTip(text)

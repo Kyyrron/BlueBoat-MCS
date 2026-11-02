@@ -3,7 +3,7 @@
 Visually directly below ROS DIAGNOSTICS, but outside the scroll area so the
 START RUN / STOP RUN button can never scroll out of sight. Shown only while a
 real-robot run session is launched (``store.session.active``); a Gazebo
-launch keeps the v1.0 flow and never shows it.
+launch never shows it.
 
 Read-out (pulled from :meth:`mcs.ros.run_session.RunSession.status` on the
 shared 10 Hz tick):
@@ -14,7 +14,7 @@ shared 10 Hz tick):
 * **State** — connected, starting, Run n with its timer, last run;
 * **Log** — the run's CSV as robot_interface confirms it, or where the last
   one was saved;
-* **Bag** — the run's ros2bag (v1.1): recording, saved (filed into the run's
+* **Bag** — the run's ros2bag: recording, saved (filed into the run's
   folder with the CSV), or off.
 
 One big button: START RUN (green) while idle, STOP RUN (amber) during a run.
@@ -27,7 +27,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from mcs.gui import theme
-from mcs.gui.widgets import InfoGrid
+from mcs.gui.widgets import InfoGrid, elide_middle
 from mcs.models.store import DataStore
 from mcs.ros.run_session import RunSession
 
@@ -84,9 +84,7 @@ class RunPanel(QFrame):
         """Set a row, eliding long text (CSV names, error details) in the
         middle so the pinned box can never widen the left panel; the full text
         is the row's tooltip."""
-        shown = text if len(text) <= _MAX_CHARS else (
-            text[:_MAX_CHARS // 2 - 1] + "…" + text[-(_MAX_CHARS // 2):])
-        self.grid.set(key, shown, color)
+        self.grid.set(key, elide_middle(text, _MAX_CHARS), color)
         label = self.grid._values.get(key)
         if label is not None and label.toolTip() != text:
             label.setToolTip(text)

@@ -43,14 +43,14 @@ class TopicsConfig:
     # (String JSON, heartbeated 1 Hz) and robot_interface's per-run log state.
     run_state: str = "/blueboat/run_state"
     run_log: str = "/blueboat/run_log"
-    # Link guardian (v1.1, real-robot sessions): the report of its laptop
+    # Link guardian (real-robot sessions): the report of its laptop
     # companion guardian.py watch (String JSON, 1 Hz).
     guardian_status: str = "/link_guardian/status"
 
     # --- Simulation only (BlueBoat-SSS-Sim sea_state_node): the live sea
     # state (String JSON, latched, 2 Hz) and the command that changes it.
     sea_state: str = "/sim/sea_state"
-    # --- Bag replay only (blueboat_control bag_replay, v1.1): the replay's
+    # --- Bag replay only (blueboat_control bag_replay): the replay's
     # state (String JSON, latched, 2 Hz) and its pause / rate command.
     replay_state: str = "/replay/state"
 
@@ -137,7 +137,7 @@ class LaunchConfig:
     # so the station's SimGps stays disarmed in this mode.
     sim_world_package: str = "blueboat_sss_sim"
     sim_world_launch_file: str = "full_mission_launch.py"
-    # Gazebo replay of a recorded real-robot run (v1.1, blueboat_control):
+    # Gazebo replay of a recorded real-robot run (blueboat_control):
     # declares bag / world_dir / rate / heave / start_paused / gui. The boat
     # is moved kinematically from the bag; no controller, no sea state.
     replay_launch_file: str = "Replay_launch.py"
@@ -153,10 +153,9 @@ class LaunchConfig:
     # for one run, pass spawn_yaw:=<radians> in Extra args — it is appended
     # after this one and ros2 launch takes the last occurrence.
     sim_spawn_yaw_deg: float = 0.0
-    # Controller choices. A real-robot launch is a run session and needs a
-    # controller (manual target and arrow keys go through master_control), so
-    # the empty "robot interface only" entry is offered for nothing any more;
-    # it stays here only so an old config.json naming it still loads.
+    # Controller choices. Every launch needs a controller (manual target and
+    # arrow keys go through master_control), so the dialogs never offer the
+    # empty entry; it stays only so an old config.json naming it still loads.
     controllers: list[str] = field(default_factory=lambda: ["", "PID", "LoS", "MPC"])
     trajectories: list[str] = field(default_factory=lambda: [
         "station_keeping", "circle", "straight_line", "sin",
@@ -203,7 +202,7 @@ class RunConfig:
 
 @dataclass
 class ReplayConfig:
-    """Gazebo replay of a recorded run ("From a ros2bag", v1.1)."""
+    """Gazebo replay of a recorded run ("From a ros2bag")."""
 
     # Where the launch dialog's folder picker opens: the run folders that
     # robot_interface files a bag into (Robot_data/<stem>/<..>-bag/).
@@ -225,8 +224,8 @@ def _default_guardian_script() -> str:
 
 @dataclass
 class GuardianConfig:
-    """Link guardian (v1.1): its laptop companion, started with every
-    real-robot session (``launch_manager.guardian_command``)."""
+    """Link guardian: its laptop companion, started with every real-robot
+    session (``launch_manager.guardian_command``)."""
 
     enabled: bool = True
     # guardian.py of the superproject's link_guardian/ (absent in a standalone
@@ -243,7 +242,7 @@ class GuardianConfig:
 
 @dataclass
 class PerceptionConfig:
-    """BlueBoat-Perception companion (2026-10-16, by the user's order):
+    """BlueBoat-Perception companion:
     ``ros2 launch <package> <launch_file> mode:=...`` started with every
     personalized-world Gazebo run (the launch dialog's Session row: normal
     session or dataset creation) and every real-robot launch (normal),
@@ -285,7 +284,7 @@ class SeaConfig:
     launch file declares no sea arguments). The companion runs for every
     empty-world launch, a null choice (no current, calm) included — with no
     sea argument then — because the simulator's catamaran hydrostatics carry
-    the hull in every run (since 2026-10-09).
+    the hull in every run.
     """
 
     presets_file: str = ""

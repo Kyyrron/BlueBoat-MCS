@@ -4,8 +4,8 @@ Restructured as a vertical splitter so monitoring and the launch console
 share the column without crowding each other:
 
 * **Top part** (scrollable stack)
-  * **Layers** — visibility checkboxes for every map layer (moved here from the
-    left column in v1.1, directly above the map tools they go with).
+  * **Layers** — visibility checkboxes for every map layer, directly above
+    the map tools they go with.
   * **Map tools** — Zoom +, Zoom −, and *Center Robot* (a one-shot recenter;
     the camera stays completely free afterwards — never a follow mode).
   * **Live distance plot** — robot ↔ current target distance vs time.
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import format_clock
 from mcs.gui.console import LaunchConsole
 from mcs.gui.plot.distance_plot import DistancePlot
 from mcs.gui.widgets import CollapsibleSection, RangeSlider
@@ -68,8 +69,6 @@ class RightPanel(QWidget):
         super().__init__(parent)
         self._cfg = cfg
         self._store = store
-        # Freely resizable via the splitter: a small minimum only, no
-        # maximum (a max-width cap prevented widening the panel at will).
         self.setMinimumWidth(260)
 
         outer = QVBoxLayout(self)
@@ -194,8 +193,8 @@ class RightPanel(QWidget):
         self._emit_window(low, high, self.slider.high_at_end())
 
     def _emit_window(self, low: float, high: float, live: bool) -> None:
-        end = "live" if live else _fmt_hms(high)
-        self._window_label.setText(f"{_fmt_hms(low)} → {end}")
+        end = "live" if live else format_clock(high)
+        self._window_label.setText(f"{format_clock(low)} → {end}")
         self._live_button.setEnabled(not live)
         self.time_window_changed.emit(low, high, live)
 
@@ -204,10 +203,3 @@ class RightPanel(QWidget):
         duration = max(self._store.recorded_duration(), 10.0)
         self.slider.set_maximum(duration, keep_high_at_end=False)
         self.slider.set_values(low, duration)
-
-
-def _fmt_hms(seconds: float) -> str:
-    seconds = int(max(0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"

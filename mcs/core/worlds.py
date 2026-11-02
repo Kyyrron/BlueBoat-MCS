@@ -139,8 +139,8 @@ def world_contains_any(meta: dict, latlon_pts) -> bool:
 
 
 def eligible_worlds_for_track(worlds_root: Path, latlon_pts) -> list[dict]:
-    """The worlds a GPS track touches (the bag replay of a recorded run,
-    v1.1): the same one-point-inside rule as :func:`eligible_worlds`."""
+    """The worlds a GPS track touches (the bag replay of a recorded run):
+    the same one-point-inside rule as :func:`eligible_worlds`."""
     if not latlon_pts:
         return []
     return [w for w in list_worlds(worlds_root)

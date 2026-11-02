@@ -87,8 +87,8 @@ class RobotItem(QGraphicsItemGroup):
         scene axes (ENU true heading once georeferenced, raw world yaw
         before). The glyph ignores view transforms and is rotated in
         **device** space (y-down, CW-positive), hence ``-degrees(heading)``.
-        This is the whole orientation contract — there is no separate
-        view-rotation term any more."""
+        This is the whole orientation contract — there is no view-rotation
+        term."""
         self._glyph.setPos(x, y)
         self._glyph.setRotation(-math.degrees(heading))
 

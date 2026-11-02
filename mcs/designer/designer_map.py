@@ -479,9 +479,7 @@ class DesignerMapView(QGraphicsView):
 
         The visible span in scene metres changes with the widget size, and
         nothing else here covers a resize -- pan, zoom and set_geo_fit each
-        refresh on their own. It used to be papered over by a 250 ms overlay
-        tick that also pushed the (live) geo fit; that tick is gone with the
-        robot/pinger overlays, so the resize case is handled explicitly.
+        refresh on their own, so the resize case is handled explicitly.
         """
         super().resizeEvent(event)
         self._update_tiles()

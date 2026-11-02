@@ -10,7 +10,7 @@ project rule CM-3, the same way :mod:`mcs.core.worlds` reads
 it headless, and every reader follows the never-raises contract: a missing
 or malformed file yields built-in names with no descriptions.
 
-The operator's model (2026-10-08) is deliberately plain:
+The operator's model is deliberately plain:
 
 * **Current** — on/off, a *mean* speed, the direction it comes from, and a
   variation level (``steady`` / ``natural`` / ``strong``). The simulator
@@ -135,7 +135,7 @@ class SeaCatalog:
     @classmethod
     def load(cls, path: str | Path | None) -> SeaCatalog:
         """Never raises: any failure answers the fallback catalogue. A file
-        from before the plain-language blocks (2026-10-08) keeps the
+        without the plain-language blocks (an older simulator) keeps the
         fallback variation / crest / wakes names."""
         if path is None:
             return cls.fallback()
@@ -525,18 +525,9 @@ def list_schedules(schedules_dir: str | Path) -> list[Path]:
     d = Path(schedules_dir).expanduser()
     if not d.is_dir():
         return []
-    out = []
-    for p in sorted(d.glob("*.yaml")):
-        if p.stem in ("last_launch", "custom_waves", "timeline_unsaved"):
-            continue
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                doc = yaml.safe_load(f)
-            if isinstance(doc, dict) and doc.get("format") == SCHEDULE_FORMAT:
-                out.append(p)
-        except (OSError, yaml.YAMLError):
-            continue
-    return out
+    return [p for p in sorted(d.glob("*.yaml"))
+            if p.stem not in ("last_launch", "custom_waves", "timeline_unsaved")
+            and read_schedule(p) is not None]
 
 
 def read_schedule(path: str | Path) -> dict | None:
@@ -644,7 +635,7 @@ class SeaReadout:
 def parse_readback(payload: str | dict, received_mono: float = 0.0
                    ) -> SeaReadout | None:
     """Decode one status message; ``None`` on malformed input. Every field
-    added after 2026-09 is optional (older simulators omit it)."""
+    beyond the original set is optional (older simulators omit it)."""
     try:
         d = json.loads(payload) if isinstance(payload, str) else dict(payload)
         cur, wav = d.get("current") or {}, d.get("waves") or {}

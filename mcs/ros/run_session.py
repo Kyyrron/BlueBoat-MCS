@@ -1,12 +1,12 @@
 """Run sessions: a real-robot launch that stays connected between runs.
 
-Since 2026-10-09 every real-robot launch from the station is a **session**
+Every real-robot launch from the station is a **session**
 (``BlueBoat_launch.py session_mode:=True``). The boat connects and goes into
 override, but ``master_control`` idles -- manual target and arrow keys drive
 it, nothing follows a path or the pinger, nothing is logged -- until the
 operator presses START RUN. A run ends with STOP RUN (its CSV, ``.npy`` and
 report are written by the control stack); the session ends with Turn Off
-Connection (the v1.0 safe shutdown, unchanged).
+Connection (the safe shutdown of :mod:`mcs.ros.command_center`).
 
 This object owns the station's half of that protocol::
 
@@ -42,6 +42,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import format_clock
 from mcs.core.signals import SignalBus
 from mcs.models.store import DataStore, NextMission, now_mono
 from mcs.ros.command_center import CommandCenter
@@ -63,7 +64,7 @@ class RunStatus:
     state_color: str
     log: str                 # current / last CSV name
     log_color: str
-    bag: str                 # the run's ros2bag (v1.1): recording / saved / off
+    bag: str                 # the run's ros2bag: recording / saved / off
     bag_color: str
     running: bool            # the button reads STOP RUN
     pending: str             # "start" | "stop" | ""
@@ -98,7 +99,6 @@ class RunSession(QObject):
         self._configure_tries = 0
         self._pending_seq: int | None = None
         self._deployed_from = ""        # source currently deployed in the file
-        self._last_detail = ""          # last refusal / error worth showing
 
         self._ack_timer = QTimer(self)
         self._ack_timer.setSingleShot(True)
@@ -138,7 +138,6 @@ class RunSession(QObject):
         self._configure_acked = False
         self._configure_tries = 0
         self._deployed_from = ""
-        self._last_detail = ""
         self._store.mission.following = False
         # Never let a previous session's path be served (or drawn by the GCS)
         # before this session decides what its first run executes. The GPS
@@ -201,7 +200,6 @@ class RunSession(QObject):
             return
         ss.next = nxt
         self._configure_tries = 0
-        self._last_detail = ""
         self._send_configure()
 
         # The map preview must describe the next run, never the last one.
@@ -329,7 +327,7 @@ class RunSession(QObject):
     def stop_run(self) -> bool:
         """STOP RUN: end the run; the boat stops and stays in override."""
         ss = self._store.session
-        if not (ss.run_active or ss.run_pending == "start"):
+        if not ss.run_in_progress:
             return False
         seq = self._next_seq()
         if not self._commands.send_run_command({"cmd": "stop", "seq": seq}):
@@ -356,7 +354,7 @@ class RunSession(QObject):
         """Turn Off Connection / app exit: a run still active is stopped first,
         so its log is closed and filed by the control stack itself."""
         ss = self._store.session
-        if ss.active and (ss.run_active or ss.run_pending == "start"):
+        if ss.active and ss.run_in_progress:
             _LOG.info("Turn Off Connection with a run active — stopping it first")
             self.stop_run()
 
@@ -385,7 +383,6 @@ class RunSession(QObject):
             self._configure_acked = True
             self._configure_timer.stop()
             if not ok:
-                self._last_detail = detail
                 self.message.emit(f"Mission settings refused: {detail}", 10000)
 
         if self._pending_seq is not None and seq == self._pending_seq:
@@ -401,7 +398,6 @@ class RunSession(QObject):
                     ss.run_active = False
                     self._store.mission.following = False
                     self._log_timer.stop()
-                    self._last_detail = detail
                     self.message.emit(f"START RUN refused: {detail}", 10000)
             elif pending == "stop":
                 ss.run_active = False
@@ -459,7 +455,6 @@ class RunSession(QObject):
     def _on_log_timeout(self) -> None:
         ss = self._store.session
         if ss.run_active and not (ss.log.get("logging") and ss.log.get("run") == ss.run):
-            self._last_detail = "position log not confirmed by robot_interface"
             self.message.emit("WARNING: robot_interface has not confirmed this "
                               "run's position log — field data may be missing.",
                               15000)
@@ -496,9 +491,9 @@ class RunSession(QObject):
         elif ss.run_pending == "stop":
             state, s_color = f"Stopping run {ss.run}…", "warn"
         elif ss.run_active:
-            state, s_color = f"Run {ss.run} — {_fmt(elapsed)}", "ok"
+            state, s_color = f"Run {ss.run} — {format_clock(elapsed)}", "ok"
         elif ss.run > 0:
-            state = f"Connected — last run {ss.run} ({_fmt(elapsed)})"
+            state = f"Connected — last run {ss.run} ({format_clock(elapsed)})"
             s_color = "dim"
         elif fresh:
             state, s_color = "Connected — no run yet", "dim"
@@ -518,8 +513,8 @@ class RunSession(QObject):
         else:
             log_text, l_color = "—", "dim"
 
-        # The run's ros2bag (robot_interface, v1.1). A control stack older
-        # than v1.1 sends no bag fields at all.
+        # The run's ros2bag (robot_interface). An older control stack sends
+        # no bag fields at all.
         bag = Path(str(log.get("bag") or "")).name
         if "bag_enabled" not in log:
             bag_text, b_color = "—", "dim"
@@ -538,14 +533,5 @@ class RunSession(QObject):
                          controller_color=c_color, state=state, state_color=s_color,
                          log=log_text, log_color=l_color,
                          bag=bag_text, bag_color=b_color,
-                         running=ss.run_active or ss.run_pending == "start",
+                         running=ss.run_in_progress,
                          pending=ss.run_pending)
-
-
-def _fmt(seconds: float | None) -> str:
-    if seconds is None:
-        return "0:00"
-    seconds = int(max(0.0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"

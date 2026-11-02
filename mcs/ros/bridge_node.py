@@ -24,6 +24,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -64,14 +65,14 @@ class TopicStats:
     warn_age_s: float = 2.0
     stale_age_s: float = 8.0
     last_rx: float | None = None            # monotonic time of last message
-    _stamps: list[float] = field(default_factory=list)
+    _stamps: deque[float] = field(default_factory=deque)
 
     def mark(self, t: float, window_s: float) -> None:
         self.last_rx = t
         self._stamps.append(t)
         cutoff = t - window_s
         while self._stamps and self._stamps[0] < cutoff:
-            self._stamps.pop(0)
+            self._stamps.popleft()
 
     def rate_hz(self, now: float, window_s: float) -> float:
         stamps = [s for s in self._stamps if s >= now - window_s]
@@ -283,11 +284,8 @@ class BridgeNode(Node):
 
     def _on_sea_state(self, msg: String) -> None:
         t = self._mark(self._cfg.topics.sea_state)
-        try:
-            payload = json.loads(msg.data)
-        except (ValueError, TypeError):
-            return
-        if isinstance(payload, dict):
+        payload = _json_object(msg.data)
+        if payload is not None:
             self._bus.sea_state_received.emit(t, payload)
 
     def _on_replay_state(self, msg: String) -> None:
@@ -321,12 +319,15 @@ class BridgeNode(Node):
     # =============================================================== outputs
     # publish() on rclpy publishers is safe to call from other threads; the
     # lock only serialises our own bookkeeping.
-    def publish_input_str(self, command: str) -> None:
-        """Publish on /blueboat/input_str ('default', 'override', 'stop', ...)."""
+    def _publish_text(self, publisher, text: str) -> None:
         with self._pub_lock:
             msg = String()
-            msg.data = command
-            self._pub_input_str.publish(msg)
+            msg.data = text
+            publisher.publish(msg)
+
+    def publish_input_str(self, command: str) -> None:
+        """Publish on /blueboat/input_str ('default', 'override', 'stop', ...)."""
+        self._publish_text(self._pub_input_str, command)
         self._bus.command_sent.emit(f"input_str ← '{command}'")
 
     def input_str_subscriber_count(self) -> int:
@@ -339,18 +340,12 @@ class BridgeNode(Node):
 
     def publish_sea_state_command(self, payload: str) -> None:
         """Publish a JSON command on /sim/sea_state/command (sim only)."""
-        with self._pub_lock:
-            msg = String()
-            msg.data = payload
-            self._pub_sea_command.publish(msg)
+        self._publish_text(self._pub_sea_command, payload)
         self._bus.command_sent.emit("sea_state/command ← " + payload[:60])
 
     def publish_replay_command(self, payload: str) -> None:
         """Publish a JSON command on /replay/command (bag replay only)."""
-        with self._pub_lock:
-            msg = String()
-            msg.data = payload
-            self._pub_replay_command.publish(msg)
+        self._publish_text(self._pub_replay_command, payload)
         self._bus.command_sent.emit("replay/command ← " + payload[:60])
 
     def publish_manual_target(self, x: float, y: float) -> None:
@@ -363,20 +358,12 @@ class BridgeNode(Node):
 
     def publish_run_command(self, payload: dict) -> None:
         """Publish one run-session command (JSON) on /blueboat/run_command."""
-        text = json.dumps(payload)
-        with self._pub_lock:
-            msg = String()
-            msg.data = text
-            self._pub_run_command.publish(msg)
+        self._publish_text(self._pub_run_command, json.dumps(payload))
         self._bus.command_sent.emit(f"run_command ← {payload.get('cmd', '?')}")
 
     def publish_guardian_command(self, payload: dict) -> None:
         """Publish one command (JSON) to the guardian companion."""
-        text = json.dumps(payload)
-        with self._pub_lock:
-            msg = String()
-            msg.data = text
-            self._pub_guardian_command.publish(msg)
+        self._publish_text(self._pub_guardian_command, json.dumps(payload))
         self._bus.command_sent.emit(f"link_guardian/command ← {payload.get('cmd', '?')}")
 
     def run_command_subscriber_count(self) -> int:

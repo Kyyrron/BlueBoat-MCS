@@ -87,13 +87,7 @@ class FloatingSeaBox(QWidget):
 
         self.setObjectName("floatingSeaBox")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("""
-            QWidget#floatingSeaBox {
-                background-color: rgba(45, 45, 45, 230);
-                border: 1px solid #555;
-                border-radius: 6px;
-            }
-        """)
+        self.setStyleSheet(theme.floating_box_style("floatingSeaBox"))
         self.setFixedWidth(_BOX_W)
 
         layout = QVBoxLayout(self)

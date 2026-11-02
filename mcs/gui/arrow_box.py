@@ -57,14 +57,6 @@ from mcs.ros.command_center import CommandCenter
 
 _ARROWS = (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Left, Qt.Key.Key_Right)
 
-_STYLE = """
-    QWidget#floatingArrowBox {{
-        background-color: rgba(45, 45, 45, 230);
-        border: {width}px solid {color};
-        border-radius: 6px;
-    }}
-"""
-
 
 class FloatingArrowBox(QWidget):
     """Arrow-key thrust control floating over the map."""
@@ -288,5 +280,5 @@ class FloatingArrowBox(QWidget):
             f" color: {theme.WARN}; font-weight: bold;")
 
     def _set_frame(self, active: bool) -> None:
-        self.setStyleSheet(_STYLE.format(width=2 if active else 1,
-                                         color=theme.WARN if active else "#555"))
+        border = f"2px solid {theme.WARN}" if active else "1px solid #555"
+        self.setStyleSheet(theme.floating_box_style("floatingArrowBox", border))

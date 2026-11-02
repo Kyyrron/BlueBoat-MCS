@@ -1,4 +1,4 @@
-"""Link guardian — the station's model of it (v1.1, 2026-10-14, by the user's order).
+"""Link guardian — the station's model of it.
 
 The guardian brings the boat back on its own when this laptop goes silent: an
 ArduPilot Lua script on the autopilot (superproject ``link_guardian/``), switched
@@ -9,10 +9,10 @@ The companion reports on ``/link_guardian/status`` (String JSON, 1 Hz) and obeys
 station adds no guardian logic of its own: this module only turns the companion's
 report into what the GUARDIAN box shows and which of its buttons may act.
 
-Since 2026-10-28 (owner's order) the script takes over after ``LGRD_TIMEOUT``
-(15 s), retraces the boat's own trail in reverse, and hands control back by
-itself on the first laptop heartbeat, so the run goes on: Take back control is
-only a fallback (an older script, or a hand-back that failed).
+The script takes over after ``LGRD_TIMEOUT`` (15 s), retraces the boat's own
+trail in reverse, and hands control back by itself on the first laptop
+heartbeat, so the run goes on: Take back control is only a fallback (an older
+script, or a hand-back that failed).
 
 Qt-free and rclpy-free, so the smoke test can pin every rule.
 """
@@ -219,8 +219,8 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
                  (not armed, "the autopilot is already armed"),
                  (not estop_latched, "E-STOP latched — release it first"),
                  (not run_active, "a run is active — stop it first"))
-    # No run gate since 2026-10-28: the hand-back resumes the run on purpose,
-    # exactly as the script's own does.
+    # No run gate: the hand-back resumes the run on purpose, exactly as the
+    # script's own does.
     reclaim = gate(*base, (autonomous, ("nothing to take back: the boat is not "
                                         "under guardian / failsafe control")))
 
@@ -234,11 +234,10 @@ def needs_turn_off_choice(r: GuardianReadout | None, *, real_session: bool,
                           now: float | None = None) -> bool:
     """Should Turn Off Connection / app exit ask what the guardian does?
 
-    Always in a real-robot session (user's order, 2026-10-23). The guardian's
-    report used to be allowed to skip the question (flag OFF, script absent),
-    but a stale or misread report then let the boat see the laptop go silent
-    and take over (HOLD / retrace, re-asserted every 2 s) without the operator
-    ever choosing it. *r* and *now* are kept for the callers' signature.
+    Always in a real-robot session, whatever the guardian reports: a stale or
+    misread report must never let the boat see the laptop go silent and take
+    over (HOLD / retrace) without the operator having chosen it. *r* and *now*
+    are kept for the callers' signature.
     """
     return bool(real_session)
 

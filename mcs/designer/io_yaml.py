@@ -204,8 +204,8 @@ def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     from mcs.core.geo import local_en_to_latlon as _en_to_ll
 
     # A usable translation fit is all deployment needs: no rotation is
-    # estimated any more (the odom frame is local ENU), so no vehicle motion
-    # is required. The watcher retries until fixes have anchored the frame.
+    # estimated (the odom frame is local ENU), so no vehicle motion is
+    # required. The watcher retries until fixes have anchored the frame.
     if current_fit is None:
         raise ValueError("no georeference yet (waiting for GPS fixes)")
 

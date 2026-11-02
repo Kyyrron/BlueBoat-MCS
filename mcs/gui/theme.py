@@ -35,6 +35,14 @@ C_GRID = QColor(255, 255, 255, 22)
 C_GRID_MAJOR = QColor(255, 255, 255, 45)
 C_MEASURE = QColor("#56d4dd")
 
+
+
+def floating_box_style(object_name: str, border: str = "1px solid #555") -> str:
+    """Stylesheet of a translucent box floating over the map view."""
+    return (f"QWidget#{object_name} {{ background-color: rgba(45, 45, 45, 230);"
+            f" border: {border}; border-radius: 6px; }}")
+
+
 STYLESHEET = f"""
 QWidget {{
     background-color: {BG_DARK};

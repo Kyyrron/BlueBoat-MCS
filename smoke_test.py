@@ -2,10 +2,12 @@
 QT_QPA_PLATFORM=offscreen, feeds synthetic telemetry through the SignalBus and
 exercises store/geo/predictor/designer logic plus the N1/N2/N4/N8 guarantees.
 
-Runs identically whether or not rclpy is importable: with a sourced ROS the
-window brings up a real bridge node, without one it degrades to GUI-only. The
-blocks that assert what was published substitute their own node stub, so the
-result never depends on which of the two it is.
+With a sourced ROS the window brings up a real bridge node, without rclpy it
+degrades to GUI-only; the blocks that assert what was published substitute
+their own node stub, so the result does not depend on which. Three blocks do
+need the environment (see .claude/CLAUDE.md §7): the simulator's installed
+sea_states.yaml, the ROS message packages bridge_node imports, and the
+superproject's link_guardian/ beside this repository.
 """
 import itertools
 import math
@@ -2879,6 +2881,28 @@ assert _pd2.parameters().perception_mode == "normal"
 _pd.deleteLater()
 _pd2.deleteLater()
 print("perception ok")
+
+# --- Shared display helpers: one elapsed-time format, one middle elision,
+# one "a run is in progress" rule (every read-out and gate uses these) ---
+from mcs.core.clock import format_clock
+from mcs.gui.widgets import elide_middle
+from mcs.models.store import SessionState
+
+assert format_clock(None) == "0:00" and format_clock(-5.0) == "0:00"
+assert format_clock(65.9) == "1:05" and format_clock(3725) == "1:02:05"
+assert elide_middle("short", 30) == "short"
+_el = elide_middle("2026_11_02-10_00_00-harbour-survey-poslog.csv", 30)
+assert len(_el) == 30, _el
+assert _el.startswith("2026_11_02-10_") and _el.endswith("-poslog.csv"), _el
+_ss = SessionState()
+assert not _ss.run_in_progress
+_ss.run_pending = "start"
+assert _ss.run_in_progress
+_ss.run_pending, _ss.run_active = "stop", False
+assert not _ss.run_in_progress
+_ss.run_active = True
+assert _ss.run_in_progress
+print("helpers ok")
 
 w.close()
 print("window ok")

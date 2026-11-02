@@ -6,7 +6,7 @@ floating SEA STATE box's "Change…" button during a run (``live=True``),
 where OK sends the change on ``/sim/sea_state/command`` and the simulator
 blends it in.
 
-Two cards, in plain language (2026-10-08 redesign):
+Two cards, in plain language:
 
 * **Current** — on/off, the *mean* speed and the direction it comes from,
   and how much it varies. The simulator adds the small smooth variation

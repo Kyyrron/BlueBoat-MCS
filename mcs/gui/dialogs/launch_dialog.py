@@ -3,7 +3,7 @@
 Two mission types, matching the two launch files of the stack:
 
 * **Real robot** — ``BlueBoat_launch.py`` as a **run session**
-  (``session_mode:=True``, since 2026-10-09): the launch connects and idles,
+  (``session_mode:=True``): the launch connects and idles,
   and runs are started and stopped from the station. The dialog chooses what
   the FIRST run executes — a designer path (built-in shapes are a simulation
   and CLI affair: a session places or deploys each run's path into one watched
@@ -28,18 +28,17 @@ Two mission types, matching the two launch files of the stack:
   anchoring, deployment and hot-reload are exercised exactly as at sea and two
   runs of the same mission remain comparable.
 
-  **Source** (Gazebo only, v1.1): *Controller* is the above; *From a
+  **Source** (Gazebo only): *Controller* is the above; *From a
   ros2bag* replays a recorded real-robot run instead (``Replay_launch.py``):
   the operator picks a run folder (or its ``*-bag`` directory) and an initial
   playback rate, and the boat moves exactly as it did in the water — no
   controller, trajectory, robot file or note apply, and no sea state is asked
   for (the recording already holds the real sea).
-  **Session** (Gazebo + Controller only, 2026-10-16): *Normal session* or
-  *Dataset creation* -- the mode BlueBoat-Perception runs in for a
-  personalized-world run (``LaunchParameters.perception_mode``; the world is
-  chosen after this dialog, and the empty world has no sonar, so no
-  Perception). A real-robot launch always runs it normal. Its own row, so a
-  future per-run row (e.g. a path source) can sit beside it.
+  **Session** (Gazebo + Controller only): *Normal session* or *Dataset
+  creation* -- the mode BlueBoat-Perception runs in for a personalized-world
+  run (``LaunchParameters.perception_mode``; the world is chosen after this
+  dialog, and the empty world has no sonar, so no Perception). A real-robot
+  launch always runs it normal.
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -159,7 +158,7 @@ class LaunchDialog(QDialog):
         self._mode.currentTextChanged.connect(self._on_mode_changed)
         form.addRow("Mission type", self._mode)
 
-        # ---- Gazebo source: live controller, or a recorded run (v1.1) ---------
+        # ---- Gazebo source: live controller, or a recorded run ---------------
         self._source = QComboBox()
         self._source.addItems([_SRC_CONTROL, _SRC_BAG])
         self._source.setToolTip(
@@ -200,8 +199,8 @@ class LaunchDialog(QDialog):
         self._rate_label = QLabel("Playback rate")
         form.addRow(self._rate_label, self._rate)
 
-        # The run placed on a world it never saw (2026-10-27), e.g. to drive a
-        # simulated sonar, started separately, with the recorded motion.
+        # The run placed on a world it never saw, e.g. to drive a simulated
+        # sonar, started separately, with the recorded motion.
         self._replay_origin = QCheckBox("Place the run on the world's origin (any world)")
         self._replay_origin.setToolTip(
             "Replay_launch.py placement:=origin — the run's launch point on the "
@@ -505,8 +504,6 @@ class LaunchDialog(QDialog):
             )
         custom = self._trajectory.currentData()
         gps_src = gps_dst = ""
-        gps_simulated = False
-        spawn_yaw = None
         if not sim:
             # Real robot = run session: path_generation always watches the
             # session file; the station writes each run's path into it.
@@ -529,44 +526,39 @@ class LaunchDialog(QDialog):
                 session_source=source,
                 extra_args=extra,
             )
+        # Gazebo simulation.
+        gps_simulated = False
+        spawn_yaw = None
         if custom:
             src = Path(custom)
             if io_yaml.read_geo_anchor(src) is not None:
-                # GPS-anchored: the SAME deferred-deploy pipeline on real
-                # water and in simulation. On real water MAVROS provides the
-                # fixes; in simulation the station synthesises them (the
-                # boat's first fix lands offset_north_m north of the path's
-                # first point) and spawns the boat at the configured fixed
-                # heading, so anchoring, deployment and hot-reload run exactly
-                # as at sea, repeatably.
+                # GPS-anchored: the SAME deferred-deploy pipeline as on real
+                # water. The station synthesises the fixes (the boat's first
+                # fix lands offset_north_m north of the path's first point)
+                # and spawns the boat at the configured FIXED heading, so two
+                # runs of one mission start from the same pose (Extra args may
+                # still override spawn_yaw for a single run).
                 gps_src = str(src)
                 gps_dst = str(io_yaml.deployed_path(src.parent, src.stem))
                 trajectory = f"from_yaml:{gps_dst}"
-                if sim:
-                    gps_simulated = True
-                    # Fixed, not random: the spawn heading is the only spawn
-                    # degree of freedom here, and two runs of one mission must
-                    # start from the same pose to be comparable. Extra args
-                    # may still override it for a single run.
-                    spawn_yaw = math.radians(
-                        self._cfg.launch.sim_spawn_yaw_deg)
+                gps_simulated = True
+                spawn_yaw = math.radians(self._cfg.launch.sim_spawn_yaw_deg)
             else:
                 trajectory = f"from_yaml:{custom}"
         else:
             trajectory = self._trajectory.currentText()
         return LaunchParameters(
-            enable_motors=(not sim) and self._enable_motors.isChecked(),
+            enable_motors=False,
             note=self._note.text().strip(),
             controller_type=self._controller.currentText(),
             trajectory=trajectory,
-            use_pinger=(not sim) and self._use_pinger.isChecked(),
-            simulation=sim,
+            use_pinger=False,
+            simulation=True,
             robot_file=self._robot_file.currentText().strip() or "thrusters_ur",
             gps_anchored_source=gps_src,
             gps_deployed_target=gps_dst,
             gps_simulated=gps_simulated,
             spawn_yaw_rad=spawn_yaw,
             extra_args=extra,
-            perception_mode=(self._session.currentData() or PERCEPTION_NORMAL)
-            if sim else PERCEPTION_NORMAL,
+            perception_mode=self._session.currentData() or PERCEPTION_NORMAL,
         )

@@ -1,10 +1,8 @@
 """High-level operator commands, the **E-STOP** and the **safe-shutdown guarantee**.
 
-Three operator actions, three separate jobs — they are deliberately NOT nested
-(2026-09-04). Before that, E-STOP published ``default``, which dropped out of
-override, and "E-STOP + Stop Override" additionally killed the launch, so an
-operator could not cut the motors without also giving the servo mapping back and
-could not give the mapping back without ending the mission:
+Three operator actions, three separate jobs — deliberately NOT nested, so the
+operator can cut the motors without giving the servo mapping back, and give the
+mapping back without ending the mission:
 
 ===========================  =========================  ===========================
 Action                       Publishes                  Terminates the launch?
@@ -17,7 +15,7 @@ Stop Mission / App Exit      ``default``                yes, after confirmation
 real-robot run session)
 ===========================  =========================  ===========================
 
-In a run session (real-robot launches since 2026-10-09) the two terminating
+In a run session (every real-robot launch) the two terminating
 paths first end a run that is still active (``stop`` on
 ``/blueboat/run_command``, so its CSV is closed and filed by the control stack
 rather than by the teardown), then run the same sequence, unchanged.
@@ -187,7 +185,7 @@ class CommandCenter(QObject):
         # is stopped (and filed) first. Set by RunSession; None outside one.
         self._before_terminate: Callable[[], None] | None = None
 
-        # Link guardian (v1.1): commands to its companion are seq-numbered; the
+        # Link guardian: commands to its companion are seq-numbered; the
         # turn-off pre-step watches the companion's report and /mavros/state.
         self._guardian_seq = 0
         self._guardian = None               # last GuardianReadout
@@ -765,7 +763,6 @@ class CommandCenter(QObject):
         self._terminate_after = False
         if terminate:
             self._restore_manual = False
-        if terminate:
             self._launcher.stop()
         # Return the toolbar's status label to blank. Without this the last
         # phase text ("no echo — check chain") stuck for the rest of the
