@@ -664,7 +664,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self, "Guardian still ON",
                 f"The guardian could not be turned off: {detail}.\n\nNothing was "
-                "terminated. Try again, or choose 'Keep ON' to let the boat come home.")
+                "terminated. Try again, or choose 'Keep ON' to let the boat come back along its path.")
         self.commands.guardian_off_and_disarm(done)
 
     # ===================================================== unconfirmed 'default'

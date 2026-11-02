@@ -283,19 +283,26 @@ class BottomToolbar(QWidget):
             from pathlib import Path
 
             from mcs.core.replay import bag_gps_track
-            from mcs.core.worlds import eligible_worlds_for_track
-            track = bag_gps_track(params.replay_bag,
-                                  self._cfg.replay.world_track_points)
-            worlds = eligible_worlds_for_track(
-                Path(self._cfg.launch.worlds_root), track)
+            from mcs.core.worlds import eligible_worlds_for_track, list_worlds
+            root = Path(self._cfg.launch.worlds_root)
+            if params.replay_placement == "origin":
+                # The run goes on the world's origin: any world will do.
+                worlds = list_worlds(root)
+                intro = (f"Replay the run on the origin of one of {len(worlds)} "
+                         "personalized world(s) (its launch point on the world's "
+                         "(0, 0); the GPS shown stays the recorded one)")
+            else:
+                track = bag_gps_track(params.replay_bag,
+                                      self._cfg.replay.world_track_points)
+                worlds = eligible_worlds_for_track(root, track)
+                intro = (f"This recorded run took place inside {len(worlds)} "
+                         "personalized world(s). Replay it inside one of them (the "
+                         "boat placed at its recorded GPS position in the world's "
+                         "geometry)")
+            intro += ", or in the empty Gazebo world (in the run's own launch frame)."
             if worlds:
                 from mcs.gui.dialogs.world_dialog import WorldChoiceDialog
-                wdlg = WorldChoiceDialog(worlds, self, intro_text=(
-                    f"This recorded run took place inside {len(worlds)} "
-                    "personalized world(s). Replay it inside one of them (the "
-                    "boat placed at its recorded GPS position in the world's "
-                    "geometry), or in the empty Gazebo world (in the run's "
-                    "own launch frame)."))
+                wdlg = WorldChoiceDialog(worlds, self, intro_text=intro)
                 if wdlg.exec() != wdlg.DialogCode.Accepted:
                     return
                 params.world_dir = wdlg.selected_world_dir or ""

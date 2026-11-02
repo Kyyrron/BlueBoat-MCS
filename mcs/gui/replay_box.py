@@ -45,7 +45,7 @@ class FloatingReplayBox(QWidget):
     pause_requested = Signal(bool)      # True = pause, False = resume
     rate_requested = Signal(float)
 
-    _ROWS = ("Run", "Time", "Status")
+    _ROWS = ("Run", "Time", "Motion", "Status")
 
     def __init__(self, cfg: AppConfig, store: DataStore,
                  parent: QWidget | None = None) -> None:
@@ -143,6 +143,7 @@ class FloatingReplayBox(QWidget):
         if r is None:
             self._set("Run", "—")
             self._set("Time", "—")
+            self._set("Motion", "—")
             self._set("Status", "waiting for the replay node…", theme.TEXT_DIM)
             self.progress.setValue(0)
             self.pause_btn.setEnabled(False)
@@ -153,6 +154,9 @@ class FloatingReplayBox(QWidget):
         run = Path(r.bag).name
         self._set("Run", f"{run} ({r.frame} world)" if r.frame else run)
         self._set("Time", f"{format_clock(r.t)} / {format_clock(r.duration)}")
+        # Below 10 Hz the attitude between samples is interpolated, not measured.
+        self._set("Motion", r.motion_text or "—",
+                  theme.WARN if r.attitude_source and r.attitude_rate_hz < 10.0 else None)
         if age > self._cfg.replay.state_fresh_s:
             self._set("Status", f"stale ({age:.0f} s)", theme.WARN)
         elif r.finished:

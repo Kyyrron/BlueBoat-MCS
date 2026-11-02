@@ -1,6 +1,6 @@
 """Link guardian — the station's model of it (v1.1, 2026-10-14, by the user's order).
 
-The guardian brings the boat home on its own when this laptop goes silent: an
+The guardian brings the boat back on its own when this laptop goes silent: an
 ArduPilot Lua script on the autopilot (superproject ``link_guardian/``), switched
 ON for every real-robot session by its laptop companion ``guardian.py watch``,
 which the station starts with the launch (``launch_manager.guardian_command``).
@@ -8,6 +8,11 @@ The companion reports on ``/link_guardian/status`` (String JSON, 1 Hz) and obeys
 ``/link_guardian/command`` (``{cmd: on|off|check|setup|reclaim, seq}``). The
 station adds no guardian logic of its own: this module only turns the companion's
 report into what the GUARDIAN box shows and which of its buttons may act.
+
+Since 2026-10-28 (owner's order) the script takes over after ``LGRD_TIMEOUT``
+(15 s), retraces the boat's own trail in reverse, and hands control back by
+itself on the first laptop heartbeat, so the run goes on: Take back control is
+only a fallback (an older script, or a hand-back that failed).
 
 Qt-free and rclpy-free, so the smoke test can pin every rule.
 """
@@ -19,6 +24,8 @@ from dataclasses import dataclass, field
 
 #: Modes the guardian (or an ArduPilot failsafe) puts the boat in.
 AUTONOMOUS_MODES = frozenset({"RTL", "SMART_RTL", "GUIDED", "LOITER", "HOLD"})
+#: ``LGRD_TIMEOUT`` when the readiness report does not carry it (older companion).
+DEFAULT_TIMEOUT_S = 15
 #: A companion silent for longer than this is "not reporting".
 STATUS_FRESH_S = 4.0
 
@@ -168,7 +175,7 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
         state, level = "UNAVAILABLE — guardian.py not found (see the config)", "err"
     elif not fcu_connected:
         if r is not None and r.guardian_on:
-            state, level = "LINK LOST — the boat returns HOME on its own", "err"
+            state, level = "LINK LOST — the boat retraces its path on its own", "err"
         else:
             state, level = "Waiting for the boat to connect…", "info"
     elif not reporting:
@@ -184,9 +191,12 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
     elif r.guardian_on is None:
         state, level = "Switching the guardian ON…", "info"
     elif armed and autonomous:
-        state, level = f"TAKEN OVER — boat in {mode}; Take back control", "err"
+        state = f"TAKEN OVER — boat in {mode}; handing back… (else Take back control)"
+        level = "err"
     elif armed:
-        state, level = "ON — returns HOME after 5 s without this laptop", "ok"
+        timeout = (r.check or {}).get("timeout") or DEFAULT_TIMEOUT_S
+        state, level = (f"ON — retraces its path after {timeout:g} s without this laptop",
+                        "ok")
     else:
         state, level = "ON — autopilot disarmed: arms itself on link loss", "warn"
 
@@ -209,9 +219,10 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
                  (not armed, "the autopilot is already armed"),
                  (not estop_latched, "E-STOP latched — release it first"),
                  (not run_active, "a run is active — stop it first"))
+    # No run gate since 2026-10-28: the hand-back resumes the run on purpose,
+    # exactly as the script's own does.
     reclaim = gate(*base, (autonomous, ("nothing to take back: the boat is not "
-                                        "under guardian / failsafe control")),
-                   (not run_active, "a run is still active — press STOP RUN first"))
+                                        "under guardian / failsafe control")))
 
     return GuardianView(state=state, level=level, link=link, autopilot=autopilot,
                         flag=flag, setup=setup, home=home, messages=messages,
@@ -226,7 +237,7 @@ def needs_turn_off_choice(r: GuardianReadout | None, *, real_session: bool,
     Always in a real-robot session (user's order, 2026-10-23). The guardian's
     report used to be allowed to skip the question (flag OFF, script absent),
     but a stale or misread report then let the boat see the laptop go silent
-    and take over (HOLD / RTL, re-asserted every 2 s) without the operator
+    and take over (HOLD / retrace, re-asserted every 2 s) without the operator
     ever choosing it. *r* and *now* are kept for the callers' signature.
     """
     return bool(real_session)

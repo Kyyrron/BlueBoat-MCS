@@ -85,8 +85,12 @@ class LaunchParameters:
       ``robot_file``/``trajectory``/``spawn_yaw``.
     * ``Replay_launch.py`` (v1.1, "From a ros2bag", selected when
       ``replay_bag`` is set): ``bag``, ``rate``, ``world_dir`` (optional, a
-      personalized world). The boat moves kinematically along a recorded
-      real-robot run; no controller, no sea state, no note, no companion.
+      personalized world), and, only when set, ``placement:=origin`` (the
+      run on the world's origin instead of its GPS position, 2026-10-27).
+      The boat moves kinematically along a recorded real-robot run; no
+      controller, no sea state, no note, no companion -- and no sonar: the
+      replay publishes the boat pose a simulated sonar renders from, and the
+      operator starts that sonar separately.
 
     ``note`` is the operator's free-text log tag and reaches all three: it is
     what ``{date}-{note}-poslog.csv`` is named after, in real-robot runs and in
@@ -142,6 +146,9 @@ class LaunchParameters:
     # its initial playback rate. Implies ``simulation``.
     replay_bag: str = ""
     replay_rate: float = 1.0
+    # The run placed on the replay world's origin rather than at its GPS
+    # position (2026-10-27).
+    replay_placement: str = "gps"
     extra_args: dict[str, str] = field(default_factory=dict)
     # BlueBoat-Perception companion mode (launch dialog's Session row); not a
     # launch argument (see the class docstring).
@@ -170,6 +177,8 @@ class LaunchParameters:
             args = [f"bag:={self.replay_bag}", f"rate:={self.replay_rate:g}"]
             if self.world_dir:
                 args.append(f"world_dir:={self.world_dir}")
+            if self.replay_placement == "origin":
+                args.append("placement:=origin")
         elif self.simulation and self.world_dir:
             args = [
                 f"world_dir:={self.world_dir}",

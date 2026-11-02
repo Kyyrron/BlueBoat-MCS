@@ -239,8 +239,13 @@ replayed boat (Control's force-free `replay:=true` description) cannot be moved 
 replay publishes the **recorded** GPS fixes, compass and odom (full attitude), so
 `mission.replay` makes `map_frame_ready()` wait for a real GPS anchor exactly as on real
 water, and SimGps stays disarmed (one GPS publisher). The floating **REPLAY** box (top-left,
-the SEA STATE box's corner — never shown together) shows the run, time / duration and status,
-with Pause/Resume and the rate. Manual Target and the Default/Override toggle are greyed:
+the SEA STATE box's corner — never shown together) shows the run, time / duration, **Motion**
+(2026-10-27: the replay's attitude source and rate, and its heave, amber under 10 Hz; "—" from
+an older control stack) and status, with Pause/Resume and the rate. **Placement** (dialog
+row, 2026-10-27): *Place the run on the world's origin* (`replay_placement` →
+`placement:=origin`, emitted only when ticked; then every world is offered). The station
+**never starts a sonar for a replay** (owner, 2026-10-27). The operator starts the simulator's
+sonar by hand and pings it from the GCS; the replay feeds it the boat pose. Manual Target and the Default/Override toggle are greyed:
 nothing commands the replayed boat. Stop Mission runs the simulation shutdown sequence.
 
 **BlueBoat-Perception companion (2026-10-16, by the user's order).** The station starts
@@ -253,19 +258,24 @@ nothing from it. `PerceptionConfig` (`enabled`, `package`, `launch_file`).
 
 **Link guardian (v1.1, 2026-10-14, by the user's order).** An ArduPilot Lua script on the
 autopilot (superproject `link_guardian/`, the one owner-ordered exception to "nothing of ours on
-the boat") brings the boat HOME by itself when this laptop goes silent. It is **ON by default
+the boat") brings the boat back by itself when this laptop goes silent: since 2026-10-28
+(owner's order) after `LGRD_TIMEOUT` = 15 s it retraces its own recorded trail in reverse, and on
+the laptop's first heartbeat it hands control back (HOLD → the station's servo mapping → MANUAL),
+so the run goes on with no operator action. It is **ON by default
 in every real-robot session**: `robot_interface` arms the autopilot at connection *before*
 override (ArduPilot refuses to arm on passthrough), and the station starts `guardian.py watch`,
 which sets the autopilot's session flag `LGRD_ON = 1`, moves HOME to each run's start and back,
 and serves the **GUARDIAN box** (top of the left column; `gui/guardian_box.py` over the
 Qt-free `core/guardian.py::summarize`). Buttons: Check, Apply settings, Turn OFF/ON, Arm again
-(`rearm`), Take back control (`reclaim`); each enabled only when it can act. The E-STOP does
+(`rearm`), Take back control (`reclaim` — a fallback since 2026-10-28, no longer gated on the
+run: like the script's own hand-back, it lets an active run go on); each enabled only when it
+can act. The E-STOP does
 not turn the guardian off (the script arms the boat itself if it has to take over).
 **Turn Off Connection and app exit ask while the guardian may be ON**
 (`needs_turn_off_choice`: a silent companion counts as ON): *Guardian OFF + disarm* runs
 `CommandCenter.guardian_off_and_disarm` (`off` → its ack → `disarm` → `/mavros/state`
 disarmed) before the unchanged N1 sequence, and terminates nothing if the OFF is not
-confirmed; *Keep ON* runs N1 directly (the boat then returns HOME); *Cancel*. Since v1.1 the
+confirmed; *Keep ON* runs N1 directly (the boat then retraces its path); *Cancel*. Since v1.1 the
 LAYERS section sits in the right column above MAP TOOLS, and the robot heading arrow is gone
 (the glyph rotates; N6 unchanged).
 

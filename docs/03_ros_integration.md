@@ -331,7 +331,7 @@ ON (`mcs.core.guardian.needs_turn_off_choice` — a silent companion counts as O
 Off Connection and Application Exit first ask: *Guardian OFF + disarm* (`off` on
 `/link_guardian/command`, wait for its acknowledgement, then `disarm`, then the
 sequence below — and if the OFF cannot be confirmed, nothing terminates), *Keep ON*
-(the sequence below; the boat then returns HOME on its own), or *Cancel*.
+(the sequence below; the boat then retraces its path on its own), or *Cancel*.
 
 **Stop Mission** (**Turn Off Connection** in a run session) and **Application Exit** —
 the only two paths that terminate anything — run the same sequence

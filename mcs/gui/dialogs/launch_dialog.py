@@ -200,6 +200,18 @@ class LaunchDialog(QDialog):
         self._rate_label = QLabel("Playback rate")
         form.addRow(self._rate_label, self._rate)
 
+        # The run placed on a world it never saw (2026-10-27), e.g. to drive a
+        # simulated sonar, started separately, with the recorded motion.
+        self._replay_origin = QCheckBox("Place the run on the world's origin (any world)")
+        self._replay_origin.setToolTip(
+            "Replay_launch.py placement:=origin — the run's launch point on the "
+            "world's origin, so any personalized world can be chosen, not only "
+            "those its GPS track touches. The replay always publishes the boat "
+            "pose a simulated sonar (started separately) renders from.")
+        self._study = self._replay_origin
+        self._study_label = QLabel("Placement")
+        form.addRow(self._study_label, self._replay_origin)
+
         # ---- Common fields -----------------------------------------------------
         self._controller = QComboBox()
         form.addRow("Controller type", self._controller)
@@ -298,6 +310,7 @@ class LaunchDialog(QDialog):
                 idx = self._rate.findData(float(last.replay_rate))
                 if idx >= 0:
                     self._rate.setCurrentIndex(idx)
+                self._replay_origin.setChecked(last.replay_placement == "origin")
             idx = self._session.findData(last.perception_mode)
             if idx >= 0:
                 self._session.setCurrentIndex(idx)
@@ -376,7 +389,8 @@ class LaunchDialog(QDialog):
         for w in (self._source, self._source_label):
             w.setVisible(sim)
         for w in (self._bag_row, self._bag_label, self._bag_info,
-                  self._bag_info_label, self._rate, self._rate_label):
+                  self._bag_info_label, self._rate, self._rate_label,
+                  self._study, self._study_label):
             w.setVisible(replay)
         for w in (self._controller, self._trajectory, self._note):
             self._set_row_visible(w, not replay)
@@ -486,6 +500,7 @@ class LaunchDialog(QDialog):
                 trajectory="",
                 replay_bag=str(bag) if bag else self._bag.text().strip(),
                 replay_rate=float(self._rate.currentData() or 1.0),
+                replay_placement="origin" if self._replay_origin.isChecked() else "gps",
                 extra_args=extra,
             )
         custom = self._trajectory.currentData()

@@ -1,7 +1,8 @@
 """GUARDIAN box — top of the left column (v1.1, 2026-10-14, by the user's order).
 
-The link guardian brings the boat home on its own when this laptop goes silent
-(WiFi lost, laptop switched off): an ArduPilot Lua script on the autopilot,
+The link guardian brings the boat back along its own path when this laptop goes
+silent (WiFi lost, laptop switched off), and gives it back to the station as soon
+as the link returns, so the run goes on: an ArduPilot Lua script on the autopilot,
 switched ON for every real-robot session by its companion ``guardian.py watch``,
 which the station starts with the launch. Everything about it is operated from
 here once the on-boat part is installed (superproject ``link_guardian/README.md``).
@@ -21,8 +22,9 @@ Buttons — each enabled only when it can act, its tooltip saying why not:
 * **Turn OFF / Turn ON** — the session flag (ON by default);
 * **Arm again** — ``rearm``: robot_interface re-arms the autopilot (needed after
   an E-STOP or a failed arm at connection; the script arms by itself anyway);
-* **Take back control** — after a guardian return: HOLD, thrusters back to the
-  station, MANUAL.
+* **Take back control** — fallback, if the boat stays under guardian control
+  once the link is back: HOLD, thrusters back to the station, MANUAL (an active
+  run then goes on).
 
 Greyed outside a real-robot session (Gazebo runs and bag replays have no
 guardian).
@@ -123,8 +125,8 @@ class GuardianBox(CollapsibleSection):
         answer = QMessageBox.question(
             self, "Apply ArduPilot settings",
             "Write the recommended failsafe parameters on the autopilot "
-            "(SCR_ENABLE=1, FS_GCS_ENABLE=1, FS_ACTION=1 RTL, FS_GCS_TIMEOUT=10, "
-            "FS_THR_ENABLE=0)?\n\nIf scripting was off, restart the autopilot "
+            "(SCR_ENABLE=1, FS_GCS_ENABLE=1, FS_ACTION=1 RTL, FS_GCS_TIMEOUT=20, "
+            "FS_THR_ENABLE=0, LGRD_TIMEOUT=15)?\n\nIf scripting was off, restart the autopilot "
             "afterwards (BlueOS > Autopilot Firmware > Restart).",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -134,8 +136,10 @@ class GuardianBox(CollapsibleSection):
     def _on_reclaim(self) -> None:
         answer = QMessageBox.question(
             self, "Take back control",
+            "The guardian normally does this by itself when the link is back.\n\n"
             "The boat stops (HOLD), the thrusters return to the station's "
-            "mapping, then MANUAL: the station drives again (it stays armed).\n\n"
+            "mapping, then MANUAL: the station drives again (it stays armed) and "
+            "an active run goes on.\n\n"
             "Take back control now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes)
@@ -184,22 +188,22 @@ class GuardianBox(CollapsibleSection):
         self._apply(self.setup_button, view.setup_action,
                     "Write the recommended ArduPilot failsafe parameters.")
         self._apply(self.toggle_button, view.toggle,
-                    "Switch the guardian ON: the boat returns HOME on its own if "
-                    "this laptop goes silent." if view.toggle_on else
+                    "Switch the guardian ON: the boat retraces its path on its own "
+                    "if this laptop goes silent." if view.toggle_on else
                     "Switch the guardian OFF for this session (it is ON by default).")
         self._apply(self.rearm_button, view.rearm,
                     "Arm the autopilot again (the boat briefly leaves override). "
                     "Needed after an E-STOP; the guardian also arms by itself.")
         self._apply(self.reclaim_button, view.reclaim,
-                    "After a guardian return: HOLD, thrusters back to the station, "
-                    "MANUAL.")
+                    "Fallback if the guardian has not handed control back by itself: "
+                    "HOLD, thrusters back to the station, MANUAL (an active run goes on).")
 
 
 def ask_turn_off_choice(parent: QWidget, exiting: bool) -> str:
     """Turn Off Connection / exit while the guardian may be ON.
 
     Returns ``'off'`` (turn the guardian off and disarm, then turn off),
-    ``'keep'`` (turn off anyway: the boat returns HOME by itself) or
+    ``'keep'`` (turn off anyway: the boat retraces its path by itself) or
     ``'cancel'``.
     """
     what = "quit the station" if exiting else "turn off the connection"
@@ -207,13 +211,13 @@ def ask_turn_off_choice(parent: QWidget, exiting: bool) -> str:
     box.setIcon(QMessageBox.Icon.Warning)
     box.setWindowTitle("Link guardian is ON")
     box.setText(f"The link guardian is ON. If you {what} now, the boat will see "
-                "this laptop go silent and RETURN HOME by itself.")
+                "this laptop go silent and RETRACE ITS PATH back by itself.")
     box.setInformativeText(
         "Turn the guardian OFF and disarm first (the boat then stays where it is), "
-        "or keep it ON and let the boat come home?")
+        "or keep it ON and let the boat come back along its path?")
     off = box.addButton("Guardian OFF + disarm, then " + ("quit" if exiting else "turn off"),
                         QMessageBox.ButtonRole.AcceptRole)
-    keep = box.addButton("Keep ON — the boat returns home",
+    keep = box.addButton("Keep ON — the boat comes back",
                          QMessageBox.ButtonRole.DestructiveRole)
     cancel = box.addButton(QMessageBox.StandardButton.Cancel)
     box.setDefaultButton(off)

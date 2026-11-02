@@ -147,6 +147,11 @@ class ReplayReadout:
     world: str
     gazebo: bool            # set_pose service reachable
     received_mono: float
+    # Additive keys (2026-10-27); absent from an older control stack.
+    attitude_source: str = ""   # mavlink | imu | odom | blueboat_odom
+    attitude_rate_hz: float = 0.0
+    heave: str = ""             # replayed | pinned_noisy | off
+    boat_pose: bool = False     # the pose stream a simulated sonar renders from is on
 
     @property
     def progress(self) -> float:
@@ -159,6 +164,19 @@ class ReplayReadout:
         if not self.gazebo:
             return "waiting for Gazebo…"
         return "paused" if self.paused else f"playing at {self.rate:g}×"
+
+    @property
+    def motion_text(self) -> str:
+        """Where the replayed attitude comes from, and the heave; "" from a
+        control stack that does not report it."""
+        if not self.attitude_source:
+            return ""
+        heave = {"replayed": "heave replayed", "pinned_noisy": "heave pinned (noisy)",
+                 "off": "heave off"}.get(self.heave, self.heave)
+        parts = [f"{self.attitude_source} {self.attitude_rate_hz:.1f} Hz", heave]
+        if self.boat_pose:
+            parts.append("sonar pose out")
+        return " · ".join(p for p in parts if p)
 
 
 def parse_state(payload: dict, received_mono: float = 0.0) -> ReplayReadout | None:
@@ -173,7 +191,11 @@ def parse_state(payload: dict, received_mono: float = 0.0) -> ReplayReadout | No
             frame=str(payload.get("frame", "")),
             world=str(payload.get("world", "")),
             gazebo=bool(payload.get("gazebo", False)),
-            received_mono=received_mono)
+            received_mono=received_mono,
+            attitude_source=str(payload.get("attitude_source", "")),
+            attitude_rate_hz=float(payload.get("attitude_rate_hz", 0.0)),
+            heave=str(payload.get("heave", "")),
+            boat_pose=bool(payload.get("boat_pose", False)))
     except (TypeError, ValueError, AttributeError):
         return None
 

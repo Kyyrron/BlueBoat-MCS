@@ -58,14 +58,15 @@ last guardian / pre-arm messages. Buttons, each enabled only when it can act
 * **Arm again** — re-arm the autopilot (the boat briefly leaves override);
   needed after an E-STOP, which disarms, or when arming failed at connection.
   The guardian also arms the boat itself if it has to take over.
-* **Take back control** — after the guardian (or an ArduPilot failsafe) has
-  taken the boat: HOLD, thrusters back to the station, MANUAL. Press STOP RUN
-  first if a run was active.
+* **Take back control** — fallback only: the guardian hands the boat back by
+  itself as soon as it hears this laptop again, and the run goes on. If the box
+  still says TAKEN OVER once the link is back (older script, or the hand-back
+  failed), this does the same: HOLD, thrusters back to the station, MANUAL.
 
 The E-STOP does **not** switch the guardian off. **Turn Off Connection** and
 closing the station ask, while the guardian is ON, whether to turn it **OFF and
 disarm** first (the boat stays put), to **keep it ON** (the boat sees the laptop
-go silent and returns HOME), or to cancel. Outside a real-robot session (Gazebo,
+go silent and, after 15 s, retraces its path back), or to cancel. Outside a real-robot session (Gazebo,
 bag replay) the box is greyed.
 
 **Robot** — world coordinates, GPS (when fixed), heading, speed, active

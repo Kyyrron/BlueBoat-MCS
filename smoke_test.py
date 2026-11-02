@@ -2443,6 +2443,14 @@ assert _rlp.to_cli()[:3] == ["bag:=/d/run/x-bag", "rate:=2", "world_dir:=/w/pA/w
 assert _rtarget(cfg.launch, _rlp) == (cfg.launch.package, cfg.launch.replay_launch_file)
 assert _rcomp(cfg, _rlp) is None
 assert _rcomp(cfg, _RLP(simulation=True)) is not None      # live sim unchanged
+# Placement (2026-10-27): placement:=origin only when chosen, after world_dir
+# and before the extra args; the default CLI is unchanged. Never a sonar: the
+# operator starts a simulated sonar separately.
+_rlp.replay_placement = "origin"
+assert _rlp.to_cli() == ["bag:=/d/run/x-bag", "rate:=2", "world_dir:=/w/pA/w1",
+                         "placement:=origin", "heave:=false"]
+_rlp.replay_placement = "gps"
+assert len(_rlp.to_cli()) == 4 and not any(a.startswith("sonar") for a in _rlp.to_cli())
 
 with tempfile.TemporaryDirectory() as _rd:
     _run = Path(_rd) / "2026_10_13-10_00_00-t-poslog"
@@ -2473,12 +2481,21 @@ with tempfile.TemporaryDirectory() as _rd:
     _rpar = _rdlg.parameters()
     assert _rpar.simulation and _rpar.replay_bag == str(_bagd)
     assert _rpar.replay_rate == cfg.replay.default_rate and _rpar.controller_type == ""
+    assert _rpar.replay_placement == "gps"
+    assert _rdlg._study.isVisibleTo(_rdlg)
+    _rdlg._replay_origin.setChecked(True)
+    _rpar = _rdlg.parameters()
+    assert _rpar.replay_placement == "origin"
+    _rdlg2 = LaunchDialog(cfg, _rpar)                  # restored from the last launch
+    assert _rdlg2._replay_origin.isChecked()
+    _rdlg2.deleteLater()
     _rdlg._bag.setText(_rd)                    # the bag is two levels down
     assert "no ros2bag" in _rdlg.bag_problem()
     _rdlg._bag.setText(str(Path(_rd) / "nowhere"))
     assert "no ros2bag" in _rdlg.bag_problem()
     _rdlg._source.setCurrentText("Controller")
     assert _rdlg._controller.isVisibleTo(_rdlg) and _rdlg.bag_problem() == ""
+    assert not _rdlg._study.isVisibleTo(_rdlg)
     _rdlg.deleteLater()
 assert _ewft(Path(cfg.launch.worlds_root), []) == []
 
@@ -2509,6 +2526,15 @@ try:
         "gazebo": True})
     w._on_tick()
     assert w.replay_box._values["Time"].text() == "1:01 / 2:02"
+    assert w.replay_box._values["Motion"].text() == "—"     # pre-2026-10-27 stack
+    w.store.on_replay_state(time.monotonic(), {
+        "bag": "/d/run/x-bag", "t": 61.0, "duration": 122.0, "rate": 2.0,
+        "paused": True, "finished": False, "frame": "empty", "world": "ocean",
+        "gazebo": True, "attitude_source": "mavlink", "attitude_rate_hz": 4.2,
+        "heave": "pinned_noisy", "boat_pose": True})
+    w._on_tick()
+    assert w.replay_box._values["Motion"].toolTip() == \
+        "mavlink 4.2 Hz · heave pinned (noisy) · sonar pose out"
     assert w.replay_box.pause_btn.text() == "Resume"
     assert w.replay_box.progress.value() == 500
     assert w.replay_box.rate.currentData() == 2.0
@@ -2616,7 +2642,7 @@ _v = _sum(_rd, real_session=False)
 assert _v.state.startswith("OFF") and not any(
     a.enabled for a in (_v.check, _v.setup_action, _v.toggle, _v.rearm, _v.reclaim))
 _v = _sum(_rd)
-assert _v.state.startswith("ON — returns HOME"), _v.state
+assert _v.state.startswith("ON — retraces its path after 15 s"), _v.state
 assert _v.level == "ok" and _v.setup[0].startswith("READY (1 advice)")
 assert _v.home[0].endswith("(run start)")
 assert _v.check.enabled and _v.toggle.enabled and not _v.toggle_on
@@ -2628,8 +2654,8 @@ assert not _sum(_rd, armed=False, estop_latched=True).rearm.enabled
 assert not _sum(_rd, armed=False, run_active=True).rearm.enabled
 _v = _sum(_rd, mode="RTL")
 assert _v.state.startswith("TAKEN OVER") and _v.reclaim.enabled
-_v = _sum(_rd, mode="RTL", run_active=True)
-assert not _v.reclaim.enabled and "STOP RUN" in _v.reclaim.reason
+_v = _sum(_rd, mode="GUIDED", run_active=True)
+assert _v.reclaim.enabled                            # the hand-back resumes the run
 _v = _sum(_rd, fcu_connected=False)
 assert _v.state.startswith("LINK LOST") and not _v.check.enabled
 assert _sum(None).state.startswith("Starting the guardian companion")
