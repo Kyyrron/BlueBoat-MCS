@@ -19,8 +19,9 @@ Qt-free and rclpy-free, so the smoke test can pin every rule.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
+
+from mcs.core.clock import station_clock
 
 #: Modes the guardian (or an ArduPilot failsafe) puts the boat in.
 AUTONOMOUS_MODES = frozenset({"RTL", "SMART_RTL", "GUIDED", "LOITER", "HOLD"})
@@ -58,7 +59,7 @@ class GuardianReadout:
         ack = payload.get("ack")
         msgs = payload.get("messages")
         return cls(
-            received_t=time.monotonic() if received_mono is None else received_mono,
+            received_t=station_clock().now() if received_mono is None else received_mono,
             connected=bool(payload.get("connected", False)),
             armed=bool(payload.get("armed", False)),
             mode=str(payload.get("mode") or ""),
@@ -73,7 +74,7 @@ class GuardianReadout:
         )
 
     def fresh(self, now: float | None = None, max_age_s: float = STATUS_FRESH_S) -> bool:
-        now = time.monotonic() if now is None else now
+        now = station_clock().now() if now is None else now
         return (now - self.received_t) <= max_age_s
 
     @property

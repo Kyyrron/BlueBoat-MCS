@@ -48,7 +48,7 @@ from mcs.gui import theme
 from mcs.gui.dialogs.launch_dialog import LaunchDialog
 from mcs.gui.widgets import StatusLed
 from mcs.ros.command_center import CommandCenter
-from mcs.ros.launch_manager import LaunchManager
+from mcs.ros.launch_manager import LaunchManager, drop_sonar_choice_without_world
 
 
 class BottomToolbar(QWidget):
@@ -202,6 +202,16 @@ class BottomToolbar(QWidget):
 
         row.addStretch(1)
 
+        # Simulation speed (2026-11-07): the requested and measured
+        # real-time factor of a simulation launch, from the station clock.
+        self._sim_badge = QLabel("")
+        self._sim_badge.setVisible(False)
+        self._sim_badge.setToolTip(
+            "Simulation speed: the Gazebo real-time factor requested at launch "
+            "and the one measured on /clock. Every station clock (rates, ages, "
+            "elapsed time, plots) runs on sim time in a simulation launch.")
+        row.addWidget(self._sim_badge)
+
         self._estop_label = QLabel("")
         self._estop_label.setSizePolicy(
             QSizePolicy.Policy.Ignored,
@@ -275,6 +285,12 @@ class BottomToolbar(QWidget):
                 return
             if params.simulation and not self._choose_sea(params):
                 return
+            if drop_sonar_choice_without_world(params):
+                QMessageBox.information(
+                    self, "No sonar in the empty world",
+                    "The ray-cast sonar needs a personalized world: the empty "
+                    "Gazebo world has no sonar. This run starts at real speed "
+                    "(x1, no slow-down).")
         if self._launcher.start(params):
             self.mission_launched.emit(params)
 
@@ -347,6 +363,16 @@ class BottomToolbar(QWidget):
             return False
         params.sea = sdlg.choice()
         return True
+
+    def set_sim_badge(self, text: str, level: str) -> None:
+        """The simulation-speed badge; empty text hides it. ``level``:
+        'ok' | 'warn'."""
+        self._sim_badge.setVisible(bool(text))
+        if not text:
+            return
+        color = theme.WARN if level == "warn" else theme.TEXT_DIM
+        self._sim_badge.setText(text)
+        self._sim_badge.setStyleSheet(f"color: {color}; font-weight: bold;")
 
     def set_stop_guard(self, guard) -> None:
         """``guard(proceed)`` runs before every Stop Mission / Turn Off

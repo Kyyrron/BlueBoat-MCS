@@ -22,8 +22,6 @@ as the text needs.
 
 from __future__ import annotations
 
-import time
-
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -34,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mcs.core.clock import station_clock
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection
 from mcs.models.store import DataStore
@@ -166,7 +165,7 @@ class FloatingSeaBox(QWidget):
                       theme.TEXT_DIM)
             self._fit()
             return
-        age = time.monotonic() - r.received_mono if r.received_mono else 0.0
+        age = station_clock().now() - r.received_mono if r.received_mono else 0.0
         self._set("Current", r.current_text)
         self._set("Waves", r.waves_text,
                   theme.WARN if r.waves_status == "unavailable" else None)

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import sim_badge, station_clock
 from mcs.core.signals import SignalBus
 from mcs.gui import theme
 from mcs.gui.arrow_box import FloatingArrowBox
@@ -72,6 +73,7 @@ class MainWindow(QMainWindow):
 
         # ---- Core objects ----------------------------------------------------
         self.cfg = cfg
+        station_clock().stall_s = cfg.sim_speed.clock_stall_s
         self.bus = SignalBus()
         self.store = DataStore(cfg)
         self.ros = RosManager(cfg, self.bus)
@@ -258,6 +260,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_floating_boxes()
         self._refresh_guardian()
+        self._refresh_sim_badge()
 
         # Run session: RUN box + session labels of the toolbar.
         ss = self.store.session
@@ -335,6 +338,10 @@ class MainWindow(QMainWindow):
         m.replay = bool(params.replay_bag)
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
+        # The station clock follows /clock in a simulation launch (a bag
+        # replay keeps the wall clock); re-anchored before the store resets.
+        station_clock().set_follow(params.simulation and not params.replay_bag)
+        self._sim_rtf = params.real_time_factor
         self.store.reset_experiment()
         if params.session:
             # Real robot = run session: connect, idle, runs by hand.
@@ -576,8 +583,14 @@ class MainWindow(QMainWindow):
         if self.store.mission.launch_running:
             self._pending_preview_trajectory = trajectory
 
+    def _refresh_sim_badge(self) -> None:
+        text, level = sim_badge(station_clock(), getattr(self, "_sim_rtf", 1.0),
+                                self.cfg.sim_speed.rtf_warn_rel)
+        self.toolbar.set_sim_badge(text, level)
+
     def _on_launch_state(self, state: str) -> None:
         if state == "idle":
+            station_clock().set_follow(False)
             self.store.mission.launch_running = False
             self.store.mission.manual_target = None
             self.store.mission.simulation = False

@@ -39,6 +39,11 @@ _LOG = logging.getLogger(__name__)
 PERCEPTION_NORMAL = "normal"
 PERCEPTION_DATASET = "dataset"
 
+#: Simulated sonar models (the launch dialog's Sonar model row; the
+#: simulator's ``sonar_renderer:=`` values).
+RENDERER_GEOMETRIC = "geometric"
+RENDERER_RAYCAST = "raycast"
+
 #: Marker every simulated run's log note carries, so a Gazebo poslog can never
 #: be mistaken for a field record. Matches ``Sim_launch.py``'s own ``note``
 #: default, which is what an empty operator note still resolves to.
@@ -82,7 +87,9 @@ class LaunchParameters:
       ``trajectory_file``, ``controller_type``, ``note`` — same control graph
       as ``Sim_launch.py`` plus the simulated sonar and a mavros shim that
       publishes the GPS fixes from the world's own anchor. It declares NO
-      ``robot_file``/``trajectory``/``spawn_yaw``.
+      ``robot_file``/``trajectory``/``spawn_yaw``. For the ray-cast sonar
+      (``sonar_renderer``) it also gets ``sonar_renderer:=raycast`` and
+      ``real_time_factor:=<f>`` (:meth:`LaunchParameters.sim_speed_args`).
     * ``Replay_launch.py`` ("From a ros2bag", selected when ``replay_bag``
       is set): ``bag``, ``rate``, ``world_dir`` (optional, a personalized
       world), and, only when set, ``placement:=origin`` (the run on the
@@ -103,6 +110,21 @@ class LaunchParameters:
     ``spawn_yaw:=`` is emitted only when ``spawn_yaw_rad`` is set, before
     ``extra_args`` — so an operator ``spawn_yaw:=`` in Extra args overrides
     it (in ``ros2 launch`` the last occurrence wins).
+
+    ``sonar_renderer`` / ``real_time_factor`` (owner, 2026-11-07): the
+    simulated sonar model, and for the ray-cast the slow-down -- the whole
+    simulation on one clock at ``real_time_factor`` x real time, so the
+    ray-cast holds its 20 Hz ping period in sim time and every record is
+    the same as at real speed. Only the personalized-world launch has a
+    sonar, so only its branch emits them, and only for the ray-cast: a
+    geometric run's command line is exactly as before.
+
+    ``sonar_profile`` (owner, 2026-11-09): a ray-cast *variant* chosen in
+    the Sonar model menu (:mod:`mcs.core.sonar_variants`) -- its absolute
+    profile path, emitted as ``sonar_config:=`` after the two arguments
+    above; "" (plain Ray-cast, geometric) emits nothing, so those command
+    lines are unchanged. An operator ``sonar_config:=`` in Extra args still
+    wins (it comes last).
 
     ``perception_mode`` is no launch argument of any of the
     four files -- ``to_cli`` ignores it. It is the BlueBoat-Perception
@@ -153,6 +175,29 @@ class LaunchParameters:
     # BlueBoat-Perception companion mode (launch dialog's Session row); not a
     # launch argument (see the class docstring).
     perception_mode: str = PERCEPTION_NORMAL
+    # Simulated sonar model and, for the ray-cast, the slow-down factor
+    # (Gazebo real-time factor); see the class docstring.
+    sonar_renderer: str = RENDERER_GEOMETRIC
+    real_time_factor: float = 1.0
+    # A ray-cast variant profile (absolute path), or "" (see the docstring).
+    sonar_profile: str = ""
+
+    def slowed(self) -> bool:
+        """A personalized-world run with the ray-cast sonar, slowed down."""
+        return (self.simulation and bool(self.world_dir) and not self.replay_bag
+                and self.sonar_renderer == RENDERER_RAYCAST
+                and self.real_time_factor < 1.0)
+
+    def sim_speed_args(self) -> list[str]:
+        """``sonar_renderer:=`` / ``real_time_factor:=`` of the world launch;
+        [] for the geometric sonar (the default command line)."""
+        if self.sonar_renderer != RENDERER_RAYCAST:
+            return []
+        args = [f"sonar_renderer:={RENDERER_RAYCAST}",
+                f"real_time_factor:={self.real_time_factor:.3f}"]
+        if self.sonar_profile:
+            args.append(f"sonar_config:={self.sonar_profile}")
+        return args
 
     def wire_note(self) -> str:
         """The ``note:=`` value, or "" when no argument should be emitted.
@@ -187,6 +232,7 @@ class LaunchParameters:
                 f"controller_type:={self.controller_type}",
                 f"note:={self.wire_note()}",
                 *self.sea_args(),          # before extra_args: an override wins
+                *self.sim_speed_args(),    # likewise
             ]
         elif self.simulation:
             args = [
@@ -211,6 +257,19 @@ class LaunchParameters:
                 args += ["session_mode:=True"]
         args += [f"{k}:={v}" for k, v in self.extra_args.items()]
         return args
+
+
+def drop_sonar_choice_without_world(params: LaunchParameters) -> bool:
+    """A ray-cast choice for a Gazebo launch that got no personalized world
+    (the empty world has no sonar) falls back to geometric at x1, in place.
+    True when it did, so the GUI can say so. Module scope, Qt-free."""
+    if (params.simulation and not params.replay_bag and not params.world_dir
+            and params.sonar_renderer == RENDERER_RAYCAST):
+        params.sonar_renderer = RENDERER_GEOMETRIC
+        params.real_time_factor = 1.0
+        params.sonar_profile = ""
+        return True
+    return False
 
 
 def companion_command(cfg, params: LaunchParameters) -> list[str] | None:
@@ -290,7 +349,9 @@ def perception_command(cfg, params: LaunchParameters,
     if mode == PERCEPTION_DATASET:
         cmd.append(f"dataset_name:={perception_dataset_name(params, now)}")
     if params.simulation:
-        cmd.append(f"world_dir:={params.world_dir}")
+        # use_sim_time: the label wait and the ground-truth bag on /clock,
+        # so a run slowed below real time records as a real-speed one.
+        cmd += [f"world_dir:={params.world_dir}", "use_sim_time:=true"]
     return cmd
 
 

@@ -7,8 +7,10 @@ timeline currently displays.
 
 Design notes
 ------------
-* All times are ``time.monotonic()`` seconds stamped at message reception,
-  giving one consistent clock across every source topic.
+* All times are station-clock seconds stamped at message reception
+  (:func:`mcs.core.clock.station_clock`: ``time.monotonic()``, sim-paced
+  under ``/clock`` in a simulation launch), giving one consistent clock
+  across every source topic.
 * Derived quantities that already exist on a ROS topic are *not* recomputed
   here (e.g. the current path target comes from ``/monitoring_data``).  The
   only computations performed are pure display transforms: pinger body ->
@@ -24,19 +26,21 @@ Design notes
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import station_clock
 from mcs.core.geo import GeoReferencer
 from mcs.core.series import TimeSeries
 
 
 def now_mono() -> float:
-    return time.monotonic()
+    """Now on the station clock (``time.monotonic()`` outside a simulation
+    launch; sim-paced under ``/clock`` in one -- core/clock.py)."""
+    return station_clock().now()
 
 
 class TargetMode(Enum):

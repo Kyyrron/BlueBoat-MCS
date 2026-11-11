@@ -23,6 +23,7 @@ defaults below match the stack as provided.
 | `/blueboat/run_log` | `std_msgs/String` (JSON) | `robot_interface.py` | **Real-robot run session only.** `{run, logging, csv, layout, bag_enabled, bag_recording, bag}`, 1 Hz: confirms the run's position CSV is being written (RUN box "Log" row; flagged if a started run is not confirmed within 3 s) and, since v1.1, its ros2bag (RUN box "Bag" row, flagged the same way; the `bag_*` fields are absent from an older control stack) |
 | `/link_guardian/status` | `std_msgs/String` (JSON) | `guardian.py watch` (superproject `link_guardian/`, started by the station) | **Real-robot session only (v1.1).** 1 Hz: `{connected, armed, mode, want_on, guardian_on, check{ready, script, items[{name, level, text}]}, home{lat, lon, source}, run_running, messages[], busy, ack{seq, cmd, ok, detail}}` → the GUARDIAN box (`mcs.core.guardian`) |
 | `/replay/state` | `std_msgs/String` (JSON) | `bag_replay` (BlueBoat-Control) | **Bag replay only (v1.1).** `{bag, t, duration, rate, paused, finished, frame, world, world_offset, pose_source, gazebo}` at 2 Hz → the floating REPLAY box. Subscribed **TRANSIENT_LOCAL depth 1**, like the sea state |
+| `/clock` | `rosgraph_msgs/Clock` | Gazebo (ros_gz bridge) | **Simulation only (2026-11-07).** BEST_EFFORT. Paces the station clock in a simulation launch (`core/clock.StationClock`): every rate, age, elapsed time and plot is in sim seconds, so a run slowed below real time for the ray-cast sonar reads like a real-speed one; the toolbar SIM badge shows the measured factor. Not in the diagnostics table. Ignored in real-robot and replay launches |
 | `/sim/sea_state` | `std_msgs/String` (JSON) | BlueBoat-SSS-Sim `sea_state_node` | **Simulation only.** The live sea situation (current mean / instantaneous speed and direction at the boat / variation level, waves strength / Hs / Tp / from-bearing / status / passing wake, the boat's roll / pitch / heave std over 30 s, next planned change or blend progress, summary) shown in the floating SEA STATE box (top-left of the map view). Subscribed **TRANSIENT_LOCAL depth 1** to match the node's latched publisher, so a station started after the simulator still gets the current situation at once |
 
 ## Published commands
@@ -230,8 +231,13 @@ selected path. Choosing one runs, instead of `Sim_launch.py`:
 ros2 launch blueboat_sss_sim full_mission_launch.py \
     world_dir:=<abs world folder> with_control:=true \
     trajectory_file:=<trajectories>/.deployed/<name>.yaml \
-    controller_type:=<PID|LoS|MPC> note:=<str>
+    controller_type:=<PID|LoS|MPC> note:=<str> \
+    [sea_*:=…] [sonar_renderer:=raycast real_time_factor:=<f>] [<Extra args>]
 ```
+
+The bracketed arguments appear only when chosen: a sea state, and the dialog's **Sonar model:
+Ray-cast** with its **Slow-down** factor. The Extra args come last, for example
+`sonar_config:=<ray-cast profile>`.
 
 With `with_control:=true` that launch starts the same control graph as
 `Sim_launch.py` (`simulation_interface`, `path_generation` watching the

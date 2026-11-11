@@ -42,15 +42,23 @@ the single source of truth for the GUI: widgets read it, never subscribe to ROS.
 guarded.
 
 **Data flow (odometry, the canonical example).** `BridgeNode._on_odom` (ROS thread) converts
-to plain lists, stamps `time.monotonic()`, marks its `TopicStats` and emits
+to plain lists, stamps the station clock, marks its `TopicStats` and emits
 `SignalBus.odom_received` → `DataStore.on_odom` (GUI thread) updates `RobotState`, histories,
 travelled distance → at the next tick `MainWindow._on_tick` calls each panel's / the map's
 `refresh()`, which *pull* from the store. User intents flow back: widget → signal →
 `MainWindow` slot → `CommandCenter` → `BridgeNode.publish_*` (thread-safe) → ROS.
 
-**Clocks.** Every history timestamp is `time.monotonic()` at **reception**. Experiment time is
-`t − store.t0` (first odometry sample). The controller's own `t` in `/monitoring_data` is
-never used as a clock.
+**Clocks.** Every history timestamp is the **station clock** at **reception**
+(`core/clock.station_clock()`, read through `store.now_mono()`): `time.monotonic()` in a
+real-robot or replay launch and before any launch; in a **simulation launch** it follows
+`/clock` (the bridge feeds it; `MainWindow._on_mission_launched` → `set_follow`), advancing in
+sim seconds, continuous, interpolated, never backwards, wall-paced after
+`sim_speed.clock_stall_s` (3 s) of `/clock` silence. So a run slowed below real time (the
+ray-cast sonar) shows rates, ages, elapsed time, plots and statistics in sim time. Every
+comparison against a reception stamp uses it; self-contained operator deadlines (N1
+shutdown, guardian waits, the path-preview timeout, the arrow `QTimer`) stay monotonic.
+Experiment time is `t − store.t0` (first odometry sample). The controller's own `t` in
+`/monitoring_data` is never used as a clock.
 
 **Repaint bounds.** `TimeSeries.decimated_window` caps every repaint at
 `map.trajectory_max_points_drawn` (20 000) vertices per polyline and 2000 per plot; the tile
@@ -139,7 +147,7 @@ arguments that file declares (another target's arguments would abort `ros2 launc
 |---|---|---|---|
 | **Real robot = run session** | `BlueBoat_launch.py session_mode:=True trajectory:=from_yaml:<session file>` | guardian, perception (normal) | Below. |
 | **Empty Gazebo** | `Sim_launch.py` (`robot_file`, `trajectory`, `controller_type`, `note`, optional `spawn_yaw`) | sea state (`sea_state_launch.py world_name:=ocean`, **every** launch, null choice included — the simulator's catamaran hull floats the boat) | No MAVROS / `robot_interface` / `param_set` / pinger; N1's acknowledgement wait skipped. |
-| **Personalized world** | `blueboat_sss_sim full_mission_launch.py` (`world_dir`, `with_control:=true`, `trajectory_file`, `controller_type`, `note`, `sea_*`; **no** `spawn_yaw`) | perception (dialog **Session** row: normal / dataset → `dataset_name:=<YYYY_MM_DD-HH_MM_SS>-<note>`) | The simulator's mavros shim publishes GPS from the world's anchor: SimGps stays **disarmed** (N8). |
+| **Personalized world** | `blueboat_sss_sim full_mission_launch.py` (`world_dir`, `with_control:=true`, `trajectory_file`, `controller_type`, `note`, `sea_*`; **no** `spawn_yaw`; with the ray-cast sonar also `sonar_renderer:=raycast real_time_factor:=<f>`) | perception (dialog **Session** row: normal / dataset → `dataset_name:=<YYYY_MM_DD-HH_MM_SS>-<note>`; `use_sim_time:=true`) | The simulator's mavros shim publishes GPS from the world's anchor: SimGps stays **disarmed** (N8). |
 | **Bag replay** ("From a ros2bag") | `Replay_launch.py bag:= rate:= [world_dir:=] [placement:=origin]` | none | Below. |
 
 A simulated run's log note always carries the `sim` marker (`LaunchParameters.wire_note`).
@@ -196,6 +204,28 @@ session** (`needs_turn_off_choice`): *Guardian OFF + disarm* (`guardian_off_and_
 **BlueBoat-Perception.** Started with every real-robot launch and every personalized-world
 launch, best effort; the station subscribes to none of its topics and imports nothing from it
 (`PerceptionConfig`).
+
+**Sonar model and slow-down (owner order, 2026-11-07).** Launch dialog, Gazebo + Controller:
+**Sonar model** Geometric (default) / Ray-cast, and for the ray-cast **Slow-down**
+x0.010-x4.000 (x0.500 until the owner order of 2026-11-10; `SimSpeedConfig`; `LaunchParameters.sonar_renderer` / `real_time_factor`). The
+ray-cast renders far slower than its 50 ms ping period, so the whole simulation runs at that
+real-time factor on one clock (Gazebo `-z`; control `time_source: ros`; processor and
+Perception on `use_sim_time`; GCS and station clocks sim-paced): 20 Hz pings in sim time, and
+every record as at real speed. Only the world branch of `to_cli()` emits the two arguments,
+and only for the ray-cast (a geometric command line is unchanged). No world chosen → the
+empty world has no sonar: geometric at x1, said in a message box
+(`drop_sonar_choice_without_world`). The toolbar's **SIM** badge shows the requested and the
+measured factor (`core/clock.sim_badge`; amber beyond `rtf_warn_rel` or when `/clock`
+stops). Smoke block `sim speed ok`. **Ray-cast variants (owner order, 2026-11-09):** after the
+unchanged Geometric / Ray-cast items, the menu lists every simulator profile with a top-level
+`variant:` block (`core/sonar_variants.py`: YAML only, never an import of SSS-Sim, CM-3; searched
+in `SimSpeedConfig.variant_dirs`, the installed `blueboat_sss_sim` share, then the superproject
+checkout), its `description` as the item tooltip; chosen, `LaunchParameters.sonar_profile` is
+emitted as `sonar_config:=<path>` after `real_time_factor:=` (plain Ray-cast and geometric command
+lines unchanged; Extra args still win). Today: *Ray-cast — live* (first-order multipath,
+bit-identical) and *— fast* (also no diffraction, identical by eye). The simulator also pauses
+Gazebo while a slow ping renders (its `sonar_hold_sim`, on by default), so the hint now says x0.500
+is the fastest setting; the SIM badge's measured factor drops during those pauses.
 
 ### Frame conventions (the recurring source of bugs)
 - Manual target **world** on the wire; pinger **body**. `master_control` converts the manual

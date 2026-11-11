@@ -36,6 +36,7 @@ from sensor_msgs.msg import BatteryState, NavSatFix
 from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import station_clock
 from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
@@ -53,6 +54,13 @@ try:  # Custom interface package of the existing stack (path service)
     BLUEBOAT_IFACES_AVAILABLE = True
 except ImportError:  # pragma: no cover
     BLUEBOAT_IFACES_AVAILABLE = False
+
+try:  # rosgraph_msgs ships with every ROS 2 install; guarded like the rest
+    from rosgraph_msgs.msg import Clock as ClockMsg
+
+    CLOCK_MSGS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    CLOCK_MSGS_AVAILABLE = False
 
 
 # --------------------------------------------------------------------------
@@ -107,7 +115,7 @@ class BridgeNode(Node):
         # ---- Topic statistics -------------------------------------------
         self._stats: dict[str, TopicStats] = {}
         for name in vars(t).values():
-            if not isinstance(name, str) or name == t.path_request:
+            if not isinstance(name, str) or name in (t.path_request, t.clock):
                 continue
             warn = cfg.diagnostics.warn_age_s.get(name, 2.0)
             self._stats[name] = TopicStats(
@@ -153,6 +161,16 @@ class BridgeNode(Node):
         # Link guardian companion (guardian.py watch, real sessions): JSON
         # report heartbeated at 1 Hz on the default profile at both ends.
         self.create_subscription(String, t.guardian_status, self._on_guardian_status, 10)
+        # Gazebo's sim clock (simulation only; nothing publishes it in a
+        # real-robot graph): the station clock's pace in a simulation launch
+        # (core/clock.py), so a run slowed below real time (the ray-cast
+        # sonar) shows rates, ages and elapsed time in sim seconds. Not marked
+        # in the diagnostics: it would read at the physics rate, and in a
+        # real launch as a missing topic. BEST_EFFORT matches the bridge's
+        # publisher whatever its reliability.
+        self._station_clock = station_clock()
+        if CLOCK_MSGS_AVAILABLE:
+            self.create_subscription(ClockMsg, t.clock, self._on_clock, best_effort)
 
         # ---- Publishers ----------------------------------------------------
         self._pub_input_str = self.create_publisher(String, t.input_str, 10)
@@ -199,8 +217,11 @@ class BridgeNode(Node):
         self.create_timer(0.2, self._poll_path_future)
 
     # ================================================================ inputs
+    def _on_clock(self, msg) -> None:
+        self._station_clock.feed(msg.clock.sec + msg.clock.nanosec * 1e-9)
+
     def _mark(self, topic: str) -> float:
-        t = time.monotonic()
+        t = self._station_clock.now()
         st = self._stats.get(topic)
         if st is not None:
             st.mark(t, self._cfg.diagnostics.rate_window_s)
@@ -400,7 +421,7 @@ class BridgeNode(Node):
         if model is None or self._last_odom is None:
             return
         t, x, y = self._last_odom
-        if time.monotonic() - t > 0.5:
+        if self._station_clock.now() - t > 0.5:
             return  # Gazebo paused or starting: no fake fixes from stale poses
         lat, lon = model.fix_for(x, y)
         msg = NavSatFix()
@@ -487,7 +508,7 @@ class BridgeNode(Node):
 
     # ------------------------------------------------------------ statistics
     def _emit_stats(self) -> None:
-        now = time.monotonic()
+        now = self._station_clock.now()
         window = self._cfg.diagnostics.rate_window_s
         snapshot = {
             name: {

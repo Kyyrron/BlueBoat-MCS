@@ -14,7 +14,6 @@ playback rate. The station never moves the replayed boat itself.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -30,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
-from mcs.core.clock import format_clock
+from mcs.core.clock import format_clock, station_clock
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection, elide_middle
 from mcs.models.store import DataStore
@@ -143,7 +142,7 @@ class FloatingReplayBox(QWidget):
             self.rate.setEnabled(False)
             self.adjustSize()
             return
-        age = time.monotonic() - r.received_mono if r.received_mono else 0.0
+        age = station_clock().now() - r.received_mono if r.received_mono else 0.0
         run = Path(r.bag).name
         self._set("Run", f"{run} ({r.frame} world)" if r.frame else run)
         self._set("Time", f"{format_clock(r.t)} / {format_clock(r.duration)}")

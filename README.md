@@ -125,7 +125,8 @@ The buttons that matter:
 
 * **Launch Mission** — a dialog for controller, trajectory, pinger and motors
   (motor enable is always re-confirmed). Simulation runs add a world dialog and a
-  sea-state dialog. In *Gazebo simulation*, **Source ▸ From a ros2bag** replays a
+  sea-state dialog. With a world, the **Sonar model** row picks Geometric or Ray-cast; the ray-cast
+  slows the whole simulation by the **Slow-down** factor (see `docs/04_user_guide.md`). In *Gazebo simulation*, **Source ▸ From a ros2bag** replays a
   recorded real-robot run instead: pick its `Robot_data` folder, and the simulated
   boat moves exactly as it did in the water (the REPLAY box pauses it or changes
   the speed). Every real-robot run records that bag automatically, next to its CSV.

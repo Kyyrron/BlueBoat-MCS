@@ -53,6 +53,9 @@ class TopicsConfig:
     # --- Bag replay only (blueboat_control bag_replay): the replay's
     # state (String JSON, latched, 2 Hz) and its pause / rate command.
     replay_state: str = "/replay/state"
+    # --- Simulation only: Gazebo's sim clock (rosgraph_msgs/Clock), the
+    # station clock's pace in every simulation launch (core/clock.py).
+    clock: str = "/clock"
 
     # --- Publications (commands consumed by the existing stack) ---
     input_str: str = "/blueboat/input_str"
@@ -255,6 +258,36 @@ class PerceptionConfig:
 
 
 @dataclass
+class SimSpeedConfig:
+    """Simulated sonar model and the ray-cast slow-down (owner, 2026-11-07).
+
+    The ray-cast sonar renders a ping in far more than its 50 ms period, so a
+    ray-cast run is slowed down as a whole: Gazebo's real-time factor
+    ``rtf`` (``full_mission_launch.py real_time_factor:=``), every node on
+    the one sim clock, so it pings at 20 Hz in sim time and records exactly
+    what a real-speed run does. The station's displays follow the sim clock
+    in every simulation launch (``core/clock.StationClock``)."""
+
+    rtf_min: float = 0.010
+    # Owner order 2026-11-10: up to x4. With the ray-cast's hold (the sonar
+    # pauses Gazebo while a slow ping renders), above x1 only the time between
+    # pings runs faster than real time; the control stack must keep up.
+    rtf_max: float = 4.000
+    rtf_step: float = 0.005
+    rtf_default: float = 0.100
+    # /clock silent this long (wall s): the station clock falls back to the
+    # wall pace and the SIM badge says "sim clock stopped".
+    clock_stall_s: float = 3.0
+    # The badge turns amber when the measured factor is this far (relative)
+    # from the requested one.
+    rtf_warn_rel: float = 0.20
+    # Extra folders searched first for ray-cast variant profiles (owner,
+    # 2026-11-09; mcs/core/sonar_variants.py); the simulator's installed
+    # config/ and the superproject checkout are always searched after them.
+    variant_dirs: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ArrowConfig:
     """Arrow-key thrust control (the floating box at the map's bottom-right)."""
 
@@ -404,6 +437,7 @@ class AppConfig:
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     guardian: GuardianConfig = field(default_factory=GuardianConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+    sim_speed: SimSpeedConfig = field(default_factory=SimSpeedConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
     # Safe shutdown: how long to wait for param_set's 'default' echo. Its

@@ -39,6 +39,14 @@ Two mission types, matching the two launch files of the stack:
   run (``LaunchParameters.perception_mode``; the world is chosen after this
   dialog, and the empty world has no sonar, so no Perception). A real-robot
   launch always runs it normal.
+  **Sonar model** (Gazebo + Controller only, 2026-11-07): *Geometric* (the
+  default, real time) or *Ray-cast*; with *Ray-cast*, **Slow-down** sets the
+  speed of the whole simulation, x0.010-x0.500 of real time (Gazebo's
+  real-time factor, ``LaunchParameters.real_time_factor``): the ray-cast
+  renders far slower than its 50 ms ping period, and a slowed run keeps one
+  clock, so it pings at 20 Hz in sim time and every record is the same as at
+  real speed. Only a personalized world has a sonar; without one the launch
+  runs geometric at x1 (the toolbar says so).
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -55,6 +63,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -68,11 +77,14 @@ from PySide6.QtWidgets import (
 
 from mcs.config.settings import AppConfig
 from mcs.core import replay as replay_core
+from mcs.core.sonar_variants import default_variant_dirs, list_variants
 from mcs.designer import io_yaml
 from mcs.gui import theme
 from mcs.ros.launch_manager import (
     PERCEPTION_DATASET,
     PERCEPTION_NORMAL,
+    RENDERER_GEOMETRIC,
+    RENDERER_RAYCAST,
     LaunchParameters,
 )
 
@@ -82,6 +94,31 @@ _SRC_CONTROL = "Controller"
 _SRC_BAG = "From a ros2bag"
 _SESSION_NORMAL = "Normal session"
 _SESSION_DATASET = "Dataset creation"
+_SONAR_GEOMETRIC = "Geometric"
+_SONAR_RAYCAST = "Ray-cast"
+#: Item data of a ray-cast variant: "raycast|<profile path>" (2026-11-09).
+_VARIANT_SEP = "|"
+
+
+def slowdown_hint(rtf: float) -> str:
+    """The Slow-down row's explanation for factor ``rtf`` (Qt-free)."""
+    rtf = max(float(rtf), 1e-6)
+    if rtf > 1.0:               # owner order 2026-11-10: up to x4
+        pace = (f"the simulation runs up to {rtf:g}x faster than real time between "
+                f"pings (1 min of mission >= {60.0 / rtf:.0f} s of wall time)")
+    else:
+        pace = (f"the whole simulation runs {1.0 / rtf:.0f}x slower (1 min of mission = "
+                f"{1.0 / rtf:.0f} min of wall time)")
+    return (f"Ray-cast sonar at x{rtf:.3f} real speed: {pace} so it pings at 20 Hz in "
+            "sim time; every record is the same as at real speed. Personalized worlds "
+            "only (the empty world has no sonar).")
+
+
+def hold_hint() -> str:
+    """The ray-cast's hold sentence (2026-11-09, Qt-free)."""
+    return ("The simulation also pauses while a slow ping renders (a quay in "
+            "range), so no ping is ever lost: set the speed you want, x2-x4 for "
+            "'Ray-cast \u2014 fast'.")
 
 
 def list_custom_paths(cfg: AppConfig) -> list[tuple[str, Path]]:
@@ -265,6 +302,41 @@ class LaunchDialog(QDialog):
         self._session_label = QLabel("Session")
         form.addRow(self._session_label, self._session)
 
+        # Simulated sonar model, and the ray-cast's slow-down (Gazebo +
+        # Controller source; emitted only for a personalized world).
+        self._sonar_model = QComboBox()
+        self._sonar_model.addItem(_SONAR_GEOMETRIC, RENDERER_GEOMETRIC)
+        self._sonar_model.addItem(_SONAR_RAYCAST, RENDERER_RAYCAST)
+        # Ray-cast variants (owner, 2026-11-09): the simulator's generated
+        # profiles that switch off only what costs GPU time without changing
+        # how the image looks; each item's tooltip says what and how much.
+        for _v in list_variants(default_variant_dirs(cfg.sim_speed.variant_dirs)):
+            self._sonar_model.addItem(_v.label, f"{RENDERER_RAYCAST}{_VARIANT_SEP}{_v.path}")
+            self._sonar_model.setItemData(self._sonar_model.count() - 1,
+                                          _v.description, Qt.ItemDataRole.ToolTipRole)
+        self._sonar_model.setToolTip(
+            "The simulated side-scan sonar of a personalized-world run.\n"
+            "Geometric: the calibrated real-time renderer (default).\n"
+            "Ray-cast: the 3-D ray-cast sensor -- far slower than the 50 ms ping\n"
+            "period, so the whole simulation is slowed down (Slow-down).")
+        form.addRow("Sonar model", self._sonar_model)
+        sp = cfg.sim_speed
+        self._slowdown = QDoubleSpinBox()
+        self._slowdown.setDecimals(3)
+        self._slowdown.setRange(sp.rtf_min, sp.rtf_max)
+        self._slowdown.setSingleStep(sp.rtf_step)
+        self._slowdown.setValue(sp.rtf_default)
+        self._slowdown.setPrefix("x")
+        self._slowdown.setSuffix(" real speed")
+        self._slowdown.setToolTip(
+            "Gazebo's real-time factor for the whole simulation: physics,\n"
+            "control, sonar and sea state all run on its one clock. Pick the\n"
+            "factor at which the ray-cast holds 20 pings/s of sim time (the\n"
+            "sonar node logs the factor it needs when it falls behind).")
+        form.addRow("Slow-down", self._slowdown)
+        self._sonar_model.currentIndexChanged.connect(lambda _i: self._gate_sonar())
+        self._slowdown.valueChanged.connect(lambda _v: self._gate_sonar())
+
         # ---- Free-form extras ------------------------------------------------------
         self._extra = QLineEdit()
         self._extra.setPlaceholderText("extra launch args, e.g. foo:=bar baz:=1")
@@ -313,6 +385,16 @@ class LaunchDialog(QDialog):
             idx = self._session.findData(last.perception_mode)
             if idx >= 0:
                 self._session.setCurrentIndex(idx)
+            idx = -1
+            if last.sonar_profile:
+                idx = self._sonar_model.findData(
+                    f"{RENDERER_RAYCAST}{_VARIANT_SEP}{last.sonar_profile}")
+            if idx < 0:
+                idx = self._sonar_model.findData(last.sonar_renderer)
+            if idx >= 0:
+                self._sonar_model.setCurrentIndex(idx)
+            if last.sonar_renderer == RENDERER_RAYCAST:
+                self._slowdown.setValue(float(last.real_time_factor))
         self._on_mode_changed(self._mode.currentText())
         if last is not None and last.controller_type in self._items(self._controller):
             self._controller.setCurrentText(last.controller_type)
@@ -395,6 +477,7 @@ class LaunchDialog(QDialog):
             self._set_row_visible(w, not replay)
         self._set_row_visible(self._robot_file, sim and not replay)
         self._set_row_visible(self._session, sim and not replay)
+        self._set_row_visible(self._sonar_model, sim and not replay)
         launch_file = (self._cfg.launch.sim_launch_file if sim
                        else self._cfg.launch.launch_file)
         if replay:
@@ -409,9 +492,29 @@ class LaunchDialog(QDialog):
                  "Run session: the boat connects and goes into override but "
                  "does NOT move or log until you press START RUN (left panel). "
                  "Drive it meanwhile with Manual Target or the arrow keys.")
-        self._hint.setText(
+        self._hint_base = (
             f"The station runs: ros2 launch {self._cfg.launch.package} "
             f"{launch_file} …\n{extra}")
+        self._gate_sonar()
+
+    def _raycast(self) -> bool:
+        """Ray-cast selected, on a Gazebo + Controller launch."""
+        return (self._mode.currentText() == _SIM and not self._replaying()
+                and str(self._sonar_model.currentData() or "").startswith(RENDERER_RAYCAST))
+
+    def _variant_profile(self) -> str:
+        """The chosen ray-cast variant's profile path, or ""."""
+        data = str(self._sonar_model.currentData() or "")
+        return data.partition(_VARIANT_SEP)[2] if self._raycast() else ""
+
+    def _gate_sonar(self) -> None:
+        """The Slow-down row only for the ray-cast, and its explanation."""
+        raycast = self._raycast()
+        self._set_row_visible(self._slowdown, raycast)
+        hint = getattr(self, "_hint_base", "")
+        if raycast:
+            hint += "\n" + slowdown_hint(self._slowdown.value()) + " " + hold_hint()
+        self._hint.setText(hint)
         self.adjustSize()
 
     def _on_pinger_toggled(self, on: bool) -> None:
@@ -561,4 +664,8 @@ class LaunchDialog(QDialog):
             spawn_yaw_rad=spawn_yaw,
             extra_args=extra,
             perception_mode=self._session.currentData() or PERCEPTION_NORMAL,
+            sonar_renderer=(RENDERER_RAYCAST if self._raycast() else RENDERER_GEOMETRIC),
+            sonar_profile=self._variant_profile(),
+            real_time_factor=(round(float(self._slowdown.value()), 3)
+                              if self._raycast() else 1.0),
         )

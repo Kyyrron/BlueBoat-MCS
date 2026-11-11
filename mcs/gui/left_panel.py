@@ -20,7 +20,6 @@ shared 10 Hz tick.
 from __future__ import annotations
 
 import math
-import time
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -32,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
-from mcs.core.clock import format_clock
+from mcs.core.clock import format_clock, station_clock
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection, InfoGrid, StatusLed
 from mcs.models.store import DataStore, TargetMode
@@ -147,7 +146,7 @@ class LeftPanel(QWidget):
             pg.set("Robot frame", "—")
             pg.set("Distance", "—")
         if p.last_raw_update_t is not None:
-            age = time.monotonic() - p.last_raw_update_t
+            age = station_clock().now() - p.last_raw_update_t
             color = theme.OK if age < 3 else (theme.WARN if age < 10 else theme.ERR)
             pg.set("Last update", f"{age:5.1f} s ago", color)
         else:
@@ -238,7 +237,7 @@ def _battery_text(r) -> tuple[str, str]:
     if r.battery_v is not None:
         parts.append(f"{r.battery_v:5.2f} V")
     text = "  ".join(parts)
-    if r.battery_t is None or (time.monotonic() - r.battery_t) > _BATTERY_STALE_S:
+    if r.battery_t is None or (station_clock().now() - r.battery_t) > _BATTERY_STALE_S:
         return text, theme.TEXT_DIM
     pct = r.battery_pct
     if pct is None:

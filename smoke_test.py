@@ -2813,12 +2813,12 @@ _pc_cfg = AppConfig()
 _pt0 = time.mktime((2026, 10, 16, 10, 0, 0, 0, 0, -1))
 _PBASE = ["ros2", "launch", "blueboat_perception", "perception_launch.py"]
 assert _pcmd(_pc_cfg, _PLP(simulation=True, world_dir="/w/a"), now=_pt0) == \
-    _PBASE + ["mode:=normal", "world_dir:=/w/a"]
+    _PBASE + ["mode:=normal", "world_dir:=/w/a", "use_sim_time:=true"]
 _pc = _pcmd(_pc_cfg, _PLP(simulation=True, world_dir="/w/a", note="dam test",
                           perception_mode="dataset"), now=_pt0)
 assert _pc == _PBASE + ["mode:=dataset",
                         "dataset_name:=2026_10_16-10_00_00-sim-dam-test",
-                        "world_dir:=/w/a"], _pc
+                        "world_dir:=/w/a", "use_sim_time:=true"], _pc
 assert _pname(_PLP(simulation=True), _pt0) == "2026_10_16-10_00_00-sim"
 # A real-robot launch: always normal, whatever the field says.
 assert _pcmd(_pc_cfg, _PLP(session=True, perception_mode="dataset")) == \
@@ -2856,7 +2856,8 @@ try:
     assert not _pl_started and "not found" in _pl_out[-1]
     _plm._ros_package_available = lambda name: None      # unknown: try anyway
     _pl._start_perception(_PLP(simulation=True, world_dir="/w/a"), Path("/tmp"))
-    assert _pl_started == [("perception", _PBASE + ["mode:=normal", "world_dir:=/w/a"])]
+    assert _pl_started == [("perception", _PBASE + ["mode:=normal", "world_dir:=/w/a",
+                                                    "use_sim_time:=true"])]
 finally:
     _plm._ros_package_available = _orig_avail
 
@@ -2881,6 +2882,155 @@ assert _pd2.parameters().perception_mode == "normal"
 _pd.deleteLater()
 _pd2.deleteLater()
 print("perception ok")
+
+# --- Sonar model + ray-cast slow-down (owner, 2026-11-07) ---
+# The world launch alone has a sonar, so only its branch emits
+# sonar_renderer:= / real_time_factor:=, and only for the ray-cast: every
+# geometric command line is exactly as before. The station clock follows
+# /clock in a simulation launch (never replay / real) so a slowed run reads
+# in sim seconds.
+from mcs.core.clock import StationClock as _SC
+from mcs.core.clock import sim_badge as _sbadge
+from mcs.ros.launch_manager import RENDERER_GEOMETRIC as _RG
+from mcs.ros.launch_manager import RENDERER_RAYCAST as _RR
+from mcs.ros.launch_manager import drop_sonar_choice_without_world as _drop
+
+for _sp0 in (_PLP(session=True, trajectory="from_yaml:/s.yaml"), _PLP(simulation=True),
+             _PLP(simulation=True, world_dir="/w/a", controller_type="PID"),
+             _PLP(simulation=True, replay_bag="/b")):
+    _sp1 = _pdc.replace(_sp0, sonar_renderer=_RG, real_time_factor=1.0)
+    assert _sp1.to_cli() == _sp0.to_cli()
+    assert not any("sonar_renderer" in a or "real_time_factor" in a for a in _sp0.to_cli())
+_spw = _PLP(simulation=True, world_dir="/w/a", controller_type="PID",
+            sonar_renderer=_RR, real_time_factor=0.1, extra_args={"foo": "1"})
+_spc = _spw.to_cli()
+assert _spc[-3:] == ["sonar_renderer:=raycast", "real_time_factor:=0.100", "foo:=1"], _spc
+assert _spw.slowed()
+for _sp0 in (_PLP(simulation=True, sonar_renderer=_RR, real_time_factor=0.1),
+             _PLP(simulation=True, replay_bag="/b", sonar_renderer=_RR, real_time_factor=0.1),
+             _PLP(session=True, sonar_renderer=_RR, real_time_factor=0.1)):
+    assert not any("sonar_renderer" in a or "real_time_factor" in a for a in _sp0.to_cli())
+# No world chosen: geometric at x1, said once.
+_spe = _PLP(simulation=True, sonar_renderer=_RR, real_time_factor=0.05)
+assert _drop(_spe) and _spe.sonar_renderer == _RG and _spe.real_time_factor == 1.0
+assert not _drop(_spe) and not _drop(_pdc.replace(_spw))
+
+# Dialog rows: Gazebo + Controller only; Slow-down only for the ray-cast.
+_sd = _PLD(cfg, None)
+assert not _sd._sonar_model.isVisibleTo(_sd) and not _sd._slowdown.isVisibleTo(_sd)
+_sd._mode.setCurrentText("Gazebo simulation")
+assert _sd._sonar_model.isVisibleTo(_sd) and not _sd._slowdown.isVisibleTo(_sd)
+assert _sd.parameters().sonar_renderer == _RG and _sd.parameters().real_time_factor == 1.0
+assert (_sd._slowdown.minimum(), _sd._slowdown.maximum()) == (0.01, 4.0)
+from mcs.gui.dialogs.launch_dialog import slowdown_hint as _shint
+assert "faster than real time" in _shint(2.0) and "slower" not in _shint(2.0)
+assert "20 Hz in sim time" in _shint(2.0) and "10x slower" in _shint(0.1)
+assert abs(_sd._slowdown.value() - cfg.sim_speed.rtf_default) < 1e-9
+_sd._sonar_model.setCurrentIndex(_sd._sonar_model.findData(_RR))
+assert _sd._slowdown.isVisibleTo(_sd) and "20 Hz in sim time" in _sd._hint.text()
+_sd._slowdown.setValue(0.025)
+_sd_par = _sd.parameters()
+assert _sd_par.sonar_renderer == _RR and abs(_sd_par.real_time_factor - 0.025) < 1e-9
+_sd._slowdown.setValue(0.001)                       # clamped to the range
+assert abs(_sd._slowdown.value() - 0.01) < 1e-9
+_sd2 = _PLD(cfg, _sd_par)                           # restored
+assert _sd2._sonar_model.currentData() == _RR and abs(_sd2._slowdown.value() - 0.025) < 1e-9
+_sd2._source.setCurrentText("From a ros2bag")       # a replay has no sonar choice
+assert not _sd2._sonar_model.isVisibleTo(_sd2) and not _sd2._slowdown.isVisibleTo(_sd2)
+assert _sd2.parameters().sonar_renderer == _RG
+_sd2._source.setCurrentText("Controller")
+_sd2._mode.setCurrentText("Real robot")
+assert not _sd2._slowdown.isVisibleTo(_sd2) and _sd2.parameters().real_time_factor == 1.0
+_sd.deleteLater()
+_sd2.deleteLater()
+
+# Ray-cast variants (owner, 2026-11-09): profiles with a `variant:` block are
+# listed after the unchanged Geometric / Ray-cast items and launched with
+# sonar_config:=<path>; plain Ray-cast and geometric command lines unchanged.
+import tempfile as _tfv
+
+from mcs.core.sonar_variants import list_variants as _lv
+from mcs.core.sonar_variants import read_variant as _rv
+
+with _tfv.TemporaryDirectory() as _vdir:
+    _vd = Path(_vdir)
+    (_vd / "raycast_zz_sonar.yaml").write_text(
+        "renderer: raycast\nvariant: {label: 'Ray-cast - test', order: 5, "
+        "description: 'a test variant'}\nraycast: {}\n")
+    (_vd / "raycast_plain_sonar.yaml").write_text("renderer: raycast\nraycast: {}\n")
+    (_vd / "broken_sonar.yaml").write_text("renderer: [raycast\n")
+    (_vd / "geo_sonar.yaml").write_text("renderer: geometric\nvariant: {label: x}\n")
+    _vs = _lv([_vd])
+    assert [v.file for v in _vs] == ["raycast_zz_sonar.yaml"], _vs
+    assert _vs[0].label == "Ray-cast - test" and _vs[0].order == 5
+    assert _rv(_vd / "missing.yaml") is None
+    _vpar = _PLP(simulation=True, world_dir="/w/a", controller_type="PID",
+                 sonar_renderer=_RR, real_time_factor=0.5,
+                 sonar_profile=_vs[0].path, extra_args={"foo": "1"})
+    assert _vpar.to_cli()[-4:] == ["sonar_renderer:=raycast", "real_time_factor:=0.500",
+                                   f"sonar_config:={_vs[0].path}", "foo:=1"], _vpar.to_cli()
+    _vpe = _pdc.replace(_vpar, world_dir="")
+    assert _drop(_vpe) and _vpe.sonar_profile == "" and _vpe.sonar_renderer == _RG
+    # Dialog: the variant is an item after the two existing ones, ray-cast,
+    # with its tooltip; chosen, it reaches the parameters; restored.
+    _cfgv = _pdc.replace(cfg, sim_speed=_pdc.replace(cfg.sim_speed, variant_dirs=[str(_vd)]))
+    _sv = _PLD(_cfgv, None)
+    _sv._mode.setCurrentText("Gazebo simulation")
+    assert [_sv._sonar_model.itemText(i) for i in range(2)] == ["Geometric", "Ray-cast"]
+    _vi = _sv._sonar_model.findText("Ray-cast - test")
+    assert _vi >= 2 and _sv._sonar_model.itemData(
+        _vi, Qt.ItemDataRole.ToolTipRole) == "a test variant"
+    _sv._sonar_model.setCurrentIndex(_sv._sonar_model.findData(_RR))
+    assert _sv.parameters().sonar_profile == ""          # plain Ray-cast: no profile
+    _sv._sonar_model.setCurrentIndex(_vi)
+    assert _sv._slowdown.isVisibleTo(_sv) and "no ping is ever lost" in _sv._hint.text()
+    _svp = _sv.parameters()
+    assert _svp.sonar_renderer == _RR and _svp.sonar_profile == _vs[0].path
+    _sv2 = _PLD(_cfgv, _svp)
+    assert _sv2._sonar_model.currentIndex() == _vi
+    _sv.deleteLater()
+    _sv2.deleteLater()
+# The simulator's own variants, when the superproject checkout is beside us.
+_simcfg = (Path(__file__).resolve().parent.parent / "BlueBoat-SSS-Sim"
+           / "blueboat_sss_sim" / "config")
+if _simcfg.is_dir():
+    _names = {v.file for v in _lv([_simcfg])}
+    assert {"raycast_live_sonar.yaml", "raycast_fast_sonar.yaml"} <= _names, _names
+    assert "raycast_default_sonar.yaml" not in _names     # the plain Ray-cast item
+
+# Station clock: monotonic until fed while following; sim-paced; wall pace
+# after a stall; never backwards; ignored when not following (real, replay).
+_c = _SC(stall_s=3.0)
+assert _c.now(5.0) == 5.0
+_c.feed(10.0, 6.0)
+assert _c.now(7.0) == 7.0 and not _c.sim_paced         # not following
+_c.set_follow(True)
+_c.feed(100.0, 1000.0)
+assert _c.now(1000.0) == 1000.0                         # continuous at the switch
+for _k in range(1, 21):
+    _c.feed(100.0 + 0.1 * _k, 1000.0 + _k)              # x0.1, one /clock per wall s
+assert abs(_c.now(1020.0) - 1002.0) < 1e-6 and abs(_c.ratio - 0.1) < 0.005
+_vs = _c.now(1023.0)                                    # 3 s interpolation, then
+assert abs(_c.now(1033.0) - _vs - 10.0) < 1e-6          # wall pace when stalled
+assert _c.stalled(1033.0)
+_c.feed(0.0, 1034.0)                                    # Gazebo restarted
+assert _c.now(1034.0) >= _vs
+_t, _lvl = _sbadge(_c, 0.1, 0.2, mono_s=1034.0)
+assert _t.startswith("SIM x0.100")
+_c.set_follow(False)
+assert _sbadge(_c, 0.1) == ("", "") and not _c.sim_paced
+_c.set_follow(True)
+assert _sbadge(_c, None)[0] == "SIM x1 · waiting for /clock"
+assert _sbadge(_c, 2.0)[0].startswith("SIM x2.000")          # above x1 (2026-11-10)
+for _k in range(40):
+    _c.feed(0.01 * _k, 2000.0 + 0.1 * _k)               # measured x0.1 vs asked x1
+assert _sbadge(_c, 1.0, 0.2, mono_s=2003.9)[1] == "warn"
+# The process-wide clock is the store's: not following outside a launch.
+from mcs.core.clock import station_clock as _stc
+from mcs.models.store import now_mono as _nm
+
+assert not _stc().following and abs(_nm() - time.monotonic()) < 0.5
+print("sim speed ok")
 
 # --- Shared display helpers: one elapsed-time format, one middle elision,
 # one "a run is in progress" rule (every read-out and gate uses these) ---

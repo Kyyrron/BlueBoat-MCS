@@ -256,6 +256,24 @@ never affect what is captured.
 
 ## Bottom toolbar
 
+**Sonar model / Slow-down** (Gazebo simulation, Controller source). *Geometric* is
+the calibrated real-time sonar. *Ray-cast* is the 3-D ray-cast sensor, which renders
+a ping in far more than the 50 ms ping period, so the **whole simulation** is slowed
+down: pick x0.010-x4.000 of real speed (the sonar node's console names the factor it
+needs if it falls behind; since 2026-11-10 the sonar also pauses Gazebo while a slow ping
+renders, so above x1 only the time between pings runs faster). Physics, control, sonar and sea state then share one clock:
+the boat behaves, pings and records exactly as at real speed, only the wall time is
+longer (at x0.100, 1 min of mission takes 10 min). Every station read-out follows the
+sim clock in a simulation, and the toolbar's **SIM x0.100 · measured x0.098** badge
+shows the factor (amber if it drifts, or "sim clock stopped"). Only a personalized
+world has a sonar: with the empty world the run starts geometric at x1, and a message
+says so. The ray-cast uses the simulator's packaged profile unless **Extra args** names
+another, e.g. `sonar_config:=/home/<you>/calib/raycast/correction/raycast_harbour_hybrid_v2_sonar.yaml`
+(the harbour hybrid). A harbour world at 20 m holds 20 Hz at about x0.03. Keep the ray-cast's
+range at 20 m (at most 30 m, whether set by `range_length_mm:=` in Extra args or by the GCS's
+range control): above 40 m it runs out of GPU memory (the simulator's README, "Range advice for
+the ray-cast").
+
 **Launch Mission** opens the configuration dialog. The **Mission type**
 selector chooses between the *Real robot* launch and the *Gazebo simulation*
 (`Sim_launch.py`). Real robot — a **run session**: the controller of the
@@ -289,7 +307,9 @@ and every seabed image is also saved as a training sample under
 `~/ros2_ws/data/Dataset_data/<date>-<note>/`, a ready YOLO dataset: every image, one
 label file per image (each object's highlight and shadow, its World Builder class, from
 the simulator's ground truth) and `data.yaml`; split it into train/val yourself, by run
-or site. The ground truth is also archived beside it. In the empty world nothing starts
+or site. The ground truth is also archived beside it. With **Sonar model: Ray-cast** the label
+files stay empty: the simulator's ray-cast does not publish ground-truth contacts yet, so
+make labelled datasets with the Geometric sonar. In the empty world nothing starts
 (no sonar). A real-robot
 launch always runs Perception in the normal mode. The station only starts and stops it;
 detections are shown by the GCS.
