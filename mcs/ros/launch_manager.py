@@ -18,6 +18,7 @@ to start and stop the process tree.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -126,6 +127,14 @@ class LaunchParameters:
     lines are unchanged. An operator ``sonar_config:=`` in Extra args still
     wins (it comes last).
 
+    ``thrust_gain`` (CR-03-3, 2026-11-16): the plant's ``[right, left]``
+    applied-thrust gains (Control's R-10 asymmetry bracket; the FIT nominal
+    is ``[0.3805,0.6055]``), canonical text from :func:`parse_thrust_gain`.
+    Only ``full_mission_launch.py`` declares it, so only the world branch
+    emits ``thrust_gain:=``, after the sonar arguments and before
+    ``extra_args``; "" (the description's gains) emits nothing, and an
+    empty-world launch drops it (:func:`drop_thrust_gain_without_world`).
+
     ``perception_mode`` is no launch argument of any of the
     four files -- ``to_cli`` ignores it. It is the BlueBoat-Perception
     companion's mode (:func:`perception_command`): ``normal`` or
@@ -181,6 +190,8 @@ class LaunchParameters:
     real_time_factor: float = 1.0
     # A ray-cast variant profile (absolute path), or "" (see the docstring).
     sonar_profile: str = ""
+    # The plant's [right, left] thrust gains, "[r,l]" or "" (see the docstring).
+    thrust_gain: str = ""
 
     def slowed(self) -> bool:
         """A personalized-world run with the ray-cast sonar, slowed down."""
@@ -234,6 +245,8 @@ class LaunchParameters:
                 *self.sea_args(),          # before extra_args: an override wins
                 *self.sim_speed_args(),    # likewise
             ]
+            if self.thrust_gain:
+                args.append(f"thrust_gain:={self.thrust_gain}")
         elif self.simulation:
             args = [
                 f"robot_file:={self.robot_file}",
@@ -268,6 +281,37 @@ def drop_sonar_choice_without_world(params: LaunchParameters) -> bool:
         params.sonar_renderer = RENDERER_GEOMETRIC
         params.real_time_factor = 1.0
         params.sonar_profile = ""
+        return True
+    return False
+
+
+def parse_thrust_gain(text: str) -> str:
+    """Operator text -> the canonical ``[r,l]`` launch value, "" when empty.
+
+    Accepts ``0.38,0.61``, ``[0.38, 0.61]`` or ``0.38 0.61``: two positive
+    numbers, right then left (the simulator's own parser reads the same
+    forms; it is mirrored here, never imported -- CM-3). Raises
+    ``ValueError`` otherwise. Module scope, Qt-free."""
+    s = str(text or "").strip().strip("[]").strip()
+    if not s:
+        return ""
+    try:
+        g = [float(v) for v in s.replace(",", " ").split()]
+    except ValueError:
+        raise ValueError(f"thrust gain {text!r}: expected two numbers [right, left]") from None
+    if len(g) != 2 or not all(math.isfinite(v) and v > 0.0 for v in g):
+        raise ValueError(f"thrust gain {text!r}: expected two positive numbers [right, left]")
+    return f"[{g[0]:g},{g[1]:g}]"
+
+
+def drop_thrust_gain_without_world(params: LaunchParameters) -> bool:
+    """A thrust gain for a Gazebo launch that got no personalized world is
+    dropped in place: ``Sim_launch.py`` declares no ``thrust_gain`` (an
+    undeclared argument would abort ``ros2 launch``). True when it did, so
+    the GUI can say so. Module scope, Qt-free."""
+    if (params.simulation and not params.replay_bag and not params.world_dir
+            and params.thrust_gain):
+        params.thrust_gain = ""
         return True
     return False
 

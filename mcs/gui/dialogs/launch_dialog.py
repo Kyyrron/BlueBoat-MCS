@@ -86,6 +86,7 @@ from mcs.ros.launch_manager import (
     RENDERER_GEOMETRIC,
     RENDERER_RAYCAST,
     LaunchParameters,
+    parse_thrust_gain,
 )
 
 _REAL = "Real robot"
@@ -337,6 +338,18 @@ class LaunchDialog(QDialog):
         self._sonar_model.currentIndexChanged.connect(lambda _i: self._gate_sonar())
         self._slowdown.valueChanged.connect(lambda _v: self._gate_sonar())
 
+        # The plant's [right, left] thrust gains (CR-03-3; Gazebo + Controller,
+        # emitted only for a personalized world). Empty = the description's.
+        self._thrust_gain = QLineEdit()
+        self._thrust_gain.setPlaceholderText("the description's — e.g. [0.3805,0.6055]")
+        self._thrust_gain.setToolTip(
+            "thrust_gain:=[right,left] of full_mission_launch.py: the applied-thrust\n"
+            "gains of simulation_interface (Control's R-10 asymmetry bracket;\n"
+            "the FIT nominal is [0.3805,0.6055]). Personalized worlds only:\n"
+            "the empty world's Sim_launch.py has no such argument.\n"
+            "Empty = the gains the robot description carries.")
+        form.addRow("Thrust gain", self._thrust_gain)
+
         # ---- Free-form extras ------------------------------------------------------
         self._extra = QLineEdit()
         self._extra.setPlaceholderText("extra launch args, e.g. foo:=bar baz:=1")
@@ -395,6 +408,7 @@ class LaunchDialog(QDialog):
                 self._sonar_model.setCurrentIndex(idx)
             if last.sonar_renderer == RENDERER_RAYCAST:
                 self._slowdown.setValue(float(last.real_time_factor))
+            self._thrust_gain.setText(last.thrust_gain)
         self._on_mode_changed(self._mode.currentText())
         if last is not None and last.controller_type in self._items(self._controller):
             self._controller.setCurrentText(last.controller_type)
@@ -478,6 +492,7 @@ class LaunchDialog(QDialog):
         self._set_row_visible(self._robot_file, sim and not replay)
         self._set_row_visible(self._session, sim and not replay)
         self._set_row_visible(self._sonar_model, sim and not replay)
+        self._set_row_visible(self._thrust_gain, sim and not replay)
         launch_file = (self._cfg.launch.sim_launch_file if sim
                        else self._cfg.launch.launch_file)
         if replay:
@@ -575,10 +590,24 @@ class LaunchDialog(QDialog):
                     "/blueboat/odom: there is no motion to replay.")
         return ""
 
+    def thrust_gain_problem(self) -> str:
+        """Why the Thrust gain text is not a [right, left] pair, or ""."""
+        if self._mode.currentText() != _SIM or self._replaying():
+            return ""
+        try:
+            parse_thrust_gain(self._thrust_gain.text())
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
     def accept(self) -> None:
         problem = self.bag_problem()
         if problem:
             QMessageBox.warning(self, "Replay", problem)
+            return
+        problem = self.thrust_gain_problem()
+        if problem:
+            QMessageBox.warning(self, "Thrust gain", problem)
             return
         super().accept()
 
@@ -668,4 +697,13 @@ class LaunchDialog(QDialog):
             sonar_profile=self._variant_profile(),
             real_time_factor=(round(float(self._slowdown.value()), 3)
                               if self._raycast() else 1.0),
+            thrust_gain=self._thrust_gain_value(),
         )
+
+    def _thrust_gain_value(self) -> str:
+        """The canonical thrust gain, or "" (empty or invalid: accept()
+        refuses the invalid case before parameters() is read)."""
+        try:
+            return parse_thrust_gain(self._thrust_gain.text())
+        except ValueError:
+            return ""

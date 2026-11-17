@@ -232,12 +232,15 @@ ros2 launch blueboat_sss_sim full_mission_launch.py \
     world_dir:=<abs world folder> with_control:=true \
     trajectory_file:=<trajectories>/.deployed/<name>.yaml \
     controller_type:=<PID|LoS|MPC> note:=<str> \
-    [sea_*:=…] [sonar_renderer:=raycast real_time_factor:=<f>] [<Extra args>]
+    [sea_*:=…] [sonar_renderer:=raycast real_time_factor:=<f>] \
+    [thrust_gain:=[<right>,<left>]] [<Extra args>]
 ```
 
-The bracketed arguments appear only when chosen: a sea state, and the dialog's **Sonar model:
-Ray-cast** with its **Slow-down** factor. The Extra args come last, for example
-`sonar_config:=<ray-cast profile>`.
+The bracketed arguments appear only when chosen: a sea state, the dialog's **Sonar model:
+Ray-cast** with its **Slow-down** factor, and the **Thrust gain** (CR-03-3, 2026-11-16: the
+plant's applied-thrust gains, e.g. the FIT nominal `[0.3805,0.6055]`; empty = the robot
+description's; `Sim_launch.py` declares no `thrust_gain`, so an empty-world launch drops it with
+a message). The Extra args come last, for example `sonar_config:=<ray-cast profile>`.
 
 With `with_control:=true` that launch starts the same control graph as
 `Sim_launch.py` (`simulation_interface`, `path_generation` watching the
@@ -270,6 +273,11 @@ written as the simulator's schedule document
 which the simulator resolves) and rides the launch as
 `sea_schedule:=<file> sea_seed:=<n>` — in a personalized world on
 `full_mission_launch.py`, placed before the operator's extra arguments.
+**Sea situation** (CR-03-3, 2026-11-16): the dialog's top row can instead
+name one of the simulator's `config/sea_situations/*.yaml` (`field_matched`,
+`harbour_chop`, …, or any schedule file); it is then passed as is,
+`sea_schedule:=<that file> sea_seed:=<n>`, nothing written, its `wind` and
+`yaw_moment` blocks included (live: its document as `{"schedule": …}`).
 `Sim_launch.py` declares no sea argument, so in the empty world the
 station spawns a **companion** process,
 

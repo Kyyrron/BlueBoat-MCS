@@ -28,6 +28,15 @@ Every choice travels as the simulator's own schedule document
 passed as ``sea_schedule:=`` at launch, or the JSON command of a live
 change. Directions are compass degrees the current / waves come **from**
 (meteorological convention, "from North to South" = 0°).
+
+**Sea situations** (CR-03-3, 2026-11-16): the simulator also ships fitted
+schedule files (``share/blueboat_sss_sim/config/sea_situations/*.yaml``:
+``calm``, ``field_matched``, ``harbour_chop``, ...), carrying blocks the
+station's cards do not offer (``wind``, ``yaw_moment``). A choice may name
+one (:attr:`SeaChoice.situation_file`); it then travels as is, as
+``sea_schedule:=`` at launch or as the live ``{"schedule": ...}`` command,
+and replaces the schedule the station would otherwise write. Without one
+nothing changes.
 """
 
 from __future__ import annotations
@@ -441,6 +450,8 @@ class SeaChoice:
     ``scenario_file`` is the schedule document the launch passes as
     ``sea_schedule:=`` (written by :meth:`write_scenario`; the dialog does it
     on OK). ``timeline`` replaces the two cards when set.
+    ``situation_file`` (CR-03-3): one of the simulator's sea situation files;
+    when set it replaces cards and timeline and travels as is ("" = today).
     """
 
     current: CurrentSetting = field(default_factory=CurrentSetting)
@@ -448,9 +459,12 @@ class SeaChoice:
     seed: int = 7
     timeline: SeaTimeline | None = None
     scenario_file: str = ""
+    situation_file: str = ""
 
     @property
     def is_null(self) -> bool:
+        if self.situation_file:
+            return False
         if self.timeline is not None and self.timeline.segments:
             return False
         return not self.current.active and not self.waves.active
@@ -478,13 +492,21 @@ class SeaChoice:
         """``sea_schedule:=`` / ``sea_seed:=`` arguments of
         ``full_mission_launch.py`` / ``sea_state_launch.py``. Every choice
         travels as a scenario file (the plain-language keys have no preset
-        name); one is written on demand if the dialog has not."""
+        name); one is written on demand if the dialog has not. A sea
+        situation file is passed itself, nothing written."""
+        if self.situation_file:
+            return [f"sea_schedule:={self.situation_file}", f"sea_seed:={int(self.seed)}"]
         if not self.scenario_file:
             self.write_scenario(schedules_dir or SCENARIO_DIR_DEFAULT)
         return [f"sea_schedule:={self.scenario_file}", f"sea_seed:={int(self.seed)}"]
 
     def command_json(self, ramp_s: float = 20.0) -> str:
         """The ``/sim/sea_state/command`` payload for a live change."""
+        if self.situation_file:
+            doc = read_schedule(self.situation_file)
+            if doc is None:
+                raise ValueError(f"not a sea schedule: {self.situation_file}")
+            return json.dumps({"schedule": doc, "t0": "now"})
         if self.timeline is not None and self.timeline.segments:
             return json.dumps({"schedule": self.schedule_document(
                 self.timeline.name or "timeline"), "t0": "now"})
@@ -493,6 +515,8 @@ class SeaChoice:
                            "ramp_s": float(ramp_s)})
 
     def summary(self, catalog: SeaCatalog | None = None) -> str:
+        if self.situation_file:
+            return f"sea situation {Path(self.situation_file).stem}"
         if self.timeline is not None and self.timeline.segments:
             return self.timeline.summary()
         if self.is_null:
@@ -547,6 +571,52 @@ def write_schedule(path: str | Path, doc: dict) -> Path:
     with open(p, "w", encoding="utf-8") as f:
         yaml.safe_dump(doc, f, sort_keys=False)
     return p
+
+
+# ------------------------------------------------------------- situations
+def find_situations_dir(explicit: str = "") -> Path | None:
+    """The simulator's ``config/sea_situations`` folder: an explicit path,
+    else every ``$AMENT_PREFIX_PATH`` entry, else ``~/ros2_ws/install``,
+    else the superproject checkout (YAML only, never an import, CM-3)."""
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p if p.is_dir() else None
+    rel = Path("share") / "blueboat_sss_sim" / "config" / "sea_situations"
+    roots = [Path(p) for p in os.environ.get("AMENT_PREFIX_PATH", "").split(":") if p]
+    roots.append(Path.home() / "ros2_ws" / "install" / "blueboat_sss_sim")
+    cands = [root / rel for root in roots]
+    cands.append(Path(__file__).resolve().parents[3] / "BlueBoat-SSS-Sim"
+                 / "blueboat_sss_sim" / "config" / "sea_situations")
+    for cand in cands:
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def list_situations(situations_dir: str | Path | None) -> list[Path]:
+    """The sea situation files of a folder (schedule format only), sorted
+    by name; [] when there is none. Never raises."""
+    if not situations_dir:
+        return []
+    d = Path(situations_dir).expanduser()
+    if not d.is_dir():
+        return []
+    return [p for p in sorted(d.glob("*.yaml")) if read_schedule(p) is not None]
+
+
+def situation_description(path: str | Path) -> str:
+    """The leading ``#`` comment block of a situation file (its own
+    description, for a tooltip); "" when unreadable."""
+    lines: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                if not raw.startswith("#"):
+                    break
+                lines.append(raw[1:].strip())
+    except OSError:
+        return ""
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------- readback

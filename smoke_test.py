@@ -641,8 +641,18 @@ try:
     assert _p2.gps_anchored_source == ""
     assert _p2.trajectory == f"from_yaml:{_ld_plain}"
     assert "spawn_yaw:=" not in " ".join(_p2.to_cli())
+    # Thrust gain row (CR-03-3): empty by default, canonicalised, refused
+    # when malformed, hidden on the real robot.
+    assert _p2.thrust_gain == "" and _dlg._thrust_gain.isVisibleTo(_dlg)
+    _dlg._thrust_gain.setText("0.3805, 0.6055")
+    assert _dlg.parameters().thrust_gain == "[0.3805,0.6055]"
+    assert _dlg.thrust_gain_problem() == ""
+    _dlg._thrust_gain.setText("0.38")
+    assert _dlg.thrust_gain_problem() != ""
+    _dlg._thrust_gain.clear()
 
     _dlg._mode.setCurrentText("Real robot")
+    assert not _dlg._thrust_gain.isVisibleTo(_dlg)
     # The log note exists in both modes (simulation_interface names its poslog
     # from it exactly as robot_interface does), so the field stays visible.
     assert _dlg._note.isVisibleTo(_dlg) and _dlg._note_label.isVisibleTo(_dlg)
@@ -917,6 +927,91 @@ assert _rb.hull_model == ""                                   # older simulators
 assert parse_readback({"hull": {"model": "catamaran", "active": True}}
                       ).hull_model == "catamaran"
 print("sea state ok")
+
+# --- Sea situation file (CR-03-3, 2026-11-16) ---
+# One of the simulator's fitted schedule files (wind / yaw_moment blocks the
+# cards do not offer) travels as is: sea_schedule:=<that file>, nothing
+# written; live, its document as {"schedule": ...}. Without one: as before.
+from mcs.core.sea import find_situations_dir, list_situations, situation_description
+
+_sit_dir = Path(tempfile.mkdtemp())
+_sit = _sit_dir / "field_matched.yaml"
+_sit.write_text("# Sea situation `field_matched` (test copy).\n# second line\n"
+                "format: blueboat_sea_schedule/1\nname: field_matched\nseed: 0\n"
+                "interpolation: hold\nkeyframes:\n- t_s: 0.0\n  current: {preset: none}\n"
+                "  wind: {speed_mps: 4.476, from_deg: 30.0}\n"
+                "  yaw_moment: {std_nm: 0.9914, tau_s: 0.434}\n")
+(_sit_dir / "not_a_schedule.yaml").write_text("format: something_else\n")
+assert list_situations(_sit_dir) == [_sit] and list_situations("") == []
+assert situation_description(_sit).startswith("Sea situation `field_matched`")
+assert find_situations_dir(str(_sit_dir)) == _sit_dir
+assert find_situations_dir(str(_sit_dir / "missing")) is None
+assert SeaChoice().situation_file == "" and SeaChoice().is_null       # default unchanged
+_sc = SeaChoice(seed=5, situation_file=str(_sit))
+assert not _sc.is_null and _sc.summary() == "sea situation field_matched"
+assert _sc.launch_args() == [f"sea_schedule:={_sit}", "sea_seed:=5"]
+assert _sc.scenario_file == ""                                        # nothing written
+_scmd = _json_sea.loads(_sc.command_json())
+assert _scmd["t0"] == "now" and _scmd["schedule"]["keyframes"][0]["wind"]["speed_mps"] == 4.476
+_scw = _WLP(simulation=True, controller_type="PID", world_dir="/w/pA/w1",
+            gps_deployed_target="/tmp/d.yaml", sea=_sc).to_cli()
+assert f"sea_schedule:={_sit}" in _scw and "sea_seed:=5" in _scw
+assert f"sea_schedule:={_sit}" in _companion(cfg, _WLP(simulation=True, sea=_sc))
+# Dialog, headless: "None" by default; a situation greys the cards and the
+# plan out, round-trips, and a launch writes no scenario for it.
+_sscfg = cfg.sea.__class__(schedules_dir=str(_sea_dir), situations_dir=str(_sit_dir))
+_sds = SeaStateDialog(_cat, _sscfg, None)
+assert _sds.situation_file() == "" and _sds.current_card.isEnabled()
+assert _sds._situation.findData(str(_sit)) >= 0                       # listed
+assert _sds._situation.findData(str(_sit_dir / "not_a_schedule.yaml")) < 0
+_sds.set_situation(str(_sit))
+assert not _sds.current_card.isEnabled() and not _sds._plan_btn.isEnabled()
+_sds._accept()
+_scd = _sds.choice()
+assert _scd.situation_file == str(_sit) and _scd.scenario_file == ""
+assert _scd.launch_args()[0] == f"sea_schedule:={_sit}"
+_sds.set_situation("")
+assert _sds.current_card.isEnabled() and _sds.choice().situation_file == ""
+_sds.deleteLater()
+_sdr = SeaStateDialog(_cat, _sscfg, _sc, live=True)                   # restored, live
+assert _sdr.situation_file() == str(_sit)
+_sdr.deleteLater()
+print("sea situation ok")
+
+# --- Plant thrust gain (CR-03-3, 2026-11-16) ---
+# thrust_gain:=[r,l] rides full_mission_launch.py only (after the sonar
+# arguments, before the extras); "" emits nothing; the empty world drops it.
+from mcs.ros.launch_manager import drop_thrust_gain_without_world, parse_thrust_gain
+
+assert parse_thrust_gain("") == "" and parse_thrust_gain("  ") == ""
+assert parse_thrust_gain("[0.3805,0.6055]") == "[0.3805,0.6055]"
+assert parse_thrust_gain("0.3805, 0.6055") == "[0.3805,0.6055]"
+assert parse_thrust_gain("0.3805 0.6055") == "[0.3805,0.6055]"
+for _bad in ("0.38", "[1,2,3]", "a,b", "0,0.5", "-1,1", "nan,1"):
+    try:
+        parse_thrust_gain(_bad)
+        raise AssertionError(f"accepted {_bad!r}")
+    except ValueError:
+        pass
+assert _WLP().thrust_gain == ""
+_tgw = _WLP(simulation=True, controller_type="PID", world_dir="/w/pA/w1",
+            gps_deployed_target="/tmp/d.yaml", sea=_sc, sonar_renderer="raycast",
+            real_time_factor=0.1, thrust_gain="[0.3805,0.6055]",
+            extra_args={"headless": "true"}).to_cli()
+assert "thrust_gain:=[0.3805,0.6055]" in _tgw and _tgw[-1] == "headless:=true"
+assert _tgw.index("real_time_factor:=0.100") < _tgw.index("thrust_gain:=[0.3805,0.6055]")
+assert not any(a.startswith("thrust_gain") for a in _WLP(
+    simulation=True, controller_type="PID", world_dir="/w/pA/w1",
+    gps_deployed_target="/tmp/d.yaml").to_cli())
+_tgs = _WLP(simulation=True, controller_type="PID", thrust_gain="[0.3805,0.6055]")
+assert drop_thrust_gain_without_world(_tgs) and _tgs.thrust_gain == ""
+assert not any(a.startswith("thrust_gain") for a in _tgs.to_cli())
+_tgr = _WLP(thrust_gain="[0.3805,0.6055]")                            # real robot
+assert not drop_thrust_gain_without_world(_tgr)
+assert not any(a.startswith("thrust_gain") for a in _tgr.to_cli())
+assert not drop_thrust_gain_without_world(_WLP(
+    simulation=True, world_dir="/w", thrust_gain="[1,1]"))             # world: kept
+print("thrust gain ok")
 
 # --- Full window in offscreen mode, synthetic telemetry ---
 from mcs.gui.main_window import MainWindow

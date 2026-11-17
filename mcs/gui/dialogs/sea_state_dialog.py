@@ -30,19 +30,22 @@ timeline editor.
 from __future__ import annotations
 
 import random
+from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -59,9 +62,16 @@ from mcs.core.sea import (
     SeaTimeline,
     WaveSetting,
     compass_name,
+    find_situations_dir,
+    list_situations,
     parse_direction,
+    read_schedule,
+    situation_description,
 )
 from mcs.gui import theme
+
+#: Combo data of the sea-situation row's "Other file…" entry.
+_SITUATION_OTHER = "\x00other"
 
 _COMPASS16 = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
@@ -416,6 +426,25 @@ class SeaStateDialog(QDialog):
             warn.setStyleSheet(f"color: {theme.WARN};")
             layout.addWidget(warn)
 
+        # ---- a sea situation file of the simulator (CR-03-3) ---------------
+        # Replaces the cards and the plan when chosen; "None" = today.
+        sit_form = QFormLayout()
+        self._situation = QComboBox()
+        self._situation.addItem("None — set the sea below", "")
+        for path in list_situations(find_situations_dir(cfg.situations_dir)):
+            self._add_situation_item(path)
+        self._situation.addItem("Other file…", _SITUATION_OTHER)
+        self._situation.setToolTip(
+            "One of the simulator's sea situation files (config/sea_situations):\n"
+            "a fitted sea passed to the simulator as is, its wind and yaw-moment\n"
+            "disturbance included. It replaces the sea set below.")
+        self._situation_prev = 0
+        self._situation.currentIndexChanged.connect(self._on_situation)
+        sit_form.addRow("Sea situation", self._situation)
+        self._situation_hint = _hint()
+        sit_form.addRow("", self._situation_hint)
+        layout.addLayout(sit_form)
+
         self.current_card = CurrentCard(catalog)
         self.waves_card = WavesCard(catalog)
         layout.addWidget(self.current_card)
@@ -485,21 +514,24 @@ class SeaStateDialog(QDialog):
                          waves=self.waves_card.setting(),
                          seed=int(self._seed.value()),
                          timeline=self._timeline,
-                         scenario_file=getattr(self, "_scenario_file", ""))
+                         scenario_file=getattr(self, "_scenario_file", ""),
+                         situation_file=self.situation_file())
 
     def set_choice(self, c: SeaChoice) -> None:
         self.current_card.set_setting(c.current)
         self.waves_card.set_setting(c.waves)
         self._seed.setValue(max(int(c.seed), 1))
         self.set_timeline(c.timeline)
+        self.set_situation(c.situation_file)
 
     def set_timeline(self, tl: SeaTimeline | None) -> None:
         """A plan replaces the two cards (its first segment is what they
         showed); ``None`` gives them back."""
         self._timeline = tl if (tl is not None and tl.segments) else None
         on = self._timeline is not None
-        self.current_card.setEnabled(not on)
-        self.waves_card.setEnabled(not on)
+        sit = bool(self.situation_file()) if hasattr(self, "_situation") else False
+        self.current_card.setEnabled(not on and not sit)
+        self.waves_card.setEnabled(not on and not sit)
         self._clear_btn.setVisible(on)
         if on:
             self._timeline_label.setText(
@@ -515,10 +547,67 @@ class SeaStateDialog(QDialog):
     def timeline(self) -> SeaTimeline | None:
         return self._timeline
 
+    def situation_file(self) -> str:
+        """The chosen sea situation file, or "" (the sea set here)."""
+        data = str(self._situation.currentData() or "")
+        return "" if data == _SITUATION_OTHER else data
+
+    def set_situation(self, path: str) -> None:
+        """Select a situation file ("" = none), adding it when it is not
+        one of the listed files."""
+        idx = self._situation.findData(path or "")
+        if idx < 0:
+            idx = self._add_situation_item(Path(path))
+        self._situation.setCurrentIndex(idx)
+        self._gate_situation()
+
+    def _add_situation_item(self, path: Path) -> int:
+        """Insert a file before "Other file…" (or last); its index."""
+        other = self._situation.findData(_SITUATION_OTHER)
+        idx = other if other >= 0 else self._situation.count()
+        self._situation.insertItem(idx, path.stem, str(path))
+        tip = situation_description(path)
+        self._situation.setItemData(idx, f"{path}\n\n{tip}" if tip else str(path),
+                                    Qt.ItemDataRole.ToolTipRole)
+        return idx
+
+    def _gate_situation(self) -> None:
+        sit = self.situation_file()
+        self._situation_prev = self._situation.currentIndex()
+        self.current_card.setEnabled(not sit and self._timeline is None)
+        self.waves_card.setEnabled(not sit and self._timeline is None)
+        self._plan_btn.setEnabled(not sit)
+        self._clear_btn.setEnabled(not sit)
+        self._situation_hint.setVisible(bool(sit))
+        if sit:
+            self._situation_hint.setText(
+                f"The simulator's situation file {Path(sit).name} replaces the "
+                "sea set below (its wind and disturbance included).")
+
     def ramp_s(self) -> float:
         return float(self._ramp.value())
 
     # ------------------------------------------------------------ slots
+    def _on_situation(self, _index: int) -> None:
+        if self._situation.currentData() == _SITUATION_OTHER:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Sea situation file",
+                str(find_situations_dir(self._cfg.situations_dir) or Path.home()),
+                "Sea schedule (*.yaml *.yml)")
+            self._situation.blockSignals(True)
+            if path and read_schedule(path) is not None:
+                idx = self._situation.findData(path)
+                self._situation.setCurrentIndex(
+                    idx if idx >= 0 else self._add_situation_item(Path(path)))
+            else:
+                if path:
+                    QMessageBox.warning(self, "Not a sea schedule",
+                                        f"{path} is not a sea schedule file "
+                                        "(format: blueboat_sea_schedule/1).")
+                self._situation.setCurrentIndex(self._situation_prev)
+            self._situation.blockSignals(False)
+        self._gate_situation()
+
     def _open_timeline(self) -> None:
         from mcs.gui.dialogs.sea_timeline_dialog import SeaTimelineDialog
         dlg = SeaTimelineDialog(self._catalog, self._cfg, self._timeline,
@@ -532,6 +621,14 @@ class SeaStateDialog(QDialog):
         # schedule format: plain keys have no preset name to pass); a live
         # change sends the same content as a JSON command instead.
         c = self.choice()
+        if c.situation_file:
+            if read_schedule(c.situation_file) is None:
+                QMessageBox.warning(self, "Not a sea schedule",
+                                    f"{c.situation_file} cannot be read as a sea "
+                                    "schedule file.")
+                return
+            self.accept()                  # passed as is: nothing written
+            return
         if not self._live and not c.is_null:
             self._scenario_file = c.write_scenario(self._cfg.schedules_dir)
         self.accept()

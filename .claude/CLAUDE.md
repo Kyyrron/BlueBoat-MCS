@@ -185,7 +185,12 @@ the simulator's rule). Labels and descriptions come from the simulator's install
 `share/blueboat_sss_sim/config/sea_states.yaml` (`SeaCatalog`, never raises; built-in names
 when absent); literature references are not shown. A non-null choice is written to
 `~/.config/blueboat_mcs/sea_states/last_launch.yaml` and passed as `sea_schedule:= sea_seed:=`.
-Saved plans live in the same folder. The SEA STATE box's Status row turns amber
+Saved plans live in the same folder. **Sea situation** (CR-03-3, 2026-11-16): the dialog's
+top row also offers the simulator's `config/sea_situations/*.yaml` (`SeaConfig.situations_dir`,
+"" = installed share, then the checkout) or any schedule file; chosen, it is passed **as is**
+(`SeaChoice.situation_file` → `sea_schedule:=<that file> sea_seed:=`; live, its document as
+`{"schedule": …}`), nothing written, cards and plan greyed — the only way to the wind and
+yaw-moment blocks. "None" (default) = unchanged. The SEA STATE box's Status row turns amber
 "· hull: Gazebo box" when the readback says the URDF box floats the boat.
 
 **Link guardian (real-robot sessions).** An ArduPilot Lua script (superproject
@@ -226,6 +231,13 @@ lines unchanged; Extra args still win). Today: *Ray-cast — live* (first-order 
 bit-identical) and *— fast* (also no diffraction, identical by eye). The simulator also pauses
 Gazebo while a slow ping renders (its `sonar_hold_sim`, on by default), so the hint now says x0.500
 is the fastest setting; the SIM badge's measured factor drops during those pauses.
+
+**Thrust gain (CR-03-3, 2026-11-16).** Launch dialog, Gazebo + Controller: **Thrust gain**
+`[right,left]` (empty = the description's 0.493 / 0.493; FIT nominal `[0.3805,0.6055]`),
+canonicalised by `parse_thrust_gain`, emitted as `thrust_gain:=` by the world branch only, after
+the sonar arguments and before Extra args; an empty-world launch drops it with a message
+(`drop_thrust_gain_without_world`: `Sim_launch.py` declares none). Smoke blocks
+`sea situation ok`, `thrust gain ok`.
 
 ### Frame conventions (the recurring source of bugs)
 - Manual target **world** on the wire; pinger **body**. `master_control` converts the manual

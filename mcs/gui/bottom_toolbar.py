@@ -48,7 +48,11 @@ from mcs.gui import theme
 from mcs.gui.dialogs.launch_dialog import LaunchDialog
 from mcs.gui.widgets import StatusLed
 from mcs.ros.command_center import CommandCenter
-from mcs.ros.launch_manager import LaunchManager, drop_sonar_choice_without_world
+from mcs.ros.launch_manager import (
+    LaunchManager,
+    drop_sonar_choice_without_world,
+    drop_thrust_gain_without_world,
+)
 
 
 class BottomToolbar(QWidget):
@@ -291,6 +295,12 @@ class BottomToolbar(QWidget):
                     "The ray-cast sonar needs a personalized world: the empty "
                     "Gazebo world has no sonar. This run starts at real speed "
                     "(x1, no slow-down).")
+            if drop_thrust_gain_without_world(params):
+                QMessageBox.information(
+                    self, "No thrust gain in the empty world",
+                    "The thrust gain is an argument of the personalized-world "
+                    "launch only (the empty world's Sim_launch.py has none). "
+                    "This run uses the robot description's gains.")
         if self._launcher.start(params):
             self.mission_launched.emit(params)
 

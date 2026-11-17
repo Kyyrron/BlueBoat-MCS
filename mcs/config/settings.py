@@ -328,6 +328,10 @@ class SeaConfig:
     companion_launch_file: str = "sea_state_launch.py"
     stock_world_name: str = "ocean"
     ramp_s: float = 20.0          # live changes ramp over this many seconds
+    # The simulator's sea situation files (CR-03-3): "" = auto-locate the
+    # installed share/blueboat_sss_sim/config/sea_situations (then the
+    # superproject checkout). Offered by the sea-state dialog.
+    situations_dir: str = ""
 
 
 @dataclass
