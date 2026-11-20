@@ -1,6 +1,6 @@
 # BlueBoat Mission Control Station
 
-v1.0 - September 14th - 2026
+v1.1 - November 20th - 2026
 
 Operator ground station for autonomous side-scan-sonar surveys with a
 BlueRobotics **BlueBoat** — an unmanned surface vessel (USV) for shallow-water
