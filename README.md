@@ -1,168 +1,189 @@
-# BlueBoat Mission Control Station
+# BlueBoat Mission Control Station (MCS)
 
-v1.1 - November 20th - 2026
+Version 1.1
 
-Operator ground station for autonomous side-scan-sonar surveys with a
-BlueRobotics **BlueBoat** — an unmanned surface vessel (USV) for shallow-water
-survey work ([bluerobotics.com](https://bluerobotics.com/store/boat/blueboat/)).
+The MCS is the operator's desktop app for the BlueRobotics
+[BlueBoat](https://bluerobotics.com/store/boat/blueboat/) surveying with side-scan sonar.
+It launches, watches and stops missions on the real boat or in Gazebo. It shows the boat
+and its path on a north-up satellite map, with live telemetry. It also holds the
+**Survey Pattern Designer**, where you draw survey paths and save them as trajectory files.
 
-The station runs on the operator laptop, like every other node of the project;
-the boat carries only its hardware and its own firmware, reached through the
-BlueBoat Base Station WiFi. It launches and supervises missions, draws the boat and its mission on a north-up satellite map,
-plots live telemetry, and carries the emergency-stop and safe-shutdown sequences.
-It performs **no control computation**: every number on screen comes from a ROS 2
-topic published by the control stack (`BlueBoat-Control`). It also contains the
-**Survey Pattern Designer**, an editor for drawing survey paths and exporting them
-as trajectory files the control stack follows.
+The station does **no control computation**. Every number it shows comes from a ROS 2
+topic of the control stack (`BlueBoat-Control`). If a value looks wrong, check the node
+that publishes it first.
 
-Part of the [BlueBoat-SideScanSonar](https://github.com/Kyyrron/BlueBoat-SideScanSonar)
-project.
+## Where it fits
 
----
+```
+Operator laptop (~/ros2_ws, runs ALL project software)
+  MCS  ──ros2 launch──▶  BlueBoat-Control (or BlueBoat-SSS-Sim for Gazebo worlds)
+   ▲                        │
+   └──── ROS 2 topics ◀─────┘ ◀── MAVROS ◀── WiFi (BlueBoat Base Station) ◀── boat
+```
 
-## Dependencies
+The boat carries only its hardware and its own firmware (ArduPilot / BlueOS).
+Nothing of this project runs on the boat.
+
+## Requirements
 
 | Needed | Why |
 |---|---|
-| Ubuntu 22.04 / 24.04, Python ≥ 3.10 | the operator laptop (24.04)|
-| [ROS 2](https://docs.ros.org/en/jazzy/Installation.html) (Jazzy on the reference machine) | `rclpy`, `ros2 launch` |
-| [BlueBoat-Control](https://github.com/Kyyrron/BlueBoat-Control) | `blueboat_control` (the launch files and nodes the station drives) and `blueboat_interfaces` (the `/path_request` service type) |
-| [mavros](https://github.com/mavlink/mavros/blob/ros2/docs/installation.md#binary-package-deb) | `mavros_msgs`, and the MAVLink link to the boat's ArduPilot |
+| Ubuntu 24.04, Python 3.10 or newer | the operator laptop |
+| [ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation.html) | `rclpy`, `ros2 launch` |
+| `BlueBoat-Control` (built in `~/ros2_ws`) | the launch files and nodes the station drives, and `blueboat_interfaces` |
+| [MAVROS](https://github.com/mavlink/mavros/blob/ros2/docs/installation.md#binary-package-deb) | `mavros_msgs` and the link to the boat's autopilot |
 | PySide6, numpy, scipy, PyYAML | `requirements.txt` |
-| Network route to the boat (the BlueBoat Base Station WiFi); internet for satellite tiles | tiles are optional — the map works without them |
+| WiFi route to the boat; internet for satellite tiles | tiles are optional, the map works without them |
+| `BlueBoat-SSS-Sim` (optional) | simulated missions in generated Gazebo worlds, with sonar and sea state |
 
-Optional, for simulated missions in personalized Gazebo worlds:
-[BlueBoat-SSS-Sim](https://github.com/Kyyrron/BlueBoat-SSS-Sim).
+Missing pieces disable features instead of crashing: without `rclpy` the app starts as
+GUI only.
 
-Missing pieces degrade rather than crash: without `rclpy` the app starts
-GUI-only; without `mavros_msgs` or `blueboat_interfaces` the features that need
-them disable themselves.
+## Install
 
-## Installation
+The MCS is plain Python, not a colcon package. It ships inside the superproject.
 
-1. Install ROS 2 and mavros, and create the workspace + src folder `~/ros2_ws/src` — the project's only
-   workspace; every node runs from it on this laptop.
+```bash
+# 1. Clone the superproject with its submodules into the workspace, then build
+cd ~/ros2_ws/src
+git clone --recurse-submodules https://github.com/Kyyrron/BlueBoat-SideScanSonar.git
+cd ~/ros2_ws && colcon build
 
-2. Clone the superproject into it, with submodules, and build:
+# 2. Source the workspace (and the venv) - every time, before starting the station
+cd ~/ros2_ws && source env.sh        # or: source install/setup.bash
 
-   ```bash
-   cd ~/ros2_ws/src
-   git clone --recurse-submodules https://github.com/Kyyrron/BlueBoat-SideScanSonar.git
-   cd ~/ros2_ws && colcon build
-   ```
+# 3. Python dependencies, once
+cd ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-MCS
+pip install -r requirements.txt
+```
 
-3. Source the workspace **before** starting the station — that is what puts
-   `rclpy` and `ros2 launch` on the path. Create also a Python virtual environment (venv). 
-   
-   Tips: create this file as `~/ros2_ws/env.sh`
-   ```bash
-    #!/usr/bin/env bash
-    source .venv/bin/activate
-    source install/setup.bash
-   ```
-   So that you can do this 
-   ```bash
-   cd ~/ros2_ws && source env.sh          # or: source install/setup.bash otherwise
-   ```
-   It will source both your ros2 workspace _and_ the Python venv (when named `.venv`). 
+`~/ros2_ws/env.sh` is a small helper you create once, sourced from `~/ros2_ws`:
 
-4. Install the Python dependencies into that environment, once:
+```bash
+#!/usr/bin/env bash
+source .venv/bin/activate
+source install/setup.bash
+```
 
-   ```bash
-   cd ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-MCS
-   pip install -r requirements.txt
-   ```
+Notes:
+- `rclpy` always comes from ROS, never from pip.
+- Inside the workspace venv, do not pass `--user` to pip. A venv you make yourself needs
+  `python3 -m venv --system-site-packages`.
 
-   `rclpy` always comes from ROS, never from pip. Inside the workspace venv do
-   not pass `--user`; against a bare system Python use `pip install --user`. A
-   hand-made venv must be created with `python3 -m venv --system-site-packages`.
+## Run
 
-## Starting the MCS App
+```bash
+cd ~/ros2_ws && source env.sh
+cd src/BlueBoat-SideScanSonar/BlueBoat-MCS
+python3 run.py                       # options: --config <file.json>  --verbose
+```
 
-When in `~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-MCS`, run:
+The status bar should read **ROS: connected**. `bash build.sh` does all of it in one go:
+`colcon build`, `source env.sh`, then `python3 run.py`.
 
-   ```bash
-   python3 run.py
-   ```
+Check the install without a boat:
 
-   The status bar should read **ROS: connected**. Verify without a boat:
-   `QT_QPA_PLATFORM=offscreen python3 smoke_test.py` must print
-   `SMOKE TEST PASSED`.
+```bash
+QT_QPA_PLATFORM=offscreen python3 smoke_test.py    # must end with SMOKE TEST PASSED
+```
 
-__`build.sh` does ros2 colcon build -> sources env.sh -> starts MCS App in one go.__
+## Main features
 
-## Features
+- **Launch Mission** in one of three ways: *Real robot*, *Gazebo simulation* (empty
+  world, or a generated world from `BlueBoat-SSS-Sim`), or **From a ros2bag**, which
+  replays a recorded real run in Gazebo.
+- **Run sessions on the real boat.** You connect once. The boat goes into override and
+  waits. **START RUN** / **STOP RUN** start and stop each logged run.
+  **Update Mission** picks the next run's path and controller.
+- **Map**: satellite tiles, boat at its true heading, trail, mission path with its
+  start **S**, USBL pinger, the controller's target. Pan, zoom, click to read GPS.
+- **Manual Target**: click a point on the map and the boat goes there.
+  **Continue Original Mission** resumes the path.
+- **Arrow control**: drive the boat with the arrow keys (ARROW CONTROL box on the map).
+- **Live panels**: robot, pinger and target state, battery, ROS diagnostics per topic,
+  distance plot, mission timeline (freeze the view while recording continues),
+  statistics, launch console with filters.
+- **Link guardian box** (real robot): shows and controls the autopilot script that brings
+  the boat home when the laptop goes silent. It is ON by default in every real session.
+- **Simulation options**: sea state (current, waves, timed plans), **Sonar model**
+  (Geometric or Ray-cast) and **Slow-down** for the slow ray-cast sonar.
+- **Survey Pattern Designer** (**Create Survey Pattern**): draw or generate patterns
+  (lawnmower, circle, rectangle, square, figure eight, spiral, expanding square,
+  station keeping, polygon), anchor them to GPS, export them.
 
-* Launch, supervise and stop ROS 2 missions — real boat, Gazebo simulation, or a
-  personalized Gazebo world with simulated sonar and sea state (when [BlueBoat-SSS-Sim](https://github.com/Kyyrron/BlueBoat-SSS-Sim) is installed).
-* North-up satellite map with the boat at its true heading, its trail, the
-  mission path, the USBL pinger and the controller's current target.
-* Manual targeting by clicking the map, distance measurement, click inspector
-  with GPS read-out.
-* Live panels: robot / pinger / target state, battery, per-topic ROS diagnostics
-  with rate and staleness LEDs.
-* Distance plot, mission timeline (freeze the display while recording
-  continues), windowed mission statistics, filterable launch console.
-* Three separate stop actions: E-STOP, E-STOP + Stop Override, Stop Mission.
-* Replay of a recorded real-robot run in Gazebo ("From a ros2bag"): the boat moves
-  exactly as it did in the water, with pause and playback rate.
-* Survey Pattern Designer: draw or generate survey patterns, anchor them to real
-  GPS coordinates, export them as trajectory files the control stack follows.
+## Stop buttons and safe shutdown
 
-## Usage
+| Button | What it does | Ends the launch? |
+|---|---|---|
+| **E-STOP** | zeroes thrust, closes the motor gate, disarms, latches. Stays in override | no |
+| **E-STOP + Stop Override** | the same, then hands the servos back to RC / QGroundControl | no |
+| **Release E-STOP** | clears the latch (real session launched with motors enabled) | no |
+| **Stop Mission** (reads **Turn Off Connection** in a real session) | safe shutdown, then stops every node | yes |
 
-Start the station, press **Launch Mission**, configure the run, and watch it.
-The window has four regions:
+**Safe shutdown.** Stop Mission and closing the app first publish `default` on
+`/blueboat/input_str` and wait until the boat confirms it left override. Only then are
+the nodes stopped. If no confirmation comes, the station asks you before stopping
+anything. Never kill a real-robot launch from the terminal instead: the motors can stay
+in override. To do it by hand:
 
-| Region | What it holds |
+```bash
+ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: default"
+```
+
+## Files and configuration
+
+| Path | Content |
 |---|---|
-| **Left panel** | map layer checkboxes; robot / pinger / target read-outs; ROS diagnostics, one row per topic |
-| **Centre — the map** | satellite imagery, boat glyph, trails, mission path, targets. Drag to pan, wheel to zoom, click to inspect a point |
-| **Right panel** | zoom and centre buttons, robot↔target distance plot, mission timeline, statistics, launch console |
-| **Bottom toolbar** | Launch Mission · Stop Mission · E-STOP · E-STOP + Stop Override · Default/Override toggle · Manual Target · Measure · Create Survey Pattern |
+| `~/.config/blueboat_mcs/config.json` | optional settings override (JSON). Every topic name, threshold and folder is in `mcs/config/settings.py`; put only the keys you change, grouped by section |
+| `~/.config/blueboat_mcs/trajectories/` | designer paths: `<name>.yaml` (what the boat follows) and `<name>.meta.yaml` (editor data) |
+| `…/trajectories/.deployed/`, `…/trajectories/.session/run.yaml` | written by the station at each launch / run. Never edit by hand |
+| `~/.config/blueboat_mcs/sea_states/` | saved sea-state plans and the last launch's sea choice |
+| `~/worlds/<path>/<world>/` | generated Gazebo worlds (made with the SSS-Sim World Builder) |
+| `~/ros2_ws/data/Robot_data/` | real-robot run logs and their ros2bags (used by the replay) |
 
-The buttons that matter:
+## Good to know
 
-* **Launch Mission** — a dialog for controller, trajectory, pinger and motors
-  (motor enable is always re-confirmed). Simulation runs add a world dialog and a
-  sea-state dialog. With a world, the **Sonar model** row picks Geometric or Ray-cast; the ray-cast
-  slows the whole simulation by the **Slow-down** factor (see `docs/04_user_guide.md`). In *Gazebo simulation*, **Source ▸ From a ros2bag** replays a
-  recorded real-robot run instead: pick its `Robot_data` folder, and the simulated
-  boat moves exactly as it did in the water (the REPLAY box pauses it or changes
-  the speed). Every real-robot run records that bag automatically, next to its CSV.
-* **Manual Target** — press it, then click the map once; that point is published
-  as the boat's target and the button disarms itself. **Continue Original
-  Mission** hands control back to the mission.
-* **E-STOP** — zeroes the thrust and latches it. It does *not* leave override and
-  does *not* end the mission. Clear it by publishing `enable`:
-  `ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: enable"`.
-* **E-STOP + Stop Override** — the same stop, then hands the servo mapping back
-  to the RC transmitter / QGroundControl. Still does not end the mission.
-* **Stop Mission** — the only button that terminates the launch, and only after
-  the boat has confirmed it left override.
-* **Create Survey Pattern** — opens the Survey Pattern Designer.
+- **On real water the map stays empty for about a second**, until GPS fixes anchor the
+  frame. No driving is needed. Map clicks are refused until then.
+- **`[0, 0]` on `/blueboat/manual_target` means "resume the mission"**, not a position.
+  A click exactly on the origin is moved by 1 mm.
+- **A stale build breaks things silently.** After pulling `BlueBoat-Control`, run
+  `colcon build` again in `~/ros2_ws`.
+- **Simulated results for the thesis** use Sonar model *Ray-cast — harbour, fast*.
+  Geometric is the dialog default but is a legacy sonar. The allowed settings are in
+  `../SIM_VALIDITY_CONDITIONS.md`.
+- Control-stack changes belong in `BlueBoat-Control`, never in this repository.
 
-Details: [`docs/04_user_guide.md`](docs/04_user_guide.md) for every screen and
-control, [`docs/05_trajectory_format.md`](docs/05_trajectory_format.md) for the
-trajectory file format. Working on the code: `.claude/CLAUDE.md` is the
-authoritative reference (architecture, ROS contract, non-negotiables), with
-[`docs/03_ros_integration.md`](docs/03_ros_integration.md) and
-[`docs/GPS_MAP_ARCHITECTURE.md`](docs/GPS_MAP_ARCHITECTURE.md) alongside it.
+## Directory layout
 
-## Worth knowing
+```
+BlueBoat-MCS/
+├── run.py              start the app
+├── build.sh            colcon build + source env.sh + run.py
+├── smoke_test.py       offline regression test
+├── requirements.txt
+├── docs/               user and developer documentation
+└── mcs/
+    ├── main.py         app bootstrap (command-line options)
+    ├── config/         settings.py: all topics, thresholds, paths
+    ├── core/           logic without widgets or ROS (geo, sea state, replay, ...)
+    ├── models/         the data store the GUI reads
+    ├── ros/            ROS thread, topic bridge, launch manager, commands and shutdown
+    ├── gui/            main window, panels, map, plots, dialogs
+    └── designer/       Survey Pattern Designer
+```
 
-* **On real water the map is empty for the first few seconds.** Nothing is drawn
-  until GPS anchors the frame — an empty map is honest, a wrongly-placed one is
-  not. It resolves in about a second, with no driving needed. Manual clicks are
-  refused until then.
-* **`[0, 0]` on `/blueboat/manual_target` is a protocol sentinel** meaning
-  "resume the mission", so a click exactly on the world origin is nudged by 1 mm.
-  Never publish it as a position.
-* **The station never compensates for the boat.** If a number looks wrong, the
-  producing node is the first suspect. A stale `BlueBoat-Control` build in
-  `~/ros2_ws/install` silently breaks the map and trajectory following.
-* **Control-stack changes belong in `BlueBoat-Control`**, never here. Nothing is
-  copied out of this repo into another package.
+## Documentation
+
+| Read | For |
+|---|---|
+| [`docs/04_user_guide.md`](docs/04_user_guide.md) | every screen, button and dialog |
+| [`docs/05_trajectory_format.md`](docs/05_trajectory_format.md) | the trajectory file format and GPS deployment |
+| [`docs/03_ros_integration.md`](docs/03_ros_integration.md) | every topic, service and launch command; the shutdown sequence |
+| [`docs/GPS_MAP_ARCHITECTURE.md`](docs/GPS_MAP_ARCHITECTURE.md) | how the map places things from GPS |
+
+Part of the [BlueBoat-SideScanSonar](https://github.com/Kyyrron/BlueBoat-SideScanSonar)
+project.
 
 ---
 
