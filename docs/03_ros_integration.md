@@ -237,7 +237,7 @@ ros2 launch blueboat_sss_sim full_mission_launch.py \
 ```
 
 The bracketed arguments appear only when chosen: a sea state, the dialog's **Sonar model:
-Ray-cast** with its **Slow-down** factor, and the **Thrust gain** (CR-03-3, 2026-11-16: the
+Ray-cast** with its **Slow-down** factor, and the **Thrust gain** (since 2026-11-16: the
 plant's applied-thrust gains, e.g. the FIT nominal `[0.3805,0.6055]`; empty = the robot
 description's; `Sim_launch.py` declares no `thrust_gain`, so an empty-world launch drops it with
 a message). The Extra args come last, for example `sonar_config:=<ray-cast profile>`.
@@ -273,7 +273,7 @@ written as the simulator's schedule document
 which the simulator resolves) and rides the launch as
 `sea_schedule:=<file> sea_seed:=<n>` — in a personalized world on
 `full_mission_launch.py`, placed before the operator's extra arguments.
-**Sea situation** (CR-03-3, 2026-11-16): the dialog's top row can instead
+**Sea situation** (since 2026-11-16): the dialog's top row can instead
 name one of the simulator's `config/sea_situations/*.yaml` (`field_matched`,
 `harbour_chop`, …, or any schedule file); it is then passed as is,
 `sea_schedule:=<that file> sea_seed:=<n>`, nothing written, its `wind` and
@@ -427,10 +427,8 @@ without reading `CLAUDE.md` §6 first.**
 trajectory the boat locks into a circle near the start while the reference runs
 ahead. The `fsin` reference is a chain of near-closed ~2 m loops (364.75°
 heading swing per half-cycle) and the MPC cost/governor settles into a
-self-orbit once displaced. Mechanism and remedies:
-§0.3 ("MPC on `fsin` — orbit limit cycle") of `BlueBoat-Control`'s pre-v1.0
-`TODO.md`, deleted at the freeze — `git show d64ac71^:.claude/TODO.md` in that
-submodule. The map is displaying the truth — nothing to compensate here.
+self-orbit once displaced (a known limit of the MPC on that shape, recorded in
+`BlueBoat-Control`'s history). The map is displaying the truth — nothing to compensate here.
 
 **Cosmetic.** `robot_interface` publishes monitoring on the *relative*
 `blueboat/monitoring_data` while `master_control` uses the global
@@ -511,8 +509,7 @@ Nothing is copied from this repo. Both files are committed in the
   the file exists the branch returns a zero pose, which is the station-keeping
   hold that makes deferred GPS deployment possible.
 
-To change either one: edit it in the `BlueBoat-Control` submodule, commit
-there, and `colcon build` in `~/ros2_ws`. No launch-file modification is
+To change either one: edit it in the `BlueBoat-Control` submodule, then rebuild with `colcon build` in `~/ros2_ws`. No launch-file modification is
 needed — the YAML path rides inside the existing `trajectory` argument
 (`trajectory:=from_yaml:/abs/path.yaml`), which both `BlueBoat_launch.py` and
 `Sim_launch.py` already forward to the node.
