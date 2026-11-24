@@ -4,6 +4,8 @@ Restructured as a vertical splitter so monitoring and the launch console
 share the column without crowding each other:
 
 * **Top part** (scrollable stack)
+  * **Layers** — visibility checkboxes for every map layer, directly above
+    the map tools they go with.
   * **Map tools** — Zoom +, Zoom −, and *Center Robot* (a one-shot recenter;
     the camera stays completely free afterwards — never a follow mode).
   * **Live distance plot** — robot ↔ current target distance vs time.
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -32,10 +35,22 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import format_clock
 from mcs.gui.console import LaunchConsole
 from mcs.gui.plot.distance_plot import DistancePlot
 from mcs.gui.widgets import CollapsibleSection, RangeSlider
 from mcs.models.store import DataStore, TargetMode
+
+#: (key, label, visible by default) — keys as MapView.set_layer_visible knows them.
+_LAYERS: list[tuple[str, str, bool]] = [
+    ("satellite", "Satellite map layer", False),
+    ("robot_track", "Robot trajectory", True),
+    ("mission_path", "Published mission path", True),
+    ("pinger", "USBL pinger position", True),
+    ("pinger_track", "USBL pinger trajectory", True),
+    ("target_line", "Robot → target line", True),
+    ("grid", "World grid", True),
+]
 
 
 class RightPanel(QWidget):
@@ -43,6 +58,7 @@ class RightPanel(QWidget):
 
     #: rel_t0, rel_t1, live
     time_window_changed = Signal(float, float, bool)
+    layer_toggled = Signal(str, bool)
     zoom_in_requested = Signal()
     zoom_out_requested = Signal()
     center_robot_requested = Signal()
@@ -53,8 +69,6 @@ class RightPanel(QWidget):
         super().__init__(parent)
         self._cfg = cfg
         self._store = store
-        # Freely resizable via the splitter: a small minimum only, no
-        # maximum (a max-width cap prevented widening the panel at will).
         self.setMinimumWidth(260)
 
         outer = QVBoxLayout(self)
@@ -71,6 +85,21 @@ class RightPanel(QWidget):
         layout = QVBoxLayout(top)
         layout.setContentsMargins(0, 0, 0, 4)
         layout.setSpacing(6)
+
+        # ---- Layers -----------------------------------------------------------
+        sec_layers = CollapsibleSection("LAYERS")
+        self._layer_boxes: dict[str, QCheckBox] = {}
+        for key, label, default in _LAYERS:
+            box = QCheckBox(label)
+            box.setChecked(default)
+            box.toggled.connect(lambda on, k=key: self.layer_toggled.emit(k, on))
+            self._layer_boxes[key] = box
+            sec_layers.add_widget(box)
+        self._layer_boxes["satellite"].setEnabled(False)
+        self._layer_boxes["satellite"].setToolTip(
+            "Enabled once the odom ↔ GPS georeference is anchored "
+            "(a few GPS fixes, real or simulated — no motion needed).")
+        layout.addWidget(sec_layers)
 
         # ---- Map tools ------------------------------------------------------
         sec_tools = CollapsibleSection("MAP TOOLS")
@@ -137,6 +166,11 @@ class RightPanel(QWidget):
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([560, 320])
 
+    def set_satellite_available(self, available: bool) -> None:
+        box = self._layer_boxes["satellite"]
+        if box.isEnabled() != available:
+            box.setEnabled(available)
+
     # ------------------------------------------------------------------ ticks
     def refresh(self) -> None:
         duration = self._store.recorded_duration()
@@ -159,8 +193,8 @@ class RightPanel(QWidget):
         self._emit_window(low, high, self.slider.high_at_end())
 
     def _emit_window(self, low: float, high: float, live: bool) -> None:
-        end = "live" if live else _fmt_hms(high)
-        self._window_label.setText(f"{_fmt_hms(low)} → {end}")
+        end = "live" if live else format_clock(high)
+        self._window_label.setText(f"{format_clock(low)} → {end}")
         self._live_button.setEnabled(not live)
         self.time_window_changed.emit(low, high, live)
 
@@ -169,10 +203,3 @@ class RightPanel(QWidget):
         duration = max(self._store.recorded_duration(), 10.0)
         self.slider.set_maximum(duration, keep_high_at_end=False)
         self.slider.set_values(low, duration)
-
-
-def _fmt_hms(seconds: float) -> str:
-    seconds = int(max(0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"

@@ -22,6 +22,13 @@ from PySide6.QtWidgets import (
 
 from mcs.gui import theme
 
+
+def elide_middle(text: str, max_chars: int) -> str:
+    """*text* shortened to *max_chars* with an ellipsis in the middle."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars // 2 - 1] + "…" + text[-(max_chars // 2):]
+
 _LED_COLORS = {
     "ok": QColor(theme.OK),
     "warn": QColor(theme.WARN),

@@ -212,8 +212,9 @@ Regression-test the round trip with a **non-trivial `t`** (ours asserts
    centimetre-accurate at harbour scale but degrades over ~10 km spans or
    near the poles; switch to a proper local projection (UTM, ENU via
    pyproj) if your operating area is larger.
-9. **Stale peers.** If the vehicle-side frame fix and the GUI fix ship
-   together, a vehicle running the old build silently reintroduces the
-   hybrid frame — there is no version handshake on a ROS topic. Rebuild and
-   redeploy the vehicle workspace, and verify heading behaviour on the
-   water before trusting the map.
+9. **Stale peers.** If the frame fix in the odometry producer and the GUI
+   fix ship together, a stale installed build of the producer silently
+   reintroduces the hybrid frame — there is no version handshake on a ROS
+   topic. Rebuild the producer's install (in this project: `colcon build` in
+   `~/ros2_ws`), and verify heading behaviour on the water before trusting
+   the map.

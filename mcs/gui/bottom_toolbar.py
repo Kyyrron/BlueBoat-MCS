@@ -4,24 +4,32 @@ Buttons (left → right):
 
 * **Launch Mission** — opens the configuration dialog, then starts
   ``ros2 launch`` through the :class:`~mcs.ros.launch_manager.LaunchManager`.
+  In a connected real-robot **run session** it reads **Update Mission** and
+  opens the small next-run window instead (between runs only).
 * **Stop Mission** — graceful SIGINT-first shutdown; the station stays open.
-  The ONLY button here that ends the mission.
-* **E-STOP** — publishes ``stop``: robot-side that zeroes the thrust, closes
+  The ONLY button here that ends the mission. In a real-robot run session it
+  reads **Turn Off Connection** (an active run is stopped first).
+* **E-STOP** — publishes ``stop``: ``robot_interface`` zeroes the thrust, closes
   the motor gate, disarms and latches. Leaves the parameter mode alone and
   leaves every node running.  Never disabled while ROS is up.
 * **E-STOP + Stop Override** — the same ``stop``, then ``default`` through the
   confirmation sequence, handing the servo mapping back. Also leaves the nodes
-  running: it used to terminate them, which made "give the mapping back" and
-  "end the mission" impossible to ask for separately.
+  running, so "give the mapping back" and "end the mission" stay separate.
+* **Release E-STOP** — appears only while a run session's E-STOP is latched
+  and the session was launched with motors enabled; publishes ``enable``.
 * **Publish Default/Override Control Mode** — alternates the two commands.
 * **Manual Target** / **Continue Original Mission** — Manual Target arms the
   next map click and publishes nothing by itself; only Continue Original
-  Mission publishes the ``[0.0, 0.0]`` resume sentinel (CLAUDE.md N2).
+  Mission publishes the ``[0.0, 0.0]`` resume sentinel (CLAUDE.md N2). Between
+  the runs of a session there is no mission to continue: the same button
+  reads **Release Target** (the boat then holds zero thrust).
 * **Measure** — toggles the distance tool.
 * A one-line launch console + launch state LED.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -40,7 +48,11 @@ from mcs.gui import theme
 from mcs.gui.dialogs.launch_dialog import LaunchDialog
 from mcs.gui.widgets import StatusLed
 from mcs.ros.command_center import CommandCenter
-from mcs.ros.launch_manager import LaunchManager
+from mcs.ros.launch_manager import (
+    LaunchManager,
+    drop_sonar_choice_without_world,
+    drop_thrust_gain_without_world,
+)
 
 
 class BottomToolbar(QWidget):
@@ -51,7 +63,7 @@ class BottomToolbar(QWidget):
     continue_mission_clicked = Signal()
     create_pattern_clicked = Signal()
     mission_launched = Signal(object)   # LaunchParameters
-    mission_stopped = Signal()
+    update_mission_requested = Signal()  # run session: open the next-run window
 
     def __init__(self, cfg: AppConfig, bus: SignalBus, launcher: LaunchManager,
                  commands: CommandCenter, parent: QWidget | None = None) -> None:
@@ -60,6 +72,10 @@ class BottomToolbar(QWidget):
         self._bus = bus
         self._launcher = launcher
         self._commands = commands
+        self._session_active = False      # a real-robot run session is launched
+        # Link guardian: consulted before Turn Off Connection; it calls the
+        # continuation when the stop may go ahead (MainWindow sets it).
+        self._stop_guard = None
 
         outer = QVBoxLayout(self)
         self.setSizePolicy(
@@ -117,6 +133,22 @@ class BottomToolbar(QWidget):
         self.estop_button.clicked.connect(self._commands.emergency_stop)
         row.addWidget(self.estop_button)
 
+        # Shown only while a run session's E-STOP is latched (see
+        # set_session_ui); its footprint is reserved meanwhile so the toolbar
+        # never reflows when it appears.
+        self.release_estop_button = QPushButton("Release E-STOP")
+        self.release_estop_button.setObjectName("releaseEstopButton")
+        self.release_estop_button.setToolTip(
+            "Publish 'enable': clears robot_interface's E-STOP latch and turns "
+            "the motor gate back ON. After E-STOP + Stop Override, also publish "
+            "'override' with the mode button to take the thrusters back.")
+        self.release_estop_button.clicked.connect(self._commands.release_estop)
+        self.release_estop_button.setVisible(False)
+        policy = self.release_estop_button.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.release_estop_button.setSizePolicy(policy)
+        row.addWidget(self.release_estop_button)
+
         self.mode_button = QPushButton()
         self.mode_button.clicked.connect(self._on_mode_toggle)
         row.addWidget(self.mode_button)
@@ -145,9 +177,8 @@ class BottomToolbar(QWidget):
             "Publish the [0.0, 0.0] manual target: master_control resumes "
             "the original mission. This button does nothing else.")
         self.continue_button.setVisible(False)
-        # Reserve the button's footprint while hidden: its appearance after
-        # a manual target used to reflow the toolbar and nudge the window /
-        # panel geometry ("the window becomes weird").
+        # Reserve the button's footprint while hidden, so its appearance
+        # after a manual target never reflows the toolbar and the window.
         policy = self.continue_button.sizePolicy()
         policy.setRetainSizeWhenHidden(True)
         self.continue_button.setSizePolicy(policy)
@@ -175,7 +206,16 @@ class BottomToolbar(QWidget):
 
         row.addStretch(1)
 
-        self._estop_label = QLabel("")
+        # Simulation speed (2026-11-07): the requested and measured
+        # real-time factor of a simulation launch, from the station clock.
+        self._sim_badge = QLabel("")
+        self._sim_badge.setVisible(False)
+        self._sim_badge.setToolTip(
+            "Simulation speed: the Gazebo real-time factor requested at launch "
+            "and the one measured on /clock. Every station clock (rates, ages, "
+            "elapsed time, plots) runs on sim time in a simulation launch.")
+        row.addWidget(self._sim_badge)
+
         self._estop_label = QLabel("")
         self._estop_label.setSizePolicy(
             QSizePolicy.Policy.Ignored,
@@ -202,6 +242,7 @@ class BottomToolbar(QWidget):
             self.stop_button,
             self.estop_button,
             self.estop_kill_button,
+            self.release_estop_button,
             self.mode_button,
             self.manual_button,
             self.continue_button,
@@ -223,66 +264,144 @@ class BottomToolbar(QWidget):
 
     # ================================================================ actions
     def _on_launch(self) -> None:
+        if self._session_active:
+            # The button reads "Update Mission" while a session is connected.
+            self.update_mission_requested.emit()
+            return
         dialog = LaunchDialog(self._cfg, self._launcher.last_parameters, self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         params = dialog.parameters()
-        if params.enable_motors:
-            confirm = QMessageBox.warning(
-                self, "Motors enabled",
-                "Motors are ENABLED for this launch — the boat will actually "
-                "move.\n\nProceed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if confirm != QMessageBox.StandardButton.Yes:
+        if params.enable_motors and not self._confirm_motors():
+            return
+        # The follow-up choices (world, sea state) are asked here, not in
+        # LaunchDialog.parameters(), which must stay non-interactive for the
+        # headless smoke test. Cancelling any of them aborts the launch.
+        if params.replay_bag:
+            # No sea-state dialog: the recording already holds the real sea,
+            # and the replayed boat feels no force.
+            if not self._choose_replay_world(params):
                 return
-        # Simulated GPS-anchored mission: offer the personalized Gazebo
-        # worlds (BlueBoat-SSS-Sim folders) whose limits contain the path.
-        # Kept out of LaunchDialog.parameters(), which must stay
-        # non-interactive for the headless smoke test. In world mode the
-        # simulator's mavros shim owns the GPS feed (the station's SimGps
-        # stays disarmed — see MainWindow._on_mission_launched) and
-        # full_mission_launch.py declares no spawn_yaw.
-        if params.simulation and params.gps_simulated \
-                and params.gps_anchored_source:
-            from pathlib import Path
-
-            from mcs.core.worlds import eligible_worlds  # lazy: yaml/numpy
-            worlds = eligible_worlds(Path(self._cfg.launch.worlds_root),
-                                     Path(params.gps_anchored_source))
-            if worlds:
-                from mcs.gui.dialogs.world_dialog import WorldChoiceDialog
-                wdlg = WorldChoiceDialog(worlds, self)
-                if wdlg.exec() != wdlg.DialogCode.Accepted:
-                    return                        # Cancel aborts the launch
-                if wdlg.selected_world_dir:
-                    params.world_dir = wdlg.selected_world_dir
-                    params.spawn_yaw_rad = None
-        # Every Gazebo launch (empty world or personalized world) then
-        # chooses the sea state the boat will feel. Cancel aborts.
-        if params.simulation:
-            from mcs.core.sea import SeaCatalog, find_presets_file
-            from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
-            catalog = SeaCatalog.load(
-                find_presets_file(self._cfg.sea.presets_file))
-            last = self._launcher.last_parameters
-            sdlg = SeaStateDialog(catalog, self._cfg.sea,
-                                  last.sea if last is not None else None,
-                                  parent=self)
-            if sdlg.exec() != sdlg.DialogCode.Accepted:
+        else:
+            if (params.simulation and params.gps_simulated
+                    and params.gps_anchored_source
+                    and not self._choose_mission_world(params)):
                 return
-            params.sea = sdlg.choice()
+            if params.simulation and not self._choose_sea(params):
+                return
+            if drop_sonar_choice_without_world(params):
+                QMessageBox.information(
+                    self, "No sonar in the empty world",
+                    "The ray-cast sonar needs a personalized world: the empty "
+                    "Gazebo world has no sonar. This run starts at real speed "
+                    "(x1, no slow-down).")
+            if drop_thrust_gain_without_world(params):
+                QMessageBox.information(
+                    self, "No thrust gain in the empty world",
+                    "The thrust gain is an argument of the personalized-world "
+                    "launch only (the empty world's Sim_launch.py has none). "
+                    "This run uses the robot description's gains.")
         if self._launcher.start(params):
             self.mission_launched.emit(params)
 
+    def _confirm_motors(self) -> bool:
+        confirm = QMessageBox.warning(
+            self, "Motors enabled",
+            "Motors are ENABLED for this launch — the boat will actually "
+            "move.\n\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return confirm == QMessageBox.StandardButton.Yes
+
+    def _choose_replay_world(self, params) -> bool:
+        """Replay of a recorded run: the personalized worlds its GPS track
+        touches (any world when placed on the world's origin), or the empty
+        world. False = cancelled."""
+        from mcs.core.replay import bag_gps_track
+        from mcs.core.worlds import eligible_worlds_for_track, list_worlds
+        root = Path(self._cfg.launch.worlds_root)
+        if params.replay_placement == "origin":
+            worlds = list_worlds(root)
+            intro = (f"Replay the run on the origin of one of {len(worlds)} "
+                     "personalized world(s) (its launch point on the world's "
+                     "(0, 0); the GPS shown stays the recorded one)")
+        else:
+            track = bag_gps_track(params.replay_bag,
+                                  self._cfg.replay.world_track_points)
+            worlds = eligible_worlds_for_track(root, track)
+            intro = (f"This recorded run took place inside {len(worlds)} "
+                     "personalized world(s). Replay it inside one of them (the "
+                     "boat placed at its recorded GPS position in the world's "
+                     "geometry)")
+        intro += ", or in the empty Gazebo world (in the run's own launch frame)."
+        if worlds:
+            from mcs.gui.dialogs.world_dialog import WorldChoiceDialog
+            wdlg = WorldChoiceDialog(worlds, self, intro_text=intro)
+            if wdlg.exec() != wdlg.DialogCode.Accepted:
+                return False
+            params.world_dir = wdlg.selected_world_dir or ""
+        return True
+
+    def _choose_mission_world(self, params) -> bool:
+        """Simulated GPS-anchored mission: offer the personalized Gazebo
+        worlds whose limits contain the path. In world mode the simulator's
+        mavros shim owns the GPS feed (the station's SimGps stays disarmed)
+        and full_mission_launch.py declares no spawn_yaw. False = cancelled."""
+        from mcs.core.worlds import eligible_worlds  # lazy: yaml/numpy
+        worlds = eligible_worlds(Path(self._cfg.launch.worlds_root),
+                                 Path(params.gps_anchored_source))
+        if worlds:
+            from mcs.gui.dialogs.world_dialog import WorldChoiceDialog
+            wdlg = WorldChoiceDialog(worlds, self)
+            if wdlg.exec() != wdlg.DialogCode.Accepted:
+                return False
+            if wdlg.selected_world_dir:
+                params.world_dir = wdlg.selected_world_dir
+                params.spawn_yaw_rad = None
+        return True
+
+    def _choose_sea(self, params) -> bool:
+        """Every Gazebo launch chooses the sea state the boat will feel.
+        False = cancelled."""
+        from mcs.core.sea import SeaCatalog, find_presets_file
+        from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
+        catalog = SeaCatalog.load(find_presets_file(self._cfg.sea.presets_file))
+        last = self._launcher.last_parameters
+        sdlg = SeaStateDialog(catalog, self._cfg.sea,
+                              last.sea if last is not None else None, parent=self)
+        if sdlg.exec() != sdlg.DialogCode.Accepted:
+            return False
+        params.sea = sdlg.choice()
+        return True
+
+    def set_sim_badge(self, text: str, level: str) -> None:
+        """The simulation-speed badge; empty text hides it. ``level``:
+        'ok' | 'warn'."""
+        self._sim_badge.setVisible(bool(text))
+        if not text:
+            return
+        color = theme.WARN if level == "warn" else theme.TEXT_DIM
+        self._sim_badge.setText(text)
+        self._sim_badge.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def set_stop_guard(self, guard) -> None:
+        """``guard(proceed)`` runs before every Stop Mission / Turn Off
+        Connection and calls ``proceed()`` only when the stop may go ahead
+        (the link-guardian choice)."""
+        self._stop_guard = guard
+
     def _on_stop(self) -> None:
+        if self._stop_guard is not None:
+            self._stop_guard(self._do_stop)
+            return
+        self._do_stop()
+
+    def _do_stop(self) -> None:
         # Stop Mission is also a node-termination path, so it runs the same
         # guarantee as E-STOP: publish 'default', confirm transmission, and
         # only then terminate (CommandCenter.safe_shutdown — never a direct
         # launcher.stop()).
-        
         self._commands.safe_stop_mission()
-        self.mission_stopped.emit()
 
     def _on_mode_toggle(self) -> None:
         self._commands.publish_mode_toggle()
@@ -299,12 +418,69 @@ class BottomToolbar(QWidget):
         """Show 'Continue Original Mission' while a manual target is active."""
         self.continue_button.setVisible(active)
 
+    def set_replay_ui(self, replaying: bool) -> None:
+        """A bag replay has no controller to command: Manual Target and the
+        Default/Override toggle are greyed while one runs."""
+        if replaying and self.manual_button.isChecked():
+            self.manual_button.setChecked(False)
+        for button in (self.manual_button, self.mode_button):
+            if button.isEnabled() == replaying:
+                button.setEnabled(not replaying)
+
+    def set_session_ui(self, active: bool, can_update: bool = False,
+                       run_active: bool = False,
+                       release_visible: bool = False) -> None:
+        """Relabel the mission buttons for a real-robot run session.
+
+        Called on the shared tick. Outside a session (no launch, or Gazebo)
+        every label is the plain mission one."""
+        launching = self._launcher.state in ("starting", "running")
+        self._session_active = active and launching
+        if self._session_active:
+            text, enabled = "Update Mission", can_update
+            tip = ("Choose the next run's path or pinger, controller and log "
+                   "note (between runs only).")
+        else:
+            text, enabled = "Launch Mission", self._launcher.state == "idle"
+            tip = "Configure and start a mission."
+        if self.launch_button.text() != text:
+            self.launch_button.setText(text)
+            self.launch_button.setToolTip(tip)
+        self.launch_button.setEnabled(enabled)
+
+        stop_text = "Turn Off Connection" if self._session_active else "Stop Mission"
+        if self.stop_button.text() != stop_text:
+            self.stop_button.setText(stop_text)
+            self.stop_button.setToolTip(
+                ("Stop a run still active, publish 'default' and wait for the "
+                 "boat to leave override, then shut every node down.")
+                if self._session_active else
+                ("Publishes 'default' on /blueboat/input_str, waits for "
+                 "confirmed transmission, then gracefully stops every launched "
+                 "node."))
+
+        self.release_estop_button.setVisible(self._session_active and release_visible)
+
+        # Between the runs of a session there is no original mission to
+        # continue: the [0, 0] sentinel just releases the target.
+        cont = ("Release Target" if self._session_active and not run_active
+                else "Continue Original Mission")
+        if self.continue_button.text() != cont:
+            self.continue_button.setText(cont)
+            self.continue_button.setToolTip(
+                "Publish the [0.0, 0.0] manual target: master_control resumes "
+                "the original mission. This button does nothing else."
+                if cont.startswith("Continue") else
+                "Publish the [0.0, 0.0] manual target: the boat stops holding "
+                "the target and keeps zero thrust (no run is active).")
+
     # ================================================================ feedback
     def _on_launch_state(self, state: str) -> None:
         led = {"idle": "never", "starting": "warn",
                "running": "ok", "stopping": "warn"}.get(state, "warn")
         self._launch_led.set_status(led)
-        self.launch_button.setEnabled(state == "idle")
+        if not self._session_active:
+            self.launch_button.setEnabled(state == "idle")
         self.stop_button.setEnabled(state in ("starting", "running"))
 
     def _on_launch_output(self, line: str) -> None:
@@ -321,7 +497,8 @@ class BottomToolbar(QWidget):
         self._refresh_mode_button()
 
     def _on_estop_state(self, state: str) -> None:
-        text = {"estop": "E-STOP: 'stop' published, awaiting robot ack…",
+        text = {"estop-released": "E-STOP released: 'enable' published",
+                "estop": "E-STOP: 'stop' published, awaiting robot ack…",
                 "estop-confirmed": "E-STOP: confirmed — thrust cut and latched",
                 "estop-timeout": "E-STOP: published, no ack (check robot_interface)",
                 "estop-sim": "E-STOP: simulation — no robot to acknowledge",
@@ -329,6 +506,8 @@ class BottomToolbar(QWidget):
                 "confirmed": "safe-shutdown: confirmed by param_mode echo",
                 "already-default": "safe-shutdown: boat was already in 'default'",
                 "timeout": "safe-shutdown: published, flushed (no echo — check chain)",
+                "unconfirmed": "safe-shutdown: no 'default' echo — waiting for your choice",
+                "manual": "safe-shutdown: returning the autopilot to MANUAL…",
                 "sim": "safe-shutdown: simulation — ack skipped",
                 "idle": ""}.get(state, "")
         self._estop_label.setText(text)

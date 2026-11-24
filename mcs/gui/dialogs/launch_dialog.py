@@ -2,10 +2,16 @@
 
 Two mission types, matching the two launch files of the stack:
 
-* **Real robot** — ``BlueBoat_launch.py`` with ``enable_motors``, ``note``,
-  ``controller_type`` (may be empty: robot interface only), ``trajectory``
-  (disabled when ``use_pinger`` is set, since the launch file then skips
-  ``path_generation``) and ``use_pinger``.
+* **Real robot** — ``BlueBoat_launch.py`` as a **run session**
+  (``session_mode:=True``): the launch connects and idles,
+  and runs are started and stopped from the station. The dialog chooses what
+  the FIRST run executes — a designer path (built-in shapes are a simulation
+  and CLI affair: a session places or deploys each run's path into one watched
+  file, which only designer files can feed) or the USBL pinger — plus
+  ``controller_type`` (PID / LoS / MPC: manual target and arrow keys go
+  through ``master_control``, so a session always has one; MPC cannot follow
+  the pinger), ``enable_motors`` and the log note. Update Mission changes all
+  of that between runs (``mission_update_dialog.py``).
 * **Gazebo simulation** — ``Sim_launch.py`` with ``robot_file``,
   ``trajectory``, ``controller_type``, ``note`` (and ``spawn_yaw`` for
   GPS-anchored missions). The simulation launch always starts
@@ -13,7 +19,7 @@ Two mission types, matching the two launch files of the stack:
   pinger do not exist in that graph and their fields are hidden to keep the
   dialog coherent with what will actually run. The **log note** does exist
   there — ``simulation_interface`` names its poslog CSV from it exactly as
-  ``robot_interface`` does on the boat — so that field stays visible in both
+  ``robot_interface`` does in a real-robot run — so that field stays visible in both
   modes; a simulated run's note always carries the ``sim`` marker
   (:meth:`LaunchParameters.wire_note`). A GPS-anchored custom path takes the
   SAME deferred-deploy pipeline as on real water: the station synthesises the
@@ -21,6 +27,26 @@ Two mission types, matching the two launch files of the stack:
   the boat at a **fixed** heading (``LaunchConfig.sim_spawn_yaw_deg``), so
   anchoring, deployment and hot-reload are exercised exactly as at sea and two
   runs of the same mission remain comparable.
+
+  **Source** (Gazebo only): *Controller* is the above; *From a
+  ros2bag* replays a recorded real-robot run instead (``Replay_launch.py``):
+  the operator picks a run folder (or its ``*-bag`` directory) and an initial
+  playback rate, and the boat moves exactly as it did in the water — no
+  controller, trajectory, robot file or note apply, and no sea state is asked
+  for (the recording already holds the real sea).
+  **Session** (Gazebo + Controller only): *Normal session* or *Dataset
+  creation* -- the mode BlueBoat-Perception runs in for a personalized-world
+  run (``LaunchParameters.perception_mode``; the world is chosen after this
+  dialog, and the empty world has no sonar, so no Perception). A real-robot
+  launch always runs it normal.
+  **Sonar model** (Gazebo + Controller only, 2026-11-07): *Geometric* (the
+  default, real time) or *Ray-cast*; with *Ray-cast*, **Slow-down** sets the
+  speed of the whole simulation, x0.010-x0.500 of real time (Gazebo's
+  real-time factor, ``LaunchParameters.real_time_factor``): the ray-cast
+  renders far slower than its 50 ms ping period, and a slowed run keeps one
+  clock, so it pings at 20 Hz in sim time and every record is the same as at
+  real speed. Only a personalized world has a sonar; without one the launch
+  runs geometric at x1 (the toolbar says so).
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -37,28 +63,114 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
+    QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core import replay as replay_core
+from mcs.core.sonar_variants import default_variant_dirs, list_variants
 from mcs.designer import io_yaml
 from mcs.gui import theme
-from mcs.ros.launch_manager import LaunchParameters
+from mcs.ros.launch_manager import (
+    PERCEPTION_DATASET,
+    PERCEPTION_NORMAL,
+    RENDERER_GEOMETRIC,
+    RENDERER_RAYCAST,
+    LaunchParameters,
+    parse_thrust_gain,
+)
 
 _REAL = "Real robot"
 _SIM = "Gazebo simulation"
+_SRC_CONTROL = "Controller"
+_SRC_BAG = "From a ros2bag"
+_SESSION_NORMAL = "Normal session"
+_SESSION_DATASET = "Dataset creation"
+_SONAR_GEOMETRIC = "Geometric"
+_SONAR_RAYCAST = "Ray-cast"
+#: Item data of a ray-cast variant: "raycast|<profile path>" (2026-11-09).
+_VARIANT_SEP = "|"
 
 
-def _list_custom_paths(cfg: AppConfig) -> list[tuple[str, Path]]:
-    """Saved designer missions: (name, runtime yaml path), sorted."""
+def slowdown_hint(rtf: float) -> str:
+    """The Slow-down row's explanation for factor ``rtf`` (Qt-free)."""
+    rtf = max(float(rtf), 1e-6)
+    if rtf > 1.0:               # owner order 2026-11-10: up to x4
+        pace = (f"the simulation runs up to {rtf:g}x faster than real time between "
+                f"pings (1 min of mission >= {60.0 / rtf:.0f} s of wall time)")
+    else:
+        pace = (f"the whole simulation runs {1.0 / rtf:.0f}x slower (1 min of mission = "
+                f"{1.0 / rtf:.0f} min of wall time)")
+    return (f"Ray-cast sonar at x{rtf:.3f} real speed: {pace} so it pings at 20 Hz in "
+            "sim time; every record is the same as at real speed. Personalized worlds "
+            "only (the empty world has no sonar).")
+
+
+def hold_hint() -> str:
+    """The ray-cast's hold sentence (2026-11-09, Qt-free)."""
+    return ("The simulation also pauses while a slow ping renders (a quay in "
+            "range), so no ping is ever lost: set the speed you want, x2-x4 for "
+            "'Ray-cast \u2014 fast'.")
+
+
+def list_custom_paths(cfg: AppConfig) -> list[tuple[str, Path]]:
+    """Saved designer missions: (name, runtime yaml path), sorted.
+
+    Read from disk on every call, so a path saved in the designer while a
+    session is connected is offered by the next dialog that opens."""
     directory = Path(cfg.designer.trajectories_dir)
     if not directory.exists():
         return []
     return sorted((p.stem, p) for p in directory.glob("*.yaml")
                   if not p.name.endswith(".meta.yaml"))
+
+
+def custom_badge(cfg: AppConfig, path: Path, session: bool = False
+                 ) -> tuple[str, str]:
+    """Suffix + tooltip for one custom-path entry.
+
+    A GPS-anchored mission is geographically fixed and is never
+    realigned (the boat turns toward it instead), so it is exempt from
+    the start-alignment check -- the same exemption
+    DesignerWindow._maybe_offer_alignment makes. Everything else is
+    checked against its own samples: the world frame is local ENU
+    (origin = launch point, +x = east), so a mission that does not
+    start at (0,0) along +x makes the boat cut across to its start.
+
+    In a real-robot run session (``session``) a non-anchored mission is
+    PLACED at the boat when the run starts (first sample on the boat, first
+    heading along its heading), so start alignment no longer matters there.
+
+    Informational only: the launch path never rewrites a mission file.
+    """
+    if io_yaml.read_geo_anchor(path) is not None:
+        return (" (GPS)",
+                ("GPS-anchored: relocated into this run's world frame at "
+                 "launch."))
+    if session:
+        return ("", ("Placed at the boat when the run starts: the path "
+                     "begins at the boat and runs out ahead of it."))
+    if io_yaml.read_start_misalignment(
+            path, cfg.designer.start_align_tol_m,
+            cfg.designer.start_align_tol_deg) is not None:
+        return (" (not start-aligned)",
+                ("This mission does not start at (0,0) heading east "
+                 "(+x). The world frame is local ENU with its origin at "
+                 "the launch point, so the boat will first cut across "
+                 "to the mission start.\n"
+                 "For real water, prefer a GPS-anchored mission; "
+                 "otherwise use Edit \u25b8 Align to Start in the Survey "
+                 "Pattern Designer."))
+    return ("", "")
 
 
 class LaunchDialog(QDialog):
@@ -72,7 +184,7 @@ class LaunchDialog(QDialog):
         self.setMinimumWidth(440)
         layout = QVBoxLayout(self)
 
-        form = QFormLayout()
+        form = self._form = QFormLayout()
         layout.addLayout(form)
 
         # ---- Mission type ----------------------------------------------------
@@ -84,29 +196,69 @@ class LaunchDialog(QDialog):
         self._mode.currentTextChanged.connect(self._on_mode_changed)
         form.addRow("Mission type", self._mode)
 
+        # ---- Gazebo source: live controller, or a recorded run ---------------
+        self._source = QComboBox()
+        self._source.addItems([_SRC_CONTROL, _SRC_BAG])
+        self._source.setToolTip(
+            f"{_SRC_CONTROL}: the simulated boat is driven by master_control.\n"
+            f"{_SRC_BAG}: the boat replays a recorded real-robot run exactly "
+            f"(ros2 launch {cfg.launch.package} {cfg.launch.replay_launch_file}).")
+        self._source.currentTextChanged.connect(
+            lambda _t: self._on_mode_changed(self._mode.currentText()))
+        self._source_label = QLabel("Source")
+        form.addRow(self._source_label, self._source)
+
+        bag_row = QWidget()
+        bag_layout = QHBoxLayout(bag_row)
+        bag_layout.setContentsMargins(0, 0, 0, 0)
+        self._bag = QLineEdit()
+        self._bag.setPlaceholderText("a run folder of Robot_data/, or its *-bag folder")
+        self._bag.textChanged.connect(self._on_bag_changed)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse_bag)
+        bag_layout.addWidget(self._bag, 1)
+        bag_layout.addWidget(browse)
+        self._bag_row = bag_row
+        self._bag_label = QLabel("Recorded run")
+        form.addRow(self._bag_label, bag_row)
+        self._bag_info = QLabel()
+        self._bag_info.setWordWrap(True)
+        self._bag_info.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 10px;")
+        self._bag_info_label = QLabel("")
+        form.addRow(self._bag_info_label, self._bag_info)
+
+        self._rate = QComboBox()
+        for r in cfg.replay.rates:
+            self._rate.addItem(f"{r:g}×", float(r))
+        idx = self._rate.findData(float(cfg.replay.default_rate))
+        self._rate.setCurrentIndex(max(0, idx))
+        self._rate.setToolTip("Initial playback rate; it can be changed, and the "
+                              "replay paused, from the REPLAY box while it runs.")
+        self._rate_label = QLabel("Playback rate")
+        form.addRow(self._rate_label, self._rate)
+
+        # The run placed on a world it never saw, e.g. to drive a simulated
+        # sonar, started separately, with the recorded motion.
+        self._replay_origin = QCheckBox("Place the run on the world's origin (any world)")
+        self._replay_origin.setToolTip(
+            "Replay_launch.py placement:=origin — the run's launch point on the "
+            "world's origin, so any personalized world can be chosen, not only "
+            "those its GPS track touches. The replay always publishes the boat "
+            "pose a simulated sonar (started separately) renders from.")
+        self._study = self._replay_origin
+        self._study_label = QLabel("Placement")
+        form.addRow(self._study_label, self._replay_origin)
+
         # ---- Common fields -----------------------------------------------------
         self._controller = QComboBox()
         form.addRow("Controller type", self._controller)
 
+        # Filled per mission type by _fill_trajectories: in simulation the
+        # built-in shapes, then designer-generated missions under a 'custom
+        # paths' section; on the real robot (a run session) designer missions
+        # only. Each custom entry carries the runtime YAML path as item data.
         self._trajectory = QComboBox()
-        self._trajectory.addItems(cfg.launch.trajectories)
-        # Designer-generated missions appear under a 'custom paths' section;
-        # each entry carries the runtime YAML path as item data, turned into
-        # trajectory:=from_yaml:<path> by parameters(). Works identically on
-        # the real robot and in simulation (path_generation runs in both).
-        customs = _list_custom_paths(cfg)
-        if customs:
-            self._trajectory.insertSeparator(self._trajectory.count())
-            header = self._trajectory.count()
-            self._trajectory.addItem("── custom paths ──")
-            self._trajectory.model().item(header).setEnabled(False)
-            for name, path in customs:
-                badge, tip = self._custom_badge(cfg, path)
-                self._trajectory.addItem(f"custom: {name}{badge}", str(path))
-                if tip:
-                    self._trajectory.setItemData(
-                        self._trajectory.count() - 1, tip,
-                        Qt.ItemDataRole.ToolTipRole)
+        self._customs = list_custom_paths(cfg)
         form.addRow("Trajectory", self._trajectory)
 
         # ---- Real-robot-only fields ----------------------------------------------
@@ -124,7 +276,8 @@ class LaunchDialog(QDialog):
         self._note.setPlaceholderText("added to the run's log file names")
         self._note.setToolTip(
             "Free text put into the poslog CSV name, {date}-{note}-poslog.csv "
-            "— robot_interface on the boat, simulation_interface in Gazebo. A "
+            "— robot_interface in a real-robot run, simulation_interface in "
+            "Gazebo. A "
             "simulated run is always tagged 'sim' (sim-<note>).")
         self._note_label = QLabel("Log note")
         form.addRow(self._note_label, self._note)
@@ -135,6 +288,67 @@ class LaunchDialog(QDialog):
         self._robot_file.addItems(cfg.launch.sim_robot_files)
         self._robot_file_label = QLabel("Robot file")
         form.addRow(self._robot_file_label, self._robot_file)
+
+        # BlueBoat-Perception session mode (Gazebo + Controller source).
+        self._session = QComboBox()
+        self._session.addItem(_SESSION_NORMAL, PERCEPTION_NORMAL)
+        self._session.addItem(_SESSION_DATASET, PERCEPTION_DATASET)
+        self._session.setToolTip(
+            "BlueBoat-Perception runs with every personalized-world run (the\n"
+            "only simulation with a sonar). Normal session: detections on the\n"
+            "GCS map and one record per image. Dataset creation: the same, and\n"
+            "every seabed image is also saved as a training sample in\n"
+            "data/Dataset_data/<date>-<note>/, with the simulator's ground truth\n"
+            "recorded beside it. The empty world has no sonar: no Perception.")
+        self._session_label = QLabel("Session")
+        form.addRow(self._session_label, self._session)
+
+        # Simulated sonar model, and the ray-cast's slow-down (Gazebo +
+        # Controller source; emitted only for a personalized world).
+        self._sonar_model = QComboBox()
+        self._sonar_model.addItem(_SONAR_GEOMETRIC, RENDERER_GEOMETRIC)
+        self._sonar_model.addItem(_SONAR_RAYCAST, RENDERER_RAYCAST)
+        # Ray-cast variants (owner, 2026-11-09): the simulator's generated
+        # profiles that switch off only what costs GPU time without changing
+        # how the image looks; each item's tooltip says what and how much.
+        for _v in list_variants(default_variant_dirs(cfg.sim_speed.variant_dirs)):
+            self._sonar_model.addItem(_v.label, f"{RENDERER_RAYCAST}{_VARIANT_SEP}{_v.path}")
+            self._sonar_model.setItemData(self._sonar_model.count() - 1,
+                                          _v.description, Qt.ItemDataRole.ToolTipRole)
+        self._sonar_model.setToolTip(
+            "The simulated side-scan sonar of a personalized-world run.\n"
+            "Geometric: the calibrated real-time renderer (default).\n"
+            "Ray-cast: the 3-D ray-cast sensor -- far slower than the 50 ms ping\n"
+            "period, so the whole simulation is slowed down (Slow-down).")
+        form.addRow("Sonar model", self._sonar_model)
+        sp = cfg.sim_speed
+        self._slowdown = QDoubleSpinBox()
+        self._slowdown.setDecimals(3)
+        self._slowdown.setRange(sp.rtf_min, sp.rtf_max)
+        self._slowdown.setSingleStep(sp.rtf_step)
+        self._slowdown.setValue(sp.rtf_default)
+        self._slowdown.setPrefix("x")
+        self._slowdown.setSuffix(" real speed")
+        self._slowdown.setToolTip(
+            "Gazebo's real-time factor for the whole simulation: physics,\n"
+            "control, sonar and sea state all run on its one clock. Pick the\n"
+            "factor at which the ray-cast holds 20 pings/s of sim time (the\n"
+            "sonar node logs the factor it needs when it falls behind).")
+        form.addRow("Slow-down", self._slowdown)
+        self._sonar_model.currentIndexChanged.connect(lambda _i: self._gate_sonar())
+        self._slowdown.valueChanged.connect(lambda _v: self._gate_sonar())
+
+        # The plant's [right, left] thrust gains (CR-03-3; Gazebo + Controller,
+        # emitted only for a personalized world). Empty = the description's.
+        self._thrust_gain = QLineEdit()
+        self._thrust_gain.setPlaceholderText("the description's — e.g. [0.3805,0.6055]")
+        self._thrust_gain.setToolTip(
+            "thrust_gain:=[right,left] of full_mission_launch.py: the applied-thrust\n"
+            "gains of simulation_interface (Control's R-10 asymmetry bracket;\n"
+            "the FIT nominal is [0.3805,0.6055]). Personalized worlds only:\n"
+            "the empty world's Sim_launch.py has no such argument.\n"
+            "Empty = the gains the robot description carries.")
+        form.addRow("Thrust gain", self._thrust_gain)
 
         # ---- Free-form extras ------------------------------------------------------
         self._extra = QLineEdit()
@@ -154,9 +368,16 @@ class LaunchDialog(QDialog):
         layout.addWidget(buttons)
 
         # ---- Restore last parameters ------------------------------------------------
+        self._fill_trajectories(sim=False)
         if last is not None:
             self._mode.setCurrentText(_SIM if last.simulation else _REAL)
-            if last.trajectory.startswith("from_yaml:"):
+            self._fill_trajectories(sim=last.simulation)
+            if last.session:
+                restore = last.gps_anchored_source or last.session_source
+                idx = self._trajectory.findData(restore) if restore else -1
+                if idx >= 0:
+                    self._trajectory.setCurrentIndex(idx)
+            elif last.trajectory.startswith("from_yaml:"):
                 idx = self._trajectory.findData(
                     last.trajectory.partition(":")[2])
                 if idx >= 0:
@@ -167,20 +388,77 @@ class LaunchDialog(QDialog):
             self._enable_motors.setChecked(False)  # always re-confirm motors
             self._note.setText(last.note)
             self._robot_file.setCurrentText(last.robot_file)
+            if last.replay_bag:
+                self._source.setCurrentText(_SRC_BAG)
+                self._bag.setText(last.replay_bag)
+                idx = self._rate.findData(float(last.replay_rate))
+                if idx >= 0:
+                    self._rate.setCurrentIndex(idx)
+                self._replay_origin.setChecked(last.replay_placement == "origin")
+            idx = self._session.findData(last.perception_mode)
+            if idx >= 0:
+                self._session.setCurrentIndex(idx)
+            idx = -1
+            if last.sonar_profile:
+                idx = self._sonar_model.findData(
+                    f"{RENDERER_RAYCAST}{_VARIANT_SEP}{last.sonar_profile}")
+            if idx < 0:
+                idx = self._sonar_model.findData(last.sonar_renderer)
+            if idx >= 0:
+                self._sonar_model.setCurrentIndex(idx)
+            if last.sonar_renderer == RENDERER_RAYCAST:
+                self._slowdown.setValue(float(last.real_time_factor))
+            self._thrust_gain.setText(last.thrust_gain)
         self._on_mode_changed(self._mode.currentText())
         if last is not None and last.controller_type in self._items(self._controller):
             self._controller.setCurrentText(last.controller_type)
 
     # ------------------------------------------------------------------ modes
+    def _fill_trajectories(self, sim: bool) -> None:
+        """Trajectory list for one mission type, keeping the selection when
+        it still exists. Simulation: built-in shapes, then designer paths.
+        Real robot (run session): designer paths only."""
+        combo = self._trajectory
+        keep_data, keep_text = combo.currentData(), combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        if sim:
+            combo.addItems(self._cfg.launch.trajectories)
+            if self._customs:
+                combo.insertSeparator(combo.count())
+                header = combo.count()
+                combo.addItem("── custom paths ──")
+                combo.model().item(header).setEnabled(False)
+        for name, path in self._customs:
+            badge, tip = custom_badge(self._cfg, path, session=not sim)
+            combo.addItem(f"{'custom: ' if sim else ''}{name}{badge}", str(path))
+            if tip:
+                combo.setItemData(combo.count() - 1, tip,
+                                  Qt.ItemDataRole.ToolTipRole)
+        if not sim and not self._customs:
+            combo.addItem("(no designer path yet — create one, or follow "
+                          "the pinger)")
+            combo.model().item(0).setEnabled(False)
+        idx = combo.findData(keep_data) if keep_data else combo.findText(keep_text)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _replaying(self) -> bool:
+        return (self._mode.currentText() == _SIM
+                and self._source.currentText() == _SRC_BAG)
+
     def _on_mode_changed(self, mode: str) -> None:
         sim = mode == _SIM
-        # Controller list: Sim_launch always starts master_control, so the
-        # empty "no controller" option only exists on the real robot.
+        self._fill_trajectories(sim)
+        # Controller list: both launches need master_control now (a real-robot
+        # run session drives manual targets and arrow keys through it), so the
+        # empty "no controller" entry is offered in neither.
         current = self._controller.currentText()
         self._controller.clear()
+        controllers = [c for c in self._cfg.launch.controllers if c]
+        self._controller.addItems(controllers)
         if sim:
-            controllers = [c for c in self._cfg.launch.controllers if c]
-            self._controller.addItems(controllers)
             default = (current if current in controllers
                        else self._cfg.launch.sim_default_controller)
             self._controller.setCurrentText(default)
@@ -188,11 +466,12 @@ class LaunchDialog(QDialog):
                 "Sim_launch.py always starts master_control; a controller is "
                 "required.")
         else:
-            self._controller.addItems(self._cfg.launch.controllers)
-            self._controller.setCurrentText(current)
+            self._controller.setCurrentText(current if current in controllers
+                                            else "PID")
             self._controller.setToolTip(
-                "Empty = robot interface only (manual 'move' commands, no "
-                "controller node).")
+                "The controller of the first run; Update Mission can change "
+                "it between runs. MPC cannot follow the pinger.")
+        self._gate_mpc()
         # Field gating
         for w in (self._use_pinger, self._use_pinger_label,
                   self._enable_motors, self._motors_label):
@@ -200,52 +479,137 @@ class LaunchDialog(QDialog):
         for w in (self._robot_file, self._robot_file_label):
             w.setVisible(sim)
         self._trajectory.setEnabled(sim or not self._use_pinger.isChecked())
+        # Gazebo source: a replay takes no controller, path, robot or note.
+        replay = self._replaying()
+        for w in (self._source, self._source_label):
+            w.setVisible(sim)
+        for w in (self._bag_row, self._bag_label, self._bag_info,
+                  self._bag_info_label, self._rate, self._rate_label,
+                  self._study, self._study_label):
+            w.setVisible(replay)
+        for w in (self._controller, self._trajectory, self._note):
+            self._set_row_visible(w, not replay)
+        self._set_row_visible(self._robot_file, sim and not replay)
+        self._set_row_visible(self._session, sim and not replay)
+        self._set_row_visible(self._sonar_model, sim and not replay)
+        self._set_row_visible(self._thrust_gain, sim and not replay)
         launch_file = (self._cfg.launch.sim_launch_file if sim
                        else self._cfg.launch.launch_file)
-        extra = ("Simulation graph: Gazebo world + simulation_interface — no "
+        if replay:
+            launch_file = self._cfg.launch.replay_launch_file
+        extra = ("Replay: the boat follows the recording exactly (pose, "
+                 "attitude, GPS, speed); targets, thrust and pinger are shown "
+                 "as recorded. No controller and no sea state — wind, current "
+                 "and waves cannot move it." if replay else
+                 "Simulation graph: Gazebo world + simulation_interface — no "
                  "MAVROS, no pinger, no param_set (shutdown acknowledgement "
                  "is skipped accordingly)." if sim else
-                 "Mission controls unlock once the required nodes report ready.")
-        self._hint.setText(
+                 "Run session: the boat connects and goes into override but "
+                 "does NOT move or log until you press START RUN (left panel). "
+                 "Drive it meanwhile with Manual Target or the arrow keys.")
+        self._hint_base = (
             f"The station runs: ros2 launch {self._cfg.launch.package} "
             f"{launch_file} …\n{extra}")
+        self._gate_sonar()
+
+    def _raycast(self) -> bool:
+        """Ray-cast selected, on a Gazebo + Controller launch."""
+        return (self._mode.currentText() == _SIM and not self._replaying()
+                and str(self._sonar_model.currentData() or "").startswith(RENDERER_RAYCAST))
+
+    def _variant_profile(self) -> str:
+        """The chosen ray-cast variant's profile path, or ""."""
+        data = str(self._sonar_model.currentData() or "")
+        return data.partition(_VARIANT_SEP)[2] if self._raycast() else ""
+
+    def _gate_sonar(self) -> None:
+        """The Slow-down row only for the ray-cast, and its explanation."""
+        raycast = self._raycast()
+        self._set_row_visible(self._slowdown, raycast)
+        hint = getattr(self, "_hint_base", "")
+        if raycast:
+            hint += "\n" + slowdown_hint(self._slowdown.value()) + " " + hold_hint()
+        self._hint.setText(hint)
         self.adjustSize()
 
-    @staticmethod
-    def _custom_badge(cfg: AppConfig, path: Path) -> tuple[str, str]:
-        """Suffix + tooltip for one custom-path entry.
-
-        A GPS-anchored mission is geographically fixed and is never
-        realigned (the boat turns toward it instead), so it is exempt from
-        the start-alignment check -- the same exemption
-        DesignerWindow._maybe_offer_alignment makes. Everything else is
-        checked against its own samples: the world frame is local ENU
-        (origin = launch point, +x = east), so a mission that does not
-        start at (0,0) along +x makes the boat cut across to its start.
-
-        Informational only: the launch path never rewrites a mission file.
-        """
-        if io_yaml.read_geo_anchor(path) is not None:
-            return (" (GPS)",
-                    ("GPS-anchored: relocated into this run's world frame at "
-                     "launch."))
-        if io_yaml.read_start_misalignment(
-                path, cfg.designer.start_align_tol_m,
-                cfg.designer.start_align_tol_deg) is not None:
-            return (" (not start-aligned)",
-                    ("This mission does not start at (0,0) heading east "
-                     "(+x). The world frame is local ENU with its origin at "
-                     "the launch point, so the boat will first cut across "
-                     "to the mission start.\n"
-                     "For real water, prefer a GPS-anchored mission; "
-                     "otherwise use Edit \u25b8 Align to Start in the Survey "
-                     "Pattern Designer."))
-        return ("", "")
-
     def _on_pinger_toggled(self, on: bool) -> None:
-        # BlueBoat_launch.py only starts path_generation when use_pinger is False.
+        # Following the pinger, the path list means nothing.
         if self._mode.currentText() == _REAL:
             self._trajectory.setEnabled(not on)
+        self._gate_mpc()
+
+    def _gate_mpc(self) -> None:
+        """MPC cannot follow the pinger (master_control's pinger branch is
+        PID / LoS only): grey it out, and leave it if it was selected."""
+        pinger = (self._mode.currentText() == _REAL
+                  and self._use_pinger.isChecked())
+        idx = self._controller.findText("MPC")
+        if idx >= 0:
+            self._controller.model().item(idx).setEnabled(not pinger)
+            if pinger and self._controller.currentText() == "MPC":
+                self._controller.setCurrentText("PID")
+
+    def _set_row_visible(self, field: QWidget, on: bool) -> None:
+        field.setVisible(on)
+        label = self._form.labelForField(field)
+        if label is not None:
+            label.setVisible(on)
+
+    # ------------------------------------------------------------- recorded run
+    def _browse_bag(self) -> None:
+        start = self._bag.text().strip() or self._cfg.replay.bag_root
+        folder = QFileDialog.getExistingDirectory(
+            self, "Recorded run (a Robot_data run folder or its bag)", start)
+        if folder:
+            self._bag.setText(folder)
+
+    def _on_bag_changed(self, text: str) -> None:
+        bag = replay_core.find_bag(text.strip()) if text.strip() else None
+        summary = replay_core.bag_summary(bag) if bag else None
+        if not text.strip():
+            self._bag_info.setText("Every real-robot run since v1.1 has a bag "
+                                   "in its Robot_data folder.")
+        elif summary is None:
+            self._bag_info.setText("No ros2bag here (no metadata.yaml in the "
+                                   "folder or one level below).")
+        else:
+            self._bag_info.setText(summary.describe())
+
+    def bag_problem(self) -> str:
+        """Why the chosen recorded run cannot be replayed, or ""."""
+        if not self._replaying():
+            return ""
+        bag = replay_core.find_bag(self._bag.text().strip())
+        if bag is None:
+            return "Choose a recorded run: no ros2bag was found in that folder."
+        summary = replay_core.bag_summary(bag)
+        if summary is None:
+            return f"{bag}: unreadable bag metadata."
+        if not summary.has_pose:
+            return (f"{bag.name} holds neither /mavros/local_position/odom nor "
+                    "/blueboat/odom: there is no motion to replay.")
+        return ""
+
+    def thrust_gain_problem(self) -> str:
+        """Why the Thrust gain text is not a [right, left] pair, or ""."""
+        if self._mode.currentText() != _SIM or self._replaying():
+            return ""
+        try:
+            parse_thrust_gain(self._thrust_gain.text())
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    def accept(self) -> None:
+        problem = self.bag_problem()
+        if problem:
+            QMessageBox.warning(self, "Replay", problem)
+            return
+        problem = self.thrust_gain_problem()
+        if problem:
+            QMessageBox.warning(self, "Thrust gain", problem)
+            return
+        super().accept()
 
     @staticmethod
     def _items(combo: QComboBox) -> list[str]:
@@ -259,46 +623,87 @@ class LaunchDialog(QDialog):
             if ":=" in token:
                 key, value = token.split(":=", 1)
                 extra[key] = value
+        if self._replaying():
+            bag = replay_core.find_bag(self._bag.text().strip())
+            return LaunchParameters(
+                simulation=True,
+                controller_type="",
+                trajectory="",
+                replay_bag=str(bag) if bag else self._bag.text().strip(),
+                replay_rate=float(self._rate.currentData() or 1.0),
+                replay_placement="origin" if self._replay_origin.isChecked() else "gps",
+                extra_args=extra,
+            )
         custom = self._trajectory.currentData()
         gps_src = gps_dst = ""
+        if not sim:
+            # Real robot = run session: path_generation always watches the
+            # session file; the station writes each run's path into it.
+            pinger = self._use_pinger.isChecked()
+            source = "" if (pinger or not custom) else str(custom)
+            session_file = self._cfg.launch.session_trajectory_file
+            if source and io_yaml.read_geo_anchor(Path(source)) is not None:
+                gps_src, gps_dst = source, session_file
+            return LaunchParameters(
+                enable_motors=self._enable_motors.isChecked(),
+                note=self._note.text().strip(),
+                controller_type=self._controller.currentText() or "PID",
+                trajectory=f"from_yaml:{session_file}",
+                use_pinger=pinger,
+                simulation=False,
+                robot_file=self._robot_file.currentText().strip() or "thrusters_ur",
+                gps_anchored_source=gps_src,
+                gps_deployed_target=gps_dst,
+                session=True,
+                session_source=source,
+                extra_args=extra,
+            )
+        # Gazebo simulation.
         gps_simulated = False
         spawn_yaw = None
         if custom:
             src = Path(custom)
             if io_yaml.read_geo_anchor(src) is not None:
-                # GPS-anchored: the SAME deferred-deploy pipeline on real
-                # water and in simulation. On real water MAVROS provides the
-                # fixes; in simulation the station synthesises them (the
-                # boat's first fix lands offset_north_m north of the path's
-                # first point) and spawns the boat at the configured fixed
-                # heading, so anchoring, deployment and hot-reload run exactly
-                # as at sea, repeatably.
+                # GPS-anchored: the SAME deferred-deploy pipeline as on real
+                # water. The station synthesises the fixes (the boat's first
+                # fix lands offset_north_m north of the path's first point)
+                # and spawns the boat at the configured FIXED heading, so two
+                # runs of one mission start from the same pose (Extra args may
+                # still override spawn_yaw for a single run).
                 gps_src = str(src)
                 gps_dst = str(io_yaml.deployed_path(src.parent, src.stem))
                 trajectory = f"from_yaml:{gps_dst}"
-                if sim:
-                    gps_simulated = True
-                    # Fixed, not random: the spawn heading is the only spawn
-                    # degree of freedom here, and two runs of one mission must
-                    # start from the same pose to be comparable. Extra args
-                    # may still override it for a single run.
-                    spawn_yaw = math.radians(
-                        self._cfg.launch.sim_spawn_yaw_deg)
+                gps_simulated = True
+                spawn_yaw = math.radians(self._cfg.launch.sim_spawn_yaw_deg)
             else:
                 trajectory = f"from_yaml:{custom}"
         else:
             trajectory = self._trajectory.currentText()
         return LaunchParameters(
-            enable_motors=(not sim) and self._enable_motors.isChecked(),
+            enable_motors=False,
             note=self._note.text().strip(),
             controller_type=self._controller.currentText(),
             trajectory=trajectory,
-            use_pinger=(not sim) and self._use_pinger.isChecked(),
-            simulation=sim,
+            use_pinger=False,
+            simulation=True,
             robot_file=self._robot_file.currentText().strip() or "thrusters_ur",
             gps_anchored_source=gps_src,
             gps_deployed_target=gps_dst,
             gps_simulated=gps_simulated,
             spawn_yaw_rad=spawn_yaw,
             extra_args=extra,
+            perception_mode=self._session.currentData() or PERCEPTION_NORMAL,
+            sonar_renderer=(RENDERER_RAYCAST if self._raycast() else RENDERER_GEOMETRIC),
+            sonar_profile=self._variant_profile(),
+            real_time_factor=(round(float(self._slowdown.value()), 3)
+                              if self._raycast() else 1.0),
+            thrust_gain=self._thrust_gain_value(),
         )
+
+    def _thrust_gain_value(self) -> str:
+        """The canonical thrust gain, or "" (empty or invalid: accept()
+        refuses the invalid case before parameters() is read)."""
+        try:
+            return parse_thrust_gain(self._thrust_gain.text())
+        except ValueError:
+            return ""

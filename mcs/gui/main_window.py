@@ -4,6 +4,11 @@ Wires together the data store, the signal bus, the panels, the map and the
 toolbar.  Owns the single 10 Hz refresh timer that drives all repainting
 (messages update the store immediately; widgets repaint on the tick — this
 is what keeps the UI smooth and flicker-free during long experiments).
+
+A real-robot launch is a **run session** (:mod:`mcs.ros.run_session`): the
+RUN box under the left panel starts and stops runs, the toolbar's Launch /
+Stop buttons become Update Mission / Turn Off Connection, and the floating
+ARROW CONTROL box (map, bottom-right) drives the boat from the keyboard.
 """
 
 from __future__ import annotations
@@ -25,18 +30,24 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import sim_badge, station_clock
 from mcs.core.signals import SignalBus
 from mcs.gui import theme
+from mcs.gui.arrow_box import FloatingArrowBox
 from mcs.gui.bottom_toolbar import BottomToolbar
+from mcs.gui.guardian_box import GuardianBox, ask_turn_off_choice
 from mcs.gui.left_panel import LeftPanel
 from mcs.gui.map.map_view import MapMode, MapView
 from mcs.gui.mission_stats import FloatingStatsBox
+from mcs.gui.replay_box import FloatingReplayBox
 from mcs.gui.right_panel import RightPanel
+from mcs.gui.run_panel import RunPanel
 from mcs.gui.sea_state_box import FloatingSeaBox
 from mcs.models.store import DataStore
 from mcs.ros.command_center import CommandCenter
 from mcs.ros.launch_manager import LaunchManager, LaunchParameters
 from mcs.ros.ros_manager import RosManager
+from mcs.ros.run_session import RunSession
 
 _LOG = logging.getLogger(__name__)
 
@@ -51,14 +62,24 @@ class MainWindow(QMainWindow):
         self._exit_in_progress = False
         self._exit_finalized = False
         self._exit_deadline = 0.0
+        # Mission-path preview: requested on the tick once the map frame is
+        # ready; a failed request is re-armed a bounded number of times.
+        self._pending_preview_trajectory: str | None = None
+        self._last_preview_trajectory: str | None = None
+        self._preview_retries_left = 0
+        self._gps_timer: QTimer | None = None      # deferred GPS deployment
+        self._unconfirmed_box: QMessageBox | None = None
+        self._designer = None                      # DesignerWindow, lazily
 
         # ---- Core objects ----------------------------------------------------
         self.cfg = cfg
+        station_clock().stall_s = cfg.sim_speed.clock_stall_s
         self.bus = SignalBus()
         self.store = DataStore(cfg)
         self.ros = RosManager(cfg, self.bus)
         self.launcher = LaunchManager(cfg, self.bus)
         self.commands = CommandCenter(cfg, self.bus, self.ros, self.launcher)
+        self.run_session = RunSession(cfg, self.bus, self.store, self.commands)
 
         # ---- Widgets -----------------------------------------------------------
         self.map_view = MapView(cfg, self.store)
@@ -66,10 +87,19 @@ class MainWindow(QMainWindow):
         self.right_panel = RightPanel(cfg, self.store)
         self.left_panel.setMinimumWidth(340)
         self.left_panel.setMaximumWidth(450)
-
         self.right_panel.setMinimumWidth(340)
         self.right_panel.setMaximumWidth(600)
         self.toolbar = BottomToolbar(cfg, self.bus, self.launcher, self.commands)
+        # RUN box: pinned under the left panel's scroll area (below ROS
+        # DIAGNOSTICS, never scrolled away); visible during a run session.
+        self.run_panel = RunPanel(self.store, self.run_session)
+        self.left_panel.set_footer(self.run_panel)
+        # GUARDIAN box: the link guardian, at the top of the left column;
+        # active during a real-robot session.
+        self.guardian_box = GuardianBox()
+        self.left_panel.set_header(self.guardian_box)
+        self._guardian_ack_seq = None
+        self.toolbar.set_stop_guard(self._guardian_stop_guard)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.left_panel)
@@ -80,12 +110,16 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 1)
         splitter.setSizes([320, 900, 320])
 
-        # Floating Mission Stats Box (parented to the map_view so it floats without breaking the splitter)
+        # Boxes floating over the map (parented to the map view, so they do
+        # not take part in the splitter): statistics top-right, sea state and
+        # bag replay top-left (never shown together), arrow control
+        # bottom-right.
         self.stats_box = FloatingStatsBox(self.store, self.map_view)
         self.right_panel.time_window_changed.connect(self.stats_box.refresh_stats)
-        # Floating Sea State box — mirror of the stats box, glued to the
-        # top-LEFT of the map view (i.e. right against the left panel).
         self.sea_box = FloatingSeaBox(self.store, self.map_view)
+        self.replay_box = FloatingReplayBox(cfg, self.store, self.map_view)
+        self.arrow_box = FloatingArrowBox(cfg, self.store, self.commands,
+                                          self.map_view)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -120,10 +154,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-
-        width = self.width()
-
-        if width < 1200:
+        if self.width() < 1200:
             self.left_panel.setMaximumWidth(300)
             self.right_panel.setMaximumWidth(320)
         else:
@@ -147,6 +178,8 @@ class MainWindow(QMainWindow):
         bus.controller_ready_received.connect(store.on_controller_ready)
         bus.param_mode_received.connect(store.on_param_mode)
         bus.sea_state_received.connect(store.on_sea_state)
+        bus.replay_state_received.connect(store.on_replay_state)
+        bus.guardian_status_received.connect(store.on_guardian_status)
         bus.mission_path_received.connect(store.on_mission_path)
         bus.mission_path_failed.connect(self._on_mission_path_failed)
 
@@ -165,6 +198,8 @@ class MainWindow(QMainWindow):
         bus.estop_state_changed.connect(
             lambda s: _LOG.warning("safe-shutdown phase: %s", s)
             if s != "idle" else None)
+        bus.shutdown_unconfirmed.connect(self._on_shutdown_unconfirmed)
+        bus.estop_state_changed.connect(self._close_unconfirmed_box)
         # Launch process output: dedicated GUI console (right panel) + DEBUG
         # level on the terminal (visible with --verbose), order-preserving in
         # both since one queued signal drives both slots.
@@ -172,7 +207,7 @@ class MainWindow(QMainWindow):
         bus.launch_output.connect(lambda line: _LOG.debug("[launch] %s", line))
 
         # Panels ↔ map
-        self.left_panel.layer_toggled.connect(self.map_view.set_layer_visible)
+        self.right_panel.layer_toggled.connect(self.map_view.set_layer_visible)
         self.right_panel.time_window_changed.connect(self.map_view.set_time_window)
         self.right_panel.clear_paths_requested.connect(self._on_clear_paths)
         self.right_panel.zoom_in_requested.connect(self.map_view.zoom_in)
@@ -187,40 +222,97 @@ class MainWindow(QMainWindow):
         self.toolbar.create_pattern_clicked.connect(self._open_designer)
         self.toolbar.mission_launched.connect(self._on_mission_launched)
         self.sea_box.modify_sea_clicked.connect(self._on_modify_sea)
-        self.toolbar.mission_stopped.connect(self._on_mission_stopped)
+        self.replay_box.pause_requested.connect(
+            lambda pause: self._send_replay("pause" if pause else "resume"))
+        self.replay_box.rate_requested.connect(
+            lambda rate: self._send_replay("rate", rate))
         bus.launch_state_changed.connect(self._on_launch_state)
 
         # Manual target clicks
         self.map_view.target_clicked.connect(self._on_target_clicked)
+
+        # Run session (real-robot launches) and arrow control
+        self.run_panel.start_clicked.connect(self.run_session.start_run)
+        self.run_panel.stop_clicked.connect(self.run_session.stop_run)
+        self.toolbar.update_mission_requested.connect(self._on_update_mission)
+        self.run_session.message.connect(self._status.showMessage)
+        self.run_session.message.connect(lambda msg, _ms: _LOG.info("run session: %s", msg))
+        self.run_session.preview_requested.connect(self._on_session_preview)
+        self.run_session.preview_cleared.connect(self._on_session_preview_cleared)
+        self.run_session.deploy_requested.connect(self._arm_session_deployment)
+        self.run_session.arrows_release_requested.connect(
+            lambda: self.arrow_box.set_active(False, hold=False))
+        self.run_session.manual_target_cleared.connect(self._clear_manual_target_ui)
+        self.guardian_box.action_requested.connect(self._on_guardian_action)
+        self.arrow_box.engaged.connect(self._on_arrows_engaged)
+        self.arrow_box.released.connect(self._on_arrows_released)
 
     # ================================================================ tick
     def _on_tick(self) -> None:
         self.left_panel.refresh()
         self.right_panel.refresh()
         self.map_view.refresh()
-        if (hasattr(self, "_pending_preview_trajectory") and self._pending_preview_trajectory is not None and self.store.map_frame_ready()):
+        if (self._pending_preview_trajectory is not None
+                and self.store.map_frame_ready()):
             trajectory = self._pending_preview_trajectory
             self._pending_preview_trajectory = None
             self._request_path_preview(trajectory)
 
-        # Keep floating stats box glued to the top-right of the map view 
-        # (which inherently puts it glued to the top-left of the right panel)
-        if hasattr(self, 'stats_box'):
-            expected_x = self.map_view.width() - self.stats_box.width() - 8
-            expected_y = 8
-            if self.stats_box.pos().x() != expected_x or self.stats_box.pos().y() != expected_y:
-                self.stats_box.move(expected_x, expected_y)
-                self.stats_box.raise_()
+        self._refresh_floating_boxes()
+        self._refresh_guardian()
+        self._refresh_sim_badge()
 
-        # Sea state box: the mirror position, glued to the top-left of the map
-        # view. It hides itself outside a running simulation.
-        if hasattr(self, 'sea_box'):
-            self.sea_box.refresh()
-            if self.sea_box.pos() != QPoint(8, 8):
-                self.sea_box.move(8, 8)
-                self.sea_box.raise_()
+        # Run session: RUN box + session labels of the toolbar.
+        ss = self.store.session
+        self.run_panel.refresh()
+        self.toolbar.set_session_ui(
+            ss.active,
+            can_update=self.run_session.can_update(),
+            run_active=ss.run_in_progress,
+            release_visible=ss.motors_enabled and self.commands.estop_latched)
 
-        # Georeference status + satellite availability
+        self._refresh_georef_status()
+        # Mission readiness → launch state promotion. The FCU-connected check
+        # only applies to the real-robot graph; Sim_launch.py has no MAVROS.
+        if self.launcher.state == "starting":
+            fcu_ok = (self.store.robot.fcu_connected
+                      or self.store.mission.simulation)
+            if fcu_ok and self.store.robot.has_odom:
+                self.launcher.notify_running()
+
+    def _refresh_floating_boxes(self) -> None:
+        """Refresh the boxes floating over the map and keep each glued to its
+        corner of the map view (it has no layout to do that)."""
+        top_left = QPoint(8, 8)
+        top_right_x = self.map_view.width() - self.stats_box.width() - 8
+        if self.stats_box.pos() != QPoint(top_right_x, 8):
+            self.stats_box.move(top_right_x, 8)
+            self.stats_box.raise_()
+        # The sea box hides itself outside a running simulation, the replay
+        # box outside a bag replay.
+        self.sea_box.refresh()
+        if self.sea_box.pos() != top_left:
+            self.sea_box.move(top_left)
+            self.sea_box.raise_()
+        self.replay_box.refresh()
+        if not self.replay_box.isHidden() and self.replay_box.pos() != top_left:
+            self.replay_box.move(top_left)
+            self.replay_box.raise_()
+        m = self.store.mission
+        self.toolbar.set_replay_ui(m.replay and m.launch_running)
+
+        # Arrow control: whenever a launch with a controller runs (real
+        # session or Gazebo).
+        self.arrow_box.set_available(m.launch_running and bool(m.controller_type))
+        if not self.arrow_box.isHidden():
+            pos = QPoint(self.map_view.width() - self.arrow_box.width() - 8,
+                         self.map_view.height() - self.arrow_box.height() - 8)
+            if self.arrow_box.pos() != pos:
+                self.arrow_box.move(pos)
+                self.arrow_box.raise_()
+
+    def _refresh_georef_status(self) -> None:
+        """Status-bar georeference read-out + satellite layer availability."""
         geo = self.store.geo
         if geo.fit is None:
             self._geo_label.setText("georef: waiting for GPS fix…")
@@ -231,17 +323,7 @@ class MainWindow(QMainWindow):
                 f"georef: {quality} (rms {geo.fit.rms_m:.1f} m, "
                 f"{geo.fit.n_pairs} fixes)")
             self._geo_label.setStyleSheet(f"color: {color};")
-        self.left_panel.set_satellite_available(geo.is_valid)
-        # Map orientation is handled inside MapView (QGC-style: north-up
-        # fixed, the scene is ENU by construction, only the glyph rotates)
-        # — nothing to drive from here.
-        # Mission readiness → launch state promotion. The FCU-connected check
-        # only applies to the real-robot graph; Sim_launch.py has no MAVROS.
-        if self.launcher.state == "starting":
-            fcu_ok = (self.store.robot.fcu_connected
-                      or self.store.mission.simulation)
-            if fcu_ok and self.store.robot.has_odom:
-                self.launcher.notify_running()
+        self.right_panel.set_satellite_available(geo.is_valid)
 
     # ============================================================ mission events
     def _on_mission_launched(self, params: LaunchParameters) -> None:
@@ -253,10 +335,22 @@ class MainWindow(QMainWindow):
         m.gps_simulated = params.gps_simulated
         m.world_dir = params.world_dir
         m.sea_choice = params.sea
+        m.replay = bool(params.replay_bag)
         m.manual_target = None
         self.commands.set_simulation_mode(params.simulation)
+        # The station clock follows /clock in a simulation launch (a bag
+        # replay keeps the wall clock); re-anchored before the store resets.
+        station_clock().set_follow(params.simulation and not params.replay_bag)
+        self._sim_rtf = params.real_time_factor
         self.store.reset_experiment()
-        # Every launch restarts the robot side, which latches a NEW world
+        if params.session:
+            # Real robot = run session: connect, idle, runs by hand.
+            self.run_session.begin(params)
+            self._status.showMessage(
+                "Run session: the boat connects and goes into override but does "
+                "not move or log until START RUN. Drive it with Manual Target "
+                "or the arrow keys meanwhile.", 12000)
+        # Every launch restarts the control stack, which latches a NEW world
         # origin — the previous run's odom<->GPS pairs are wrong by
         # construction, so the anchor must start fresh (real and sim alike).
         self.store.reset_georeference()
@@ -265,7 +359,14 @@ class MainWindow(QMainWindow):
         # arming the station's SimGps too would put a second publisher on
         # the same topic with an arbitrary receiver origin and deploy the
         # trajectory into the wrong frame relative to the world geometry.
-        if params.gps_simulated and not params.world_dir:
+        if params.replay_bag:
+            # A replay publishes the RECORDED fixes: the only GPS publisher.
+            self.commands.disarm_sim_gps()
+            self._status.showMessage(
+                "Replay of a recorded run: the boat follows the recording "
+                "(pose, attitude, GPS, speed); pause or change the rate in the "
+                "REPLAY box.", 12000)
+        elif params.gps_simulated and not params.world_dir:
             self._arm_sim_gps(params)
         else:
             self.commands.disarm_sim_gps()
@@ -291,8 +392,14 @@ class MainWindow(QMainWindow):
         # (gated on map_frame_ready).
         deployment_pending = bool(params.gps_anchored_source) and not (
             params.simulation and not params.gps_simulated)
+        # A run session previews nothing up front: an anchored first mission
+        # is previewed by the deployment poll, a placed one only once its run
+        # starts (RunSession.preview_requested).
+        # A replay has no path server: its path (the run's -path.yaml
+        # snapshot) is published on /set_path by bag_replay instead.
         self._pending_preview_trajectory = (
-            None if deployment_pending else params.trajectory)
+            None if (deployment_pending or params.session or params.replay_bag)
+            else params.trajectory)
         self._start_gps_deployment(params)
 
     # ========================================================= simulated GPS
@@ -362,9 +469,20 @@ class MainWindow(QMainWindow):
         if not params.gps_anchored_source or (
                 params.simulation and not params.gps_simulated):
             return
+        self._arm_deployment(Path(params.gps_anchored_source),
+                             Path(params.gps_deployed_target))
+
+    def _arm_session_deployment(self, source: str) -> None:
+        """Update Mission chose a GPS-anchored path for the next run: deploy
+        it into the session file as soon as the frame is anchored (at once
+        when it already is) -- the same watcher a launch uses."""
+        self._stop_gps_deployment()
+        self._arm_deployment(Path(source), self.run_session.session_file)
+
+    def _arm_deployment(self, src: Path, dst: Path) -> None:
         from mcs.designer import io_yaml  # lazy: PyYAML machinery
-        self._gps_src = Path(params.gps_anchored_source)
-        self._gps_dst = Path(params.gps_deployed_target)
+        self._gps_src = src
+        self._gps_dst = dst
         self._gps_dst.unlink(missing_ok=True)  # never reuse a stale frame
         self._gps_hint_countdown = 0
         self._gps_timer = QTimer(self)
@@ -396,15 +514,22 @@ class MainWindow(QMainWindow):
         self._stop_gps_deployment()
         _LOG.info("GPS mission deployed to %s (fit rms %.2f m)",
                   self._gps_dst, geo.fit.rms_m)
-        self._status.showMessage(
-            f"GPS path deployed (georef rms {geo.fit.rms_m:.2f} m) — the "
-            "robot transitions onto the mission at its next path request.",
-            10000)
+        if self.store.session.active:
+            self.run_session.mark_deployed(str(self._gps_src))
+            self._status.showMessage(
+                f"GPS path deployed (georef rms {geo.fit.rms_m:.2f} m) — shown "
+                "on the map, start circled 'S'; the boat follows it when the "
+                "run starts.", 10000)
+        else:
+            self._status.showMessage(
+                f"GPS path deployed (georef rms {geo.fit.rms_m:.2f} m) — the "
+                "robot transitions onto the mission at its next path request.",
+                10000)
         QTimer.singleShot(
             1500, lambda: self._request_path_preview(f"from_yaml:{self._gps_dst}"))
 
     def _stop_gps_deployment(self) -> None:
-        timer = getattr(self, "_gps_timer", None)
+        timer = self._gps_timer
         if timer is not None:
             timer.stop()
             timer.deleteLater()
@@ -435,8 +560,8 @@ class MainWindow(QMainWindow):
     def _on_mission_path_failed(self, err: str) -> None:
         """One failed/timed-out /path_request must not mean 'no path ever':
         re-arm the pending preview (bounded, spaced) while the mission runs."""
-        retries = getattr(self, "_preview_retries_left", 0)
-        trajectory = getattr(self, "_last_preview_trajectory", None)
+        retries = self._preview_retries_left
+        trajectory = self._last_preview_trajectory
         if (trajectory is not None and retries > 0
                 and self.store.mission.launch_running):
             self._preview_retries_left = retries - 1
@@ -458,11 +583,14 @@ class MainWindow(QMainWindow):
         if self.store.mission.launch_running:
             self._pending_preview_trajectory = trajectory
 
-    def _on_mission_stopped(self) -> None:
-        pass  # state cleared on 'idle' launch_state
+    def _refresh_sim_badge(self) -> None:
+        text, level = sim_badge(station_clock(), getattr(self, "_sim_rtf", 1.0),
+                                self.cfg.sim_speed.rtf_warn_rel)
+        self.toolbar.set_sim_badge(text, level)
 
     def _on_launch_state(self, state: str) -> None:
         if state == "idle":
+            station_clock().set_follow(False)
             self.store.mission.launch_running = False
             self.store.mission.manual_target = None
             self.store.mission.simulation = False
@@ -482,6 +610,108 @@ class MainWindow(QMainWindow):
             self.toolbar.set_manual_target_active(False)
             if self.toolbar.manual_button.isChecked():
                 self.toolbar.manual_button.setChecked(False)
+            self.arrow_box.set_active(False, hold=False)
+            self.run_session.end()
+            self.store.guardian = None
+
+    # ============================================================ link guardian
+    def _real_session(self) -> bool:
+        m = self.store.mission
+        return m.launch_running and not m.simulation and not m.replay
+
+    def _refresh_guardian(self) -> None:
+        from mcs.core.guardian import summarize
+        g = self.cfg.guardian
+        ss, r = self.store.session, self.store.robot
+        view = summarize(
+            self.store.guardian, real_session=self._real_session(),
+            companion_found=g.enabled and Path(g.script).expanduser().is_file(),
+            fcu_connected=r.fcu_connected, armed=r.armed, mode=r.fcu_mode,
+            run_active=ss.run_in_progress,
+            estop_latched=self.commands.estop_latched)
+        self.guardian_box.update_view(view, self.store.guardian)
+        # Report each answered command once, in the status bar.
+        ack = self.store.guardian.ack if self.store.guardian is not None else None
+        if ack and ack.get("seq") != self._guardian_ack_seq:
+            self._guardian_ack_seq = ack.get("seq")
+            ok = "done" if ack.get("ok") else "FAILED"
+            self._status.showMessage(
+                f"Guardian {ack.get('cmd')}: {ok} — {ack.get('detail', '')}", 10000)
+
+    def _on_guardian_action(self, action: str) -> None:
+        if action == "rearm":
+            self.commands.rearm()
+            self._status.showMessage(
+                "Arm again: the boat briefly leaves override, the autopilot arms, "
+                "then override resumes.", 8000)
+            return
+        if self.commands.send_guardian_command(action) is None:
+            QMessageBox.warning(self, "Guardian", "The command could not be sent "
+                                "(ROS layer not running).")
+
+    def _guardian_stop_guard(self, proceed) -> None:
+        """Turn Off Connection: ask what the guardian does, then proceed - or
+        not."""
+        from mcs.core.guardian import needs_turn_off_choice
+        if not needs_turn_off_choice(self.store.guardian, real_session=self._real_session()):
+            proceed()
+            return
+        choice = ask_turn_off_choice(self, exiting=False)
+        if choice == "keep":
+            proceed()
+        elif choice == "off":
+            self._guardian_off_then(proceed)
+
+    def _guardian_off_then(self, proceed) -> None:
+        self._status.showMessage("Turning the link guardian OFF and disarming…", 8000)
+
+        def done(ok: bool, detail: str) -> None:
+            if ok:
+                proceed()
+                return
+            QMessageBox.critical(
+                self, "Guardian still ON",
+                f"The guardian could not be turned off: {detail}.\n\nNothing was "
+                "terminated. Try again, or choose 'Keep ON' to let the boat come back along its path.")
+        self.commands.guardian_off_and_disarm(done)
+
+    # ===================================================== unconfirmed 'default'
+    def _on_shutdown_unconfirmed(self, reason: str) -> None:
+        """Turn Off Connection / exit got no 'default' echo in time: ask.
+
+        Non-blocking (open(), not exec()) so a late echo, which still confirms,
+        can close the box itself through _close_unconfirmed_box.
+        """
+        self._close_unconfirmed_box("")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("'default' not confirmed")
+        box.setText(
+            f"{reason}: the boat has not confirmed 'default' after "
+            f"{self.cfg.shutdown_confirm_timeout_s:.0f} s.\n\n"
+            "Terminating now may leave the thrusters on RC passthrough and the "
+            "autopilot listening to this laptop only, so BlueOS / QGC cannot "
+            "drive the boat until 'default' is applied (or the autopilot reboots).")
+        wait = box.addButton("Wait again", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Terminate anyway", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(wait)
+
+        def answered(button) -> None:
+            self._unconfirmed_box = None
+            if button is wait:
+                self.commands.shutdown_retry()
+            else:
+                self.commands.shutdown_force()
+        box.buttonClicked.connect(answered)
+        self._unconfirmed_box = box
+        box.open()
+
+    def _close_unconfirmed_box(self, state: str) -> None:
+        box = self._unconfirmed_box
+        if box is not None and state != "unconfirmed":
+            self._unconfirmed_box = None
+            box.buttonClicked.disconnect()
+            box.close()
 
     # ============================================================ manual target
     def _on_manual_mode(self, armed: bool) -> None:
@@ -500,6 +730,10 @@ class MainWindow(QMainWindow):
             self.map_view.set_mode(MapMode.NORMAL)
 
     def _on_target_clicked(self, x: float, y: float) -> None:
+        if self.arrow_box.active:
+            # A clicked target is a newer intent than the keys: end arrow
+            # control (no hold point) before publishing it.
+            self.arrow_box.set_active(False, hold=False)
         if x == 0.0 and y == 0.0:
             # (0,0) is the reserved resume sentinel of master_control — nudge it.
             x = 1e-3
@@ -513,14 +747,71 @@ class MainWindow(QMainWindow):
         self.toolbar.set_manual_target_active(True)
 
     def _on_continue_mission(self) -> None:
-        """'Continue Original Mission': publish [0.0, 0.0], nothing else."""
+        """'Continue Original Mission': publish [0.0, 0.0], nothing else.
+
+        Between the runs of a session the same button reads 'Release Target'
+        and the same sentinel just lets go of the target (zero thrust)."""
         self.commands.resume_original_mission()
+        self._clear_manual_target_ui()
+        ss = self.store.session
+        if ss.active and not ss.run_in_progress:
+            self._status.showMessage(
+                "Published [0.0, 0.0] — target released; no run is active, the "
+                "boat holds zero thrust.", 6000)
+        else:
+            self._status.showMessage(
+                "Published [0.0, 0.0] — master_control resumes the original "
+                "mission.", 6000)
+
+    def _clear_manual_target_ui(self) -> None:
         self.store.mission.manual_target = None
         self.map_view.clear_manual_target()
         self.toolbar.set_manual_target_active(False)
+
+    # ============================================================ run session
+    def _on_update_mission(self) -> None:
+        """Update Mission (toolbar, run session, between runs)."""
+        from mcs.gui.dialogs.mission_update_dialog import MissionUpdateDialog
+        if not self.run_session.can_update():
+            self._status.showMessage(
+                "Update Mission is only possible between runs, once "
+                "master_control reports.", 6000)
+            return
+        dlg = MissionUpdateDialog(self.cfg, self.store.session.next, self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        self.run_session.update_mission(dlg.selection())
+
+    def _on_session_preview(self, trajectory: str) -> None:
+        """A run's path was just written: preview it (once the map is ready)."""
+        self._preview_retries_left = self.cfg.launch.path_request_max_retries
+        self._pending_preview_trajectory = trajectory
+
+    def _on_session_preview_cleared(self) -> None:
+        self._stop_gps_deployment()
+        self.store.mission_path = None
+        self._pending_preview_trajectory = None
+        self._last_preview_trajectory = None
+        self.commands.cancel_mission_path_request()
+
+    # ============================================================ arrow control
+    def _on_arrows_engaged(self) -> None:
+        if self.toolbar.manual_button.isChecked():
+            self.toolbar.manual_button.setChecked(False)   # disarm map clicks
         self._status.showMessage(
-            "Published [0.0, 0.0] — master_control resumes the original "
-            "mission.", 6000)
+            "Arrow control ON: ↑ ahead, ↓ astern, ← / → turn. Any running path "
+            "or pinger run is paused.", 8000)
+
+    def _on_arrows_released(self, hold: bool) -> None:
+        """Arrow control OFF: hold the boat where it is (a manual target at its
+        position, through the normal manual-target code), then release."""
+        r = self.store.robot
+        if hold and r.has_odom:
+            self._on_target_clicked(r.x, r.y)
+            self._status.showMessage(
+                "Arrow control OFF — holding position here. Use "
+                f"'{self.toolbar.continue_button.text()}' to let go.", 8000)
+        self.commands.release_arrows()
 
     def _on_clear_paths(self) -> None:
         self.store.clear_tracks()
@@ -534,7 +825,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================ designer
     def _on_modify_sea(self) -> None:
-        """Left panel 'Modify situation…': live sea-state change (sim)."""
+        """SEA STATE box 'Change sea state…': live sea-state change (sim)."""
         from mcs.core.sea import SeaCatalog, SeaChoice, find_presets_file
         from mcs.gui.dialogs.sea_state_dialog import SeaStateDialog
         if not self.store.mission.simulation:
@@ -555,6 +846,11 @@ class MainWindow(QMainWindow):
         else:
             self._status.showMessage("ROS is not running — sea state not sent", 8000)
 
+    def _send_replay(self, cmd: str, rate: float | None = None) -> None:
+        """REPLAY box: pause / resume / playback rate of the bag replay."""
+        if not self.commands.send_replay_command(cmd, rate):
+            self._status.showMessage("ROS is not running — replay command not sent", 8000)
+
     def _open_designer(self) -> None:
         """Open the Survey Pattern Designer (one shared, non-modal instance).
 
@@ -562,7 +858,7 @@ class MainWindow(QMainWindow):
         current fix" action only -- the editor is otherwise independent of
         live telemetry, deliberately (see DesignerWindow._active_fit)."""
         from mcs.designer.designer_window import DesignerWindow  # lazy import
-        if getattr(self, "_designer", None) is None:
+        if self._designer is None:
             self._designer = DesignerWindow(self.cfg, self.store, parent=self)
             self._designer.destroyed.connect(
                 lambda: setattr(self, "_designer", None))
@@ -584,6 +880,18 @@ class MainWindow(QMainWindow):
             return
         if self.launcher.running:
             if not self._exit_in_progress:
+                from mcs.core.guardian import needs_turn_off_choice
+                if needs_turn_off_choice(self.store.guardian,
+                                         real_session=self._real_session()):
+                    # The same guardian choice as Turn Off Connection, in
+                    # place of the plain confirmation.
+                    choice = ask_turn_off_choice(self, exiting=True)
+                    if choice == "keep":
+                        self._start_exit_sequence()
+                    elif choice == "off":
+                        self._guardian_off_then(self._start_exit_sequence)
+                    event.ignore()
+                    return
                 answer = QMessageBox.question(
                     self, "Mission running",
                     "A mission is still running. Publish 'default', stop the "
@@ -593,13 +901,19 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     event.ignore()
                     return
-                self._exit_in_progress = True
-                self.bus.shutdown_sequence_finished.connect(self._on_exit_sequence_done)
-                self.commands.safe_app_exit()
+                self._start_exit_sequence()
             event.ignore()  # keep the process (and the DDS writer) alive
             return
         self.ros.stop()
         event.accept()
+
+    def _start_exit_sequence(self) -> None:
+        """Safe app exit: the N1 sequence, then close once the launch is gone."""
+        if self._exit_in_progress:
+            return
+        self._exit_in_progress = True
+        self.bus.shutdown_sequence_finished.connect(self._on_exit_sequence_done)
+        self.commands.safe_app_exit()
 
     def _on_exit_sequence_done(self) -> None:
         """Safe-shutdown confirmed; now wait for the launch tree to exit."""

@@ -1,24 +1,28 @@
 """Left information panel.
 
 Sections (all collapsible):
-* **Layers** — visibility checkboxes for every map layer.
+* **Guardian** — the link guardian's box (``mcs/gui/guardian_box.py``),
+  hosted at the very top via :meth:`set_header`.
 * **Robot** — live pose, GPS, heading, speed, controller, mission state,
   motor commands, battery charge, travelled distance, elapsed time.
 * **Pinger** — world & robot-frame coordinates, live distance, last update.
 * **Target** — robot↔pinger or robot↔path distance depending on mode.
 * **ROS diagnostics** — per-topic rate / age / LED status.
+* **RUN** (real-robot run session only) — pinned below the scroll area, so it
+  sits under ROS DIAGNOSTICS and never scrolls away: START RUN / STOP RUN and
+  the run's status (``mcs/gui/run_panel.py``, hosted via :meth:`set_footer`).
 
-The panel is read-only except for the checkboxes; all values are pulled
-from the :class:`~mcs.models.store.DataStore` on the shared 10 Hz tick.
+The map-layer checkboxes live in the right column. The panel is read-only;
+all values are pulled from the :class:`~mcs.models.store.DataStore` on the
+shared 10 Hz tick.
 """
 
 from __future__ import annotations
 
-import time
+import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox,
     QGridLayout,
     QLabel,
     QScrollArea,
@@ -27,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import format_clock, station_clock
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection, InfoGrid, StatusLed
 from mcs.models.store import DataStore, TargetMode
@@ -37,34 +42,20 @@ _BATTERY_WARN_FRAC = 0.40
 _BATTERY_ERR_FRAC = 0.20
 _BATTERY_STALE_S = 15.0
 
-_LAYERS: list[tuple[str, str, bool]] = [
-    ("satellite", "Satellite map layer", False),
-    ("robot_track", "Robot trajectory", True),
-    ("mission_path", "Published mission path", True),
-    ("pinger", "USBL pinger position", True),
-    ("pinger_track", "USBL pinger trajectory", True),
-    ("target_line", "Robot → target line", True),
-    ("heading", "Robot heading arrow", False),
-    ("grid", "World grid", True),
-]
-
-
 class LeftPanel(QWidget):
     """Live-information sidebar."""
-
-    layer_toggled = Signal(str, bool)
 
     def __init__(self, cfg: AppConfig, store: DataStore,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._store = store
-        # Freely resizable via the splitter: a small minimum only, no
-        # maximum (a max-width cap prevented widening the panel at will).
         self.setMinimumWidth(220)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        self._outer = outer
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         outer.addWidget(scroll)
@@ -73,21 +64,7 @@ class LeftPanel(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
-
-        # ---- Layers ---------------------------------------------------------
-        sec_layers = CollapsibleSection("LAYERS")
-        self._layer_boxes: dict[str, QCheckBox] = {}
-        for key, label, default in _LAYERS:
-            box = QCheckBox(label)
-            box.setChecked(default)
-            box.toggled.connect(lambda on, k=key: self.layer_toggled.emit(k, on))
-            self._layer_boxes[key] = box
-            sec_layers.add_widget(box)
-        self._layer_boxes["satellite"].setEnabled(False)
-        self._layer_boxes["satellite"].setToolTip(
-            "Enabled once the odom ↔ GPS georeference is anchored "
-            "(a few GPS fixes, real or simulated — no motion needed).")
-        layout.addWidget(sec_layers)
+        self._content_layout = layout
 
         # ---- Robot -----------------------------------------------------------
         sec_robot = CollapsibleSection("ROBOT")
@@ -155,7 +132,7 @@ class LeftPanel(QWidget):
         g.set("Battery", *_battery_text(r))
         g.set("Travelled", f"{r.travelled_m:8.1f} m")
         elapsed = s.mission.elapsed_s()
-        g.set("Elapsed", _fmt_hms(elapsed) if elapsed is not None else "—")
+        g.set("Elapsed", format_clock(elapsed) if elapsed is not None else "—")
 
         p = s.pinger
         pg = self.pinger_grid
@@ -169,7 +146,7 @@ class LeftPanel(QWidget):
             pg.set("Robot frame", "—")
             pg.set("Distance", "—")
         if p.last_raw_update_t is not None:
-            age = time.monotonic() - p.last_raw_update_t
+            age = station_clock().now() - p.last_raw_update_t
             color = theme.OK if age < 3 else (theme.WARN if age < 10 else theme.ERR)
             pg.set("Last update", f"{age:5.1f} s ago", color)
         else:
@@ -196,6 +173,8 @@ class LeftPanel(QWidget):
             checks.append(s.robot.controller_ready)
         ready = sum(checks)
         label = "operational" if ready == len(checks) else "starting"
+        if s.session.active and ready == len(checks):
+            label = "run active" if s.session.run_active else "idle, no run"
         suffix = " (sim)" if s.mission.simulation else ""
         color = theme.OK if ready == len(checks) else theme.WARN
         return f"{label} ({ready}/{len(checks)}){suffix}", color
@@ -233,10 +212,13 @@ class LeftPanel(QWidget):
         self._diag_grid.addWidget(value, row, 2)
         self._diag_rows[topic] = (led, name, value)
 
-    def set_satellite_available(self, available: bool) -> None:
-        box = self._layer_boxes["satellite"]
-        if box.isEnabled() != available:
-            box.setEnabled(available)
+    def set_header(self, widget: QWidget) -> None:
+        """Put *widget* at the very top of the panel (the GUARDIAN box)."""
+        self._content_layout.insertWidget(0, widget)
+
+    def set_footer(self, widget: QWidget) -> None:
+        """Pin *widget* below the scroll area (the run session's RUN box)."""
+        self._outer.addWidget(widget)
 
 
 def _battery_text(r) -> tuple[str, str]:
@@ -255,7 +237,7 @@ def _battery_text(r) -> tuple[str, str]:
     if r.battery_v is not None:
         parts.append(f"{r.battery_v:5.2f} V")
     text = "  ".join(parts)
-    if r.battery_t is None or (time.monotonic() - r.battery_t) > _BATTERY_STALE_S:
+    if r.battery_t is None or (station_clock().now() - r.battery_t) > _BATTERY_STALE_S:
         return text, theme.TEXT_DIM
     pct = r.battery_pct
     if pct is None:
@@ -266,12 +248,4 @@ def _battery_text(r) -> tuple[str, str]:
 
 
 def _deg(rad: float) -> float:
-    import math
     return math.degrees(rad) % 360.0
-
-
-def _fmt_hms(seconds: float) -> str:
-    seconds = int(max(0, seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"

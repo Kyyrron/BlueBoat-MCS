@@ -7,7 +7,7 @@ applies a y-flip so +y points up on screen.  Items that must keep constant
 ``ItemIgnoresTransformations`` around a world-anchored origin.
 
 Z-order (back to front): tiles(-100) < grid(view background) < mission path
-< trajectories < target line < prediction < markers < robot.
+< its start "S" < trajectories < target line < prediction < markers < robot.
 """
 
 from __future__ import annotations
@@ -55,17 +55,16 @@ class PolylineItem(QGraphicsPathItem):
 
 
 class RobotItem(QGraphicsItemGroup):
-    """Boat glyph (constant pixel size) + world-scaled heading arrow.
+    """Boat glyph (constant pixel size), rotated to the boat's heading.
 
     Yaw convention: identical to the stack (``master_control`` /
     ``bridge_node`` both take yaw from ``R.from_quat(...).as_euler('xyz')``:
-    CCW-positive about +z in the y-up world frame). The *heading arrow* is a
-    plain world-coordinate line, so the view's y-flip orients it correctly
-    for free. The *glyph*, however, uses ``ItemIgnoresTransformations`` and
-    is therefore rotated in **device** space, where +y points down and Qt
-    rotations are clockwise-positive — a world yaw θ must be applied as
-    ``setRotation(-degrees(θ))`` there, otherwise the glyph renders mirrored
-    about the x-axis (the original "arrow not properly oriented" defect).
+    CCW-positive about +z in the y-up world frame). The glyph uses
+    ``ItemIgnoresTransformations`` and is therefore rotated in **device**
+    space, where +y points down and Qt rotations are clockwise-positive — a
+    world yaw θ must be applied as ``setRotation(-degrees(θ))`` there,
+    otherwise the glyph renders mirrored about the x-axis (the original
+    "arrow not properly oriented" defect).
     """
 
     def __init__(self) -> None:
@@ -79,12 +78,6 @@ class RobotItem(QGraphicsItemGroup):
         self._glyph.setPen(QPen(QColor("white"), 1.2))
         self._glyph.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.addToGroup(self._glyph)
-        # Heading arrow: world-scaled SOLID white line ahead of the boat
-        # (solid, so it can never be confused with the dashed target line).
-        self._arrow = QGraphicsLineItem()
-        self._arrow.setPen(_cosmetic_pen(QColor("white"), 1.8))
-        self.addToGroup(self._arrow)
-        self._arrow_visible = False
 
     def set_pose(self, x: float, y: float, heading: float) -> None:
         """Place the glyph at scene (x, y) pointing at scene ``heading``.
@@ -93,20 +86,11 @@ class RobotItem(QGraphicsItemGroup):
         is axis-aligned: the caller passes coordinates and heading already in
         scene axes (ENU true heading once georeferenced, raw world yaw
         before). The glyph ignores view transforms and is rotated in
-        **device** space (y-down, CW-positive), hence ``-degrees(heading)``;
-        the arrow is a plain scene line and picks up the view's y-flip for
-        free. This is the whole orientation contract — there is no separate
-        view-rotation term any more."""
+        **device** space (y-down, CW-positive), hence ``-degrees(heading)``.
+        This is the whole orientation contract — there is no view-rotation
+        term."""
         self._glyph.setPos(x, y)
         self._glyph.setRotation(-math.degrees(heading))
-        length = 4.0  # metres of look-ahead
-        self._arrow.setLine(QLineF(
-            x, y, x + length * math.cos(heading), y + length * math.sin(heading)))
-        self._arrow.setVisible(self._arrow_visible)
-
-    def set_heading_visible(self, visible: bool) -> None:
-        self._arrow_visible = visible
-        self._arrow.setVisible(visible)
 
 
 class MarkerItem(QGraphicsItemGroup):
@@ -185,6 +169,43 @@ class MissionPathItem(PolylineItem):
     def __init__(self) -> None:
         super().__init__(theme.C_MISSION_PATH, 2.0, Qt.PenStyle.SolidLine, z=10)
         self.setOpacity(0.9)
+
+
+class StartMarkerItem(QGraphicsItemGroup):
+    """Constant-pixel circled "S" on the first point of the mission path.
+
+    Says where a run begins: the boat drives there first when a GPS-anchored
+    run starts, and a placed path begins under the boat. Drawn in the path's
+    colour, just above it (z 11), below every live marker.
+    """
+
+    def __init__(self, z: float = 11.0, radius_px: float = 9.0) -> None:
+        super().__init__()
+        self.setZValue(z)
+        self._ring = QGraphicsEllipseItem(-radius_px, -radius_px,
+                                          2 * radius_px, 2 * radius_px)
+        self._ring.setBrush(QBrush(QColor(theme.BG_DARK)))
+        self._ring.setPen(QPen(theme.C_MISSION_PATH, 2.0))
+        self._ring.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.addToGroup(self._ring)
+        # A child of the ring, so it is untransformed (upright) as well.
+        self._text = QGraphicsSimpleTextItem("S", self._ring)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSizeF(9.5)
+        self._text.setFont(font)
+        self._text.setBrush(QBrush(theme.C_MISSION_PATH))
+        rect = self._text.boundingRect()
+        self._text.setPos(-rect.width() / 2.0, -rect.height() / 2.0)
+
+    def set_world_pos(self, x: float, y: float) -> None:
+        self._ring.setPos(x, y)
+
+    def scene_pos(self) -> tuple[float, float]:
+        """Current scene position (carried by the child ring, see
+        :meth:`MarkerItem.scene_pos`)."""
+        p = self._ring.pos()
+        return p.x(), p.y()
 
 
 def draw_north_indicator(painter, viewport_w: int) -> None:

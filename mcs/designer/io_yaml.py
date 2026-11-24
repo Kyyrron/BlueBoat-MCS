@@ -4,18 +4,26 @@ Two files per mission, in ``designer.trajectories_dir``:
 
 * ``<name>.yaml`` — the **runtime** trajectory: only what execution needs
   (format tag, speed, loop, time-stamped ``[t, x, y, yaw]`` samples plus
-  informative length/duration). Consumed on the robot side by
+  informative length/duration). Consumed by the control stack's
   ``BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py``;
   documented in ``docs/05_trajectory_format.md``.
 * ``<name>.meta.yaml`` — **editor** metadata: the full designer model
   (groups, locks, segment interpolation settings, comments). The runtime
   never reads it; without it a runtime file can still be re-imported as
   plain waypoints (decimated), so nothing is ever lost beyond styling.
+
+The read-only helpers the launch dialogs call once per saved mission
+(:func:`read_geo_anchor`, :func:`read_first_point`,
+:func:`read_start_misalignment`) parse through libyaml when it is installed and
+memoize the parsed file by ``(mtime, size)``, so a dialog that badges every
+saved path costs one ``stat`` per file once the files have been read.
 """
 
 from __future__ import annotations
 
 import datetime
+import math
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,6 +38,30 @@ if TYPE_CHECKING:  # annotation only -- see mcs/designer/sampling.py
 
 FORMAT = "blueboat_trajectory/1"
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+# libyaml's loader when the build has it (~9x faster on the dense sample files);
+# same constructors as SafeLoader, so the parsed data is identical.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+# path -> ((mtime_ns, size), parsed data). Read-only for callers.
+_DATA_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
+def _read_data(yaml_path: Path) -> dict:
+    """Parsed content of a runtime file, memoized until the file changes.
+
+    Raises ``OSError`` / ``yaml.YAMLError`` like a direct parse and caches only
+    successes. The returned dict is shared: callers must not mutate it."""
+    stat = yaml_path.stat()
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    key = str(yaml_path)
+    hit = _DATA_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    loaded = yaml.load(yaml_path.read_text(), Loader=_SAFE_LOADER) or {}
+    data = loaded if isinstance(loaded, dict) else {}
+    _DATA_CACHE[key] = (stamp, data)
+    return data
 
 
 def valid_name(name: str) -> bool:
@@ -97,12 +129,12 @@ def save_mission(directory: Path, name: str, model: MissionModel,
 def read_geo_anchor(yaml_path: Path) -> dict | None:
     """Return the geo_anchor block of a runtime file, if any."""
     try:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
+        data = _read_data(yaml_path)
     except OSError:
         return None
     anchor = data.get("geo_anchor")
     if isinstance(anchor, dict) and "lat0" in anchor and "lon0" in anchor:
-        return anchor
+        return dict(anchor)
     return None
 
 
@@ -113,7 +145,7 @@ def read_first_point(yaml_path: Path) -> tuple[float, float] | None:
     Never raises: an unreadable, non-YAML or malformed file answers None.
     """
     try:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
+        data = _read_data(yaml_path)
     except (OSError, yaml.YAMLError):
         return None
     points = data.get("points") or []
@@ -141,7 +173,7 @@ def read_start_misalignment(yaml_path: Path, tol_m: float, tol_deg: float
     misalignment to report" so it cannot break the launch dialog.
     """
     try:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
+        data = _read_data(yaml_path)
     except (OSError, yaml.YAMLError):
         return None
     try:
@@ -172,8 +204,8 @@ def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     from mcs.core.geo import local_en_to_latlon as _en_to_ll
 
     # A usable translation fit is all deployment needs: no rotation is
-    # estimated any more (the odom frame is local ENU), so no vehicle motion
-    # is required. The watcher retries until fixes have anchored the frame.
+    # estimated (the odom frame is local ENU), so no vehicle motion is
+    # required. The watcher retries until fixes have anchored the frame.
     if current_fit is None:
         raise ValueError("no georeference yet (waiting for GPS fixes)")
 
@@ -201,10 +233,64 @@ def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     deployed["deployed_from"] = str(src)
     deployed["deployed_fit_rms_m"] = round(float(current_fit.rms_m), 3)
     deployed["points"] = out_points
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(yaml.safe_dump(deployed, sort_keys=False,
-                                  default_flow_style=None))
+    _atomic_write_yaml(dst, deployed)
     return dst
+
+
+def place_mission(src: Path, x: float, y: float, yaw: float, dst: Path) -> Path:
+    """Place a NON-anchored mission at the boat, for the start of a run.
+
+    A run session (real-robot launch) fixes the world frame at connection,
+    long before a run starts, so a design-frame mission can no longer simply
+    start "where the boat was at launch": the boat has been driven since. The
+    whole path is therefore moved RIGIDLY so its first sample sits on the
+    boat's current world position (x, y) and its first heading on the boat's
+    current world heading ``yaw`` (odom yaw, radians ENU) -- the path starts
+    at the boat and runs out ahead of it. Shape, spacing and timing are
+    untouched: every sample is rotated by ``yaw - yaw_first`` about the first
+    sample, then translated; every yaw gains the same angle.
+
+    Written atomically to *dst* -- the file path_generation watches -- with
+    ``deployed_from`` and ``placed_at`` provenance. A GPS-anchored mission is
+    refused: it is geographically fixed and goes through deploy_mission.
+    """
+    data = yaml.safe_load(src.read_text()) or {}
+    if data.get("geo_anchor"):
+        raise ValueError(f"{src.name} is GPS-anchored: deploy it, do not place it")
+    points = data.get("points") or []
+    if not points:
+        raise ValueError(f"{src.name} has no points")
+    _t0, x0, y0, yaw0 = (float(v) for v in points[0][:4])
+    dpsi = float(yaw) - yaw0
+    c, s = math.cos(dpsi), math.sin(dpsi)
+    out_points = []
+    for t_s, px, py, pyaw in (row[:4] for row in points):
+        dx, dy = float(px) - x0, float(py) - y0
+        wyaw = float(pyaw) + dpsi
+        out_points.append([round(float(t_s), 3),
+                           round(float(x) + c * dx - s * dy, 4),
+                           round(float(y) + s * dx + c * dy, 4),
+                           round(math.atan2(math.sin(wyaw), math.cos(wyaw)), 5)])
+    placed = dict(data)
+    placed["deployed_from"] = str(src)
+    placed["placed_at"] = {"x": round(float(x), 4), "y": round(float(y), 4),
+                           "yaw": round(float(yaw), 5)}
+    placed["points"] = out_points
+    _atomic_write_yaml(dst, placed)
+    return dst
+
+
+def _atomic_write_yaml(dst: Path, data: dict) -> None:
+    """Write a runtime trajectory so a reader never sees half a file.
+
+    path_generation reloads its watched file on the next request after the
+    mtime changes, and in a run session that request can come within one
+    control tick of the write: write a sibling, then os.replace() it in.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    tmp.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=None))
+    os.replace(tmp, dst)
 
 
 def deployed_path(directory: Path, name: str) -> Path:

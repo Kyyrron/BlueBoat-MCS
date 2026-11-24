@@ -35,6 +35,14 @@ C_GRID = QColor(255, 255, 255, 22)
 C_GRID_MAJOR = QColor(255, 255, 255, 45)
 C_MEASURE = QColor("#56d4dd")
 
+
+
+def floating_box_style(object_name: str, border: str = "1px solid #555") -> str:
+    """Stylesheet of a translucent box floating over the map view."""
+    return (f"QWidget#{object_name} {{ background-color: rgba(45, 45, 45, 230);"
+            f" border: {border}; border-radius: 6px; }}")
+
+
 STYLESHEET = f"""
 QWidget {{
     background-color: {BG_DARK};
@@ -56,6 +64,7 @@ QLabel#sectionTitle {{
     padding: 4px 0px;
 }}
 QLabel#valueLabel {{ font-family: "DejaVu Sans Mono", monospace; }}
+QLabel#hint {{ color: {TEXT_DIM}; font-size: 11px; }}
 QGroupBox {{
     border: 1px solid {BORDER};
     border-radius: 4px;
@@ -85,6 +94,24 @@ QPushButton#estopButton {{
 }}
 QPushButton#estopButton:hover {{ background-color: #e04040; }}
 QPushButton#launchButton {{ font-weight: bold; }}
+QPushButton#runStartButton {{
+    background-color: #1f6f34; color: white; font-weight: bold; font-size: 15px;
+    border: 2px solid {OK}; border-radius: 5px; padding: 10px 12px;
+}}
+QPushButton#runStartButton:hover {{ background-color: #268a41; }}
+QPushButton#runStartButton:disabled {{
+    background-color: {BG_PANEL}; color: {TEXT_DIM}; border: 2px solid {BORDER};
+}}
+QPushButton#runStopButton {{
+    background-color: #8a5a00; color: white; font-weight: bold; font-size: 15px;
+    border: 2px solid {WARN}; border-radius: 5px; padding: 10px 12px;
+}}
+QPushButton#runStopButton:hover {{ background-color: #a86d00; }}
+QPushButton#releaseEstopButton {{
+    background-color: #5c4300; color: white; font-weight: bold;
+    border: 2px solid {WARN}; border-radius: 4px; padding: 8px 14px;
+}}
+QPushButton#releaseEstopButton:hover {{ background-color: #7a5900; }}
 QCheckBox {{ spacing: 6px; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; }}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {{

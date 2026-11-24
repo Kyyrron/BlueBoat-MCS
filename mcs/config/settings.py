@@ -39,15 +39,36 @@ class TopicsConfig:
     thruster_input: str = "/thruster_input"
     controller_ready: str = "/blueboat/controller_ready"
     param_mode: str = "/blueboat/param_mode"
+    # Run sessions (real-robot launches only): master_control's run state
+    # (String JSON, heartbeated 1 Hz) and robot_interface's per-run log state.
+    run_state: str = "/blueboat/run_state"
+    run_log: str = "/blueboat/run_log"
+    # Link guardian (real-robot sessions): the report of its laptop
+    # companion guardian.py watch (String JSON, 1 Hz).
+    guardian_status: str = "/link_guardian/status"
 
     # --- Simulation only (BlueBoat-SSS-Sim sea_state_node): the live sea
     # state (String JSON, latched, 2 Hz) and the command that changes it.
     sea_state: str = "/sim/sea_state"
+    # --- Bag replay only (blueboat_control bag_replay): the replay's
+    # state (String JSON, latched, 2 Hz) and its pause / rate command.
+    replay_state: str = "/replay/state"
+    # --- Simulation only: Gazebo's sim clock (rosgraph_msgs/Clock), the
+    # station clock's pace in every simulation launch (core/clock.py).
+    clock: str = "/clock"
 
     # --- Publications (commands consumed by the existing stack) ---
     input_str: str = "/blueboat/input_str"
     manual_target: str = "/blueboat/manual_target"
     sea_state_command: str = "/sim/sea_state/command"
+    replay_command: str = "/replay/command"
+    # Run-session commands to master_control (String JSON: configure / start /
+    # stop) and the arrow-key thrust stream ([right, left] N, [] = release).
+    run_command: str = "/blueboat/run_command"
+    arrow_thrust: str = "/blueboat/arrow_thrust"
+    # Link guardian commands to guardian.py watch (String JSON:
+    # {cmd: on|off|check|setup|reclaim, seq}).
+    guardian_command: str = "/link_guardian/command"
 
     # --- Services ---
     path_request: str = "/path_request"
@@ -75,6 +96,9 @@ class DiagnosticsConfig:
         "/blueboat/controller_ready": 30.0,
         "/blueboat/param_mode": 60.0,
         "/sim/sea_state": 3.0,
+        "/blueboat/run_state": 3.0,
+        "/blueboat/run_log": 3.0,
+        "/link_guardian/status": 3.0,
     })
     stale_age_multiplier: float = 4.0
     expected_hz: dict[str, float] = field(default_factory=lambda: {
@@ -88,6 +112,9 @@ class DiagnosticsConfig:
         "/monitoring_data": 20.0,
         "/thruster_input": 20.0,
         "/sim/sea_state": 2.0,
+        "/blueboat/run_state": 1.0,
+        "/blueboat/run_log": 1.0,
+        "/link_guardian/status": 1.0,
     })
     rate_window_s: float = 5.0
     update_period_s: float = 1.0
@@ -113,6 +140,10 @@ class LaunchConfig:
     # so the station's SimGps stays disarmed in this mode.
     sim_world_package: str = "blueboat_sss_sim"
     sim_world_launch_file: str = "full_mission_launch.py"
+    # Gazebo replay of a recorded real-robot run (blueboat_control):
+    # declares bag / world_dir / rate / heave / start_paused / gui. The boat
+    # is moved kinematically from the bag; no controller, no sea state.
+    replay_launch_file: str = "Replay_launch.py"
     worlds_root: str = str(Path.home() / "worlds")
     sim_robot_files: list[str] = field(default_factory=lambda: ["thrusters_ur"])
     sim_default_controller: str = "MPC"
@@ -125,6 +156,9 @@ class LaunchConfig:
     # for one run, pass spawn_yaw:=<radians> in Extra args — it is appended
     # after this one and ros2 launch takes the last occurrence.
     sim_spawn_yaw_deg: float = 0.0
+    # Controller choices. Every launch needs a controller (manual target and
+    # arrow keys go through master_control), so the dialogs never offer the
+    # empty entry; it stays only so an old config.json naming it still loads.
     controllers: list[str] = field(default_factory=lambda: ["", "PID", "LoS", "MPC"])
     trajectories: list[str] = field(default_factory=lambda: [
         "station_keeping", "circle", "straight_line", "sin",
@@ -146,6 +180,126 @@ class LaunchConfig:
     path_request_timeout_s: float = 10.0
     path_request_max_retries: int = 3
     path_request_retry_delay_s: float = 2.0
+    # Run sessions. The ONE trajectory file path_generation watches in a
+    # real-robot session (trajectory:=from_yaml:<this>): the station writes
+    # each run's path here -- GPS-deployed, or placed at the boat when the run
+    # starts. A hidden directory, so it never collides with a designer mission
+    # name and the mission lists never show it.
+    session_trajectory_file: str = str(
+        DEFAULT_CONFIG_DIR / "trajectories" / ".session" / "run.yaml")
+
+
+@dataclass
+class RunConfig:
+    """Run-session behaviour (real-robot launches)."""
+
+    # master_control's /blueboat/run_state older than this = not connected
+    # (it heartbeats at 1 Hz).
+    state_fresh_s: float = 3.0
+    # A configure / start / stop not acknowledged within this is reported.
+    ack_timeout_s: float = 3.0
+    # A started run whose position log robot_interface has not confirmed by
+    # then is flagged in the RUN box (field data would be missing).
+    log_confirm_timeout_s: float = 3.0
+
+
+@dataclass
+class ReplayConfig:
+    """Gazebo replay of a recorded run ("From a ros2bag")."""
+
+    # Where the launch dialog's folder picker opens: the run folders that
+    # robot_interface files a bag into (Robot_data/<stem>/<..>-bag/).
+    bag_root: str = str(Path.home() / "ros2_ws" / "data" / "Robot_data")
+    rates: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 2.0, 4.0])
+    default_rate: float = 1.0
+    # /replay/state older than this = the replay node is not answering.
+    state_fresh_s: float = 3.0
+    # GPS points sampled from the bag to choose eligible worlds.
+    world_track_points: int = 400
+
+
+def _default_guardian_script() -> str:
+    # The superproject's link_guardian/ sits beside this repository
+    # (<superproject>/BlueBoat-MCS/mcs/config/settings.py).
+    return str(Path(__file__).resolve().parents[3]
+               / "link_guardian" / "laptop" / "guardian.py")
+
+
+@dataclass
+class GuardianConfig:
+    """Link guardian: its laptop companion, started with every real-robot
+    session (``launch_manager.guardian_command``)."""
+
+    enabled: bool = True
+    # guardian.py of the superproject's link_guardian/ (absent in a standalone
+    # clone of this repository: the GUARDIAN box then says so).
+    script: str = field(default_factory=_default_guardian_script)
+    # Turn Off Connection / exit, "turn the guardian off first": how long to
+    # wait for the autopilot to confirm LGRD_ON = 0, then for the disarm.
+    off_confirm_timeout_s: float = 6.0
+    disarm_confirm_timeout_s: float = 4.0
+    # After 'default' is confirmed with the guardian OFF: how long to wait for
+    # /mavros/state to report MANUAL (the 'manual' token) before terminating.
+    manual_confirm_timeout_s: float = 4.0
+
+
+@dataclass
+class PerceptionConfig:
+    """BlueBoat-Perception companion:
+    ``ros2 launch <package> <launch_file> mode:=...`` started with every
+    personalized-world Gazebo run (the launch dialog's Session row: normal
+    session or dataset creation) and every real-robot launch (normal),
+    never for the empty world (no sonar) or a bag replay
+    (``launch_manager.perception_command``)."""
+
+    enabled: bool = True
+    package: str = "blueboat_perception"
+    launch_file: str = "perception_launch.py"
+
+
+@dataclass
+class SimSpeedConfig:
+    """Simulated sonar model and the ray-cast slow-down (owner, 2026-11-07).
+
+    The ray-cast sonar renders a ping in far more than its 50 ms period, so a
+    ray-cast run is slowed down as a whole: Gazebo's real-time factor
+    ``rtf`` (``full_mission_launch.py real_time_factor:=``), every node on
+    the one sim clock, so it pings at 20 Hz in sim time and records exactly
+    what a real-speed run does. The station's displays follow the sim clock
+    in every simulation launch (``core/clock.StationClock``)."""
+
+    rtf_min: float = 0.010
+    # Owner order 2026-11-10: up to x4. With the ray-cast's hold (the sonar
+    # pauses Gazebo while a slow ping renders), above x1 only the time between
+    # pings runs faster than real time; the control stack must keep up.
+    rtf_max: float = 4.000
+    rtf_step: float = 0.005
+    rtf_default: float = 0.100
+    # /clock silent this long (wall s): the station clock falls back to the
+    # wall pace and the SIM badge says "sim clock stopped".
+    clock_stall_s: float = 3.0
+    # The badge turns amber when the measured factor is this far (relative)
+    # from the requested one.
+    rtf_warn_rel: float = 0.20
+    # Extra folders searched first for ray-cast variant profiles (owner,
+    # 2026-11-09; mcs/core/sonar_variants.py); the simulator's installed
+    # config/ and the superproject checkout are always searched after them.
+    variant_dirs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ArrowConfig:
+    """Arrow-key thrust control (the floating box at the map's bottom-right)."""
+
+    max_power_n: float = 20.0       # slider range 0..max (master_control's
+                                    # thrust_limit saturates above 20 N anyway)
+    default_power_n: float = 10.0
+    turn_n: float = 5.0             # default Rotation: +/- added per side by
+                                    # Left / Right (the name predates the slider)
+    min_turn_n: float = 3.0         # Rotation slider range
+    max_turn_n: float = 15.0
+    publish_hz: float = 20.0        # stream rate; master_control's dead-man
+                                    # (arrow_timeout, 0.5 s) zeroes a gap
 
 
 @dataclass
@@ -160,8 +314,10 @@ class SeaConfig:
     personalized world, and through a companion
     ``ros2 launch blueboat_sss_sim sea_state_launch.py world_name:=ocean``
     process next to ``Sim_launch.py`` in the empty Gazebo world (that
-    launch file declares no sea arguments). A null choice (no current,
-    calm) starts no companion at all.
+    launch file declares no sea arguments). The companion runs for every
+    empty-world launch, a null choice (no current, calm) included — with no
+    sea argument then — because the simulator's catamaran hydrostatics carry
+    the hull in every run.
     """
 
     presets_file: str = ""
@@ -172,6 +328,10 @@ class SeaConfig:
     companion_launch_file: str = "sea_state_launch.py"
     stock_world_name: str = "ocean"
     ramp_s: float = 20.0          # live changes ramp over this many seconds
+    # The simulator's sea situation files (CR-03-3): "" = auto-locate the
+    # installed share/blueboat_sss_sim/config/sea_situations (then the
+    # superproject checkout). Offered by the sea-state dialog.
+    situations_dir: str = ""
 
 
 @dataclass
@@ -276,8 +436,22 @@ class AppConfig:
     sim_gps: SimGpsConfig = field(default_factory=SimGpsConfig)
     designer: DesignerConfig = field(default_factory=DesignerConfig)
     sea: SeaConfig = field(default_factory=SeaConfig)
+    run: RunConfig = field(default_factory=RunConfig)
+    arrows: ArrowConfig = field(default_factory=ArrowConfig)
+    replay: ReplayConfig = field(default_factory=ReplayConfig)
+    guardian: GuardianConfig = field(default_factory=GuardianConfig)
+    perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+    sim_speed: SimSpeedConfig = field(default_factory=SimSpeedConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
+    # Safe shutdown: how long to wait for param_set's 'default' echo. Its
+    # sequence (pull, three writes, read-back over the WiFi link) routinely
+    # outlasts the E-STOP's 2 s, and a launch torn down mid-sequence leaves
+    # SERVO1/3 on passthrough and the GCS sysid on mavros. Above param_set's
+    # own give-up bound (param_sequence_timeout_s, 20 s). A terminating
+    # sequence still unconfirmed then asks the operator; nothing is killed
+    # before they choose.
+    shutdown_confirm_timeout_s: float = 25.0
 
     # ------------------------------------------------------------------ I/O
     @classmethod

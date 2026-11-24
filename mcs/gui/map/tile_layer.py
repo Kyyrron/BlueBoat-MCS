@@ -12,6 +12,7 @@ misleading, which is worse than absent on an operator station.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from pathlib import Path
@@ -49,6 +50,17 @@ class TileLayer:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._items: dict[tuple[int, int, int], QGraphicsPixmapItem] = {}
         self._pending: set[tuple[int, int, int]] = set()
+        # Tiles the server answered "no such tile" (HTTP 4xx): no imagery at
+        # that zoom there. Never re-requested; the view falls back to a
+        # coarser zoom whose tiles are simply magnified.
+        self._missing: set[tuple[int, int, int]] = set()
+        # The provider's "no imagery here" placeholder is a normal 200 image.
+        # Learn its bytes from a tile that cannot exist (and from any image
+        # served for two different tiles) and treat it as missing.
+        self._placeholders: set[str] = set()
+        self._hash_keys: dict[str, set[tuple[int, int, int]]] = {}
+        self._key_hash: dict[tuple[int, int, int], str] = {}
+        self._probe_started = False
         self._enabled = False
         self._current_zoom = -1
 
@@ -76,6 +88,7 @@ class TileLayer:
         self._group.setVisible(self._enabled)
         if not self._enabled:
             return
+        self._start_probe()
 
         def scene_to_latlon(sx: float, sy: float) -> tuple[float, float]:
             return local_en_to_latlon(sx, sy, fit.lat0, fit.lon0)
@@ -88,15 +101,80 @@ class TileLayer:
                 zoom = z
                 break
 
+        # Fall back to a coarser zoom while every tile the view needs at this
+        # one is known to be missing: the loaded tiles are just magnified.
+        while zoom > 3:
+            keys = self._needed_tiles(view_rect_world, zoom, scene_to_latlon)
+            if not keys or any(k not in self._missing for k in keys):
+                break
+            zoom -= 1
+
         # Show only the current zoom level: without this, tiles fetched at an
         # earlier zoom stay on top/underneath and the imagery looks blurry
         # after zooming in or out.
         if zoom != self._current_zoom:
             self._current_zoom = zoom
             for (z, _x, _y), item in self._items.items():
-                item.setVisible(z == zoom)
+                item.setVisible(self._shown(z))
             self._evict(keep_zoom=zoom)
 
+        for key in self._needed_tiles(view_rect_world, zoom, scene_to_latlon):
+            if key not in self._missing:
+                self._ensure_tile(*key, fit)
+
+    def _shown(self, z: int) -> bool:
+        # Coarser tiles stay underneath (finer ones cover them) so the view
+        # is never blank while a finer zoom loads or has no imagery.
+        return self._current_zoom - 3 <= z <= self._current_zoom
+
+    def _start_probe(self) -> None:
+        if self._probe_started:
+            return
+        self._probe_started = True
+        # Tile 0/0 at the deepest zoom: open ocean corner, no imagery exists.
+        z = self._cfg.tile_max_zoom
+        request = QNetworkRequest(QUrl(self._cfg.tile_url.format(z=z, x=0, y=0)))
+        request.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader,
+                          "BlueBoatMissionControl/1.0")
+        reply = self._net.get(request)
+        reply.finished.connect(lambda r=reply: self._on_probe(r))
+
+    def _on_probe(self, reply: QNetworkReply) -> None:
+        data = bytes(reply.readAll())
+        ok = reply.error() == QNetworkReply.NetworkError.NoError and data
+        reply.deleteLater()
+        if ok:
+            self._learn_placeholder(hashlib.sha1(data).hexdigest())
+
+    def _learn_placeholder(self, digest: str) -> None:
+        """Mark ``digest`` as the placeholder: drop every tile showing it."""
+        if digest in self._placeholders:
+            return
+        self._placeholders.add(digest)
+        for key in list(self._hash_keys.get(digest, ())):
+            self._missing.add(key)
+            item = self._items.pop(key, None)
+            if item is not None:
+                self._group.removeFromGroup(item)
+                if item.scene() is not None:
+                    item.scene().removeItem(item)
+            (self._cache_dir / f"{key[0]}_{key[1]}_{key[2]}.png").unlink(
+                missing_ok=True)
+
+    def _note_hash(self, key: tuple[int, int, int], data: bytes) -> bool:
+        """Record a tile's bytes; True when they are the placeholder."""
+        digest = hashlib.sha1(data).hexdigest()
+        keys = self._hash_keys.setdefault(digest, set())
+        keys.add(key)
+        self._key_hash[key] = digest
+        if len(keys) >= 3:  # same image for three different tiles
+            self._learn_placeholder(digest)
+        return digest in self._placeholders
+
+    @staticmethod
+    def _needed_tiles(view_rect_world, zoom: int, scene_to_latlon
+                      ) -> list[tuple[int, int, int]]:
+        """Tile keys covering the view at ``zoom`` ([] when too many)."""
         corners = [
             (view_rect_world.left(), view_rect_world.top()),
             (view_rect_world.right(), view_rect_world.top()),
@@ -115,10 +193,9 @@ class TileLayer:
         y_min = max(0, int(math.floor(min(tys))))
         y_max = min(n - 1, int(math.floor(max(tys))))
         if (x_max - x_min + 1) * (y_max - y_min + 1) > 64:
-            return  # zoomed out too far for this many tiles; skip quietly
-        for tx in range(x_min, x_max + 1):
-            for ty in range(y_min, y_max + 1):
-                self._ensure_tile(zoom, tx, ty, fit)
+            return []  # zoomed out too far for this many tiles; skip quietly
+        return [(zoom, tx, ty) for tx in range(x_min, x_max + 1)
+                for ty in range(y_min, y_max + 1)]
 
     def _evict(self, keep_zoom: int, limit: int = 384) -> None:
         """Bound memory across zoom changes: drop hidden other-zoom tiles
@@ -141,6 +218,11 @@ class TileLayer:
             return
         cached = self._cache_dir / f"{z}_{x}_{y}.png"
         if cached.exists():
+            raw = cached.read_bytes()
+            if self._note_hash(key, raw):
+                self._missing.add(key)
+                cached.unlink(missing_ok=True)
+                return
             pm = QPixmap(str(cached))
             if not pm.isNull():
                 self._add_tile(key, pm, fit)
@@ -158,11 +240,17 @@ class TileLayer:
         self._pending.discard(key)
         data = bytes(reply.readAll())
         reply.deleteLater()
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if isinstance(status, int) and 400 <= status < 500:
+            self._missing.add(key)  # server has no tile here: stop asking
         if reply.error() != QNetworkReply.NetworkError.NoError or not data:
             _LOG.debug("Tile %s failed: %s", key, reply.errorString())
             return
         pm = QPixmap()
         if not pm.loadFromData(data):
+            return
+        if self._note_hash(key, data):
+            self._missing.add(key)
             return
         (self._cache_dir / f"{key[0]}_{key[1]}_{key[2]}.png").write_bytes(data)
         self._add_tile(key, pm, fit)
@@ -174,7 +262,8 @@ class TileLayer:
         # which is why the satellite layer never appeared at all.
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._group.addToGroup(item)
-        item.setVisible(key[0] == self._current_zoom)
+        item.setZValue(key[0])
+        item.setVisible(self._shown(key[0]))
         self._items[key] = item
         self._place_tile(item, *key, fit)
 

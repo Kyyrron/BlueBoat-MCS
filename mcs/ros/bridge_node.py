@@ -6,9 +6,10 @@ Responsibilities
   message to the :class:`~mcs.core.signals.SignalBus` (thread boundary).
 * Track per-topic reception statistics (rate / age / status) for the
   diagnostics panel.
-* Expose the two command publishers (``/blueboat/input_str`` and
-  ``/blueboat/manual_target``) through thread-safe helpers callable from
-  the GUI thread.
+* Expose the command publishers (``/blueboat/input_str``,
+  ``/blueboat/manual_target``, the run-session ``/blueboat/run_command`` and
+  the arrow-key ``/blueboat/arrow_thrust`` stream) through thread-safe helpers
+  callable from the GUI thread.
 * Query the mission path from the ``/path_request`` service exactly as
   ``path_publisher.py`` does (same request pattern, reused, not reinvented).
 
@@ -23,6 +24,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -34,11 +36,12 @@ from sensor_msgs.msg import BatteryState, NavSatFix
 from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import station_clock
 from mcs.core.signals import SignalBus
 
 _LOG = logging.getLogger(__name__)
 
-try:  # mavros_msgs may be absent on a dev laptop — degrade gracefully
+try:  # mavros_msgs may be absent (a workspace without MAVROS) — degrade gracefully
     from mavros_msgs.msg import State as MavrosState
 
     MAVROS_MSGS_AVAILABLE = True
@@ -52,6 +55,13 @@ try:  # Custom interface package of the existing stack (path service)
 except ImportError:  # pragma: no cover
     BLUEBOAT_IFACES_AVAILABLE = False
 
+try:  # rosgraph_msgs ships with every ROS 2 install; guarded like the rest
+    from rosgraph_msgs.msg import Clock as ClockMsg
+
+    CLOCK_MSGS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    CLOCK_MSGS_AVAILABLE = False
+
 
 # --------------------------------------------------------------------------
 @dataclass
@@ -63,14 +73,14 @@ class TopicStats:
     warn_age_s: float = 2.0
     stale_age_s: float = 8.0
     last_rx: float | None = None            # monotonic time of last message
-    _stamps: list[float] = field(default_factory=list)
+    _stamps: deque[float] = field(default_factory=deque)
 
     def mark(self, t: float, window_s: float) -> None:
         self.last_rx = t
         self._stamps.append(t)
         cutoff = t - window_s
         while self._stamps and self._stamps[0] < cutoff:
-            self._stamps.pop(0)
+            self._stamps.popleft()
 
     def rate_hz(self, now: float, window_s: float) -> float:
         stamps = [s for s in self._stamps if s >= now - window_s]
@@ -105,7 +115,7 @@ class BridgeNode(Node):
         # ---- Topic statistics -------------------------------------------
         self._stats: dict[str, TopicStats] = {}
         for name in vars(t).values():
-            if not isinstance(name, str) or name == t.path_request:
+            if not isinstance(name, str) or name in (t.path_request, t.clock):
                 continue
             warn = cfg.diagnostics.warn_age_s.get(name, 2.0)
             self._stats[name] = TopicStats(
@@ -140,11 +150,36 @@ class BridgeNode(Node):
         # situation immediately; the reader matches that durability.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, t.sea_state, self._on_sea_state, latched)
+        # Gazebo replay of a recorded run (bag_replay): latched state, like
+        # the sea state.
+        self.create_subscription(String, t.replay_state, self._on_replay_state, latched)
+        # Run sessions (real-robot launches): master_control's run state and
+        # robot_interface's per-run log state, both JSON, heartbeated at 1 Hz
+        # on the default profile at both ends (CM-4).
+        self.create_subscription(String, t.run_state, self._on_run_state, 10)
+        self.create_subscription(String, t.run_log, self._on_run_log, 10)
+        # Link guardian companion (guardian.py watch, real sessions): JSON
+        # report heartbeated at 1 Hz on the default profile at both ends.
+        self.create_subscription(String, t.guardian_status, self._on_guardian_status, 10)
+        # Gazebo's sim clock (simulation only; nothing publishes it in a
+        # real-robot graph): the station clock's pace in a simulation launch
+        # (core/clock.py), so a run slowed below real time (the ray-cast
+        # sonar) shows rates, ages and elapsed time in sim seconds. Not marked
+        # in the diagnostics: it would read at the physics rate, and in a
+        # real launch as a missing topic. BEST_EFFORT matches the bridge's
+        # publisher whatever its reliability.
+        self._station_clock = station_clock()
+        if CLOCK_MSGS_AVAILABLE:
+            self.create_subscription(ClockMsg, t.clock, self._on_clock, best_effort)
 
         # ---- Publishers ----------------------------------------------------
         self._pub_input_str = self.create_publisher(String, t.input_str, 10)
         self._pub_manual_target = self.create_publisher(Float32MultiArray, t.manual_target, 10)
         self._pub_sea_command = self.create_publisher(String, t.sea_state_command, 10)
+        self._pub_replay_command = self.create_publisher(String, t.replay_command, 10)
+        self._pub_run_command = self.create_publisher(String, t.run_command, 10)
+        self._pub_arrow_thrust = self.create_publisher(Float32MultiArray, t.arrow_thrust, 10)
+        self._pub_guardian_command = self.create_publisher(String, t.guardian_command, 10)
 
         # ---- Simulated GPS (Gazebo runs of GPS-anchored missions) ----------
         # The station itself publishes NavSatFix on the real GPS topic, which
@@ -182,8 +217,11 @@ class BridgeNode(Node):
         self.create_timer(0.2, self._poll_path_future)
 
     # ================================================================ inputs
+    def _on_clock(self, msg) -> None:
+        self._station_clock.feed(msg.clock.sec + msg.clock.nanosec * 1e-9)
+
     def _mark(self, topic: str) -> float:
-        t = time.monotonic()
+        t = self._station_clock.now()
         st = self._stats.get(topic)
         if st is not None:
             st.mark(t, self._cfg.diagnostics.rate_window_s)
@@ -267,26 +305,50 @@ class BridgeNode(Node):
 
     def _on_sea_state(self, msg: String) -> None:
         t = self._mark(self._cfg.topics.sea_state)
-        try:
-            payload = json.loads(msg.data)
-        except (ValueError, TypeError):
-            return
-        if isinstance(payload, dict):
+        payload = _json_object(msg.data)
+        if payload is not None:
             self._bus.sea_state_received.emit(t, payload)
+
+    def _on_replay_state(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.replay_state)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.replay_state_received.emit(t, payload)
 
     def _on_param_mode(self, msg: String) -> None:
         t = self._mark(self._cfg.topics.param_mode)
         self._bus.param_mode_received.emit(t, str(msg.data))
 
+    def _on_run_state(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.run_state)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.run_state_received.emit(t, payload)
+
+    def _on_run_log(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.run_log)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.run_log_received.emit(t, payload)
+
+    def _on_guardian_status(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.guardian_status)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.guardian_status_received.emit(t, payload)
+
     # =============================================================== outputs
     # publish() on rclpy publishers is safe to call from other threads; the
     # lock only serialises our own bookkeeping.
-    def publish_input_str(self, command: str) -> None:
-        """Publish on /blueboat/input_str ('default', 'override', 'stop', ...)."""
+    def _publish_text(self, publisher, text: str) -> None:
         with self._pub_lock:
             msg = String()
-            msg.data = command
-            self._pub_input_str.publish(msg)
+            msg.data = text
+            publisher.publish(msg)
+
+    def publish_input_str(self, command: str) -> None:
+        """Publish on /blueboat/input_str ('default', 'override', 'stop', ...)."""
+        self._publish_text(self._pub_input_str, command)
         self._bus.command_sent.emit(f"input_str ← '{command}'")
 
     def input_str_subscriber_count(self) -> int:
@@ -299,11 +361,13 @@ class BridgeNode(Node):
 
     def publish_sea_state_command(self, payload: str) -> None:
         """Publish a JSON command on /sim/sea_state/command (sim only)."""
-        with self._pub_lock:
-            msg = String()
-            msg.data = payload
-            self._pub_sea_command.publish(msg)
+        self._publish_text(self._pub_sea_command, payload)
         self._bus.command_sent.emit("sea_state/command ← " + payload[:60])
+
+    def publish_replay_command(self, payload: str) -> None:
+        """Publish a JSON command on /replay/command (bag replay only)."""
+        self._publish_text(self._pub_replay_command, payload)
+        self._bus.command_sent.emit("replay/command ← " + payload[:60])
 
     def publish_manual_target(self, x: float, y: float) -> None:
         """Publish a manual target; (0, 0) resumes the original mission."""
@@ -312,6 +376,32 @@ class BridgeNode(Node):
             msg.data = [float(x), float(y)]
             self._pub_manual_target.publish(msg)
         self._bus.command_sent.emit(f"manual_target ← [{x:.2f}, {y:.2f}]")
+
+    def publish_run_command(self, payload: dict) -> None:
+        """Publish one run-session command (JSON) on /blueboat/run_command."""
+        self._publish_text(self._pub_run_command, json.dumps(payload))
+        self._bus.command_sent.emit(f"run_command ← {payload.get('cmd', '?')}")
+
+    def publish_guardian_command(self, payload: dict) -> None:
+        """Publish one command (JSON) to the guardian companion."""
+        self._publish_text(self._pub_guardian_command, json.dumps(payload))
+        self._bus.command_sent.emit(f"link_guardian/command ← {payload.get('cmd', '?')}")
+
+    def run_command_subscriber_count(self) -> int:
+        """Matched subscriptions on /blueboat/run_command (master_control in
+        a run session). Thread-safe, like input_str_subscriber_count."""
+        return self._pub_run_command.get_subscription_count()
+
+    def publish_arrow_thrust(self, values) -> None:
+        """Publish [right, left] N, or [] to release arrow control.
+
+        Called at the stream rate (20 Hz) while arrow control is on, so it
+        deliberately emits no ``command_sent``: the status bar and the log
+        would drown in it. Engaging and releasing are reported by the GUI."""
+        with self._pub_lock:
+            msg = Float32MultiArray()
+            msg.data = [float(v) for v in values]
+            self._pub_arrow_thrust.publish(msg)
 
     # ---------------------------------------------------------- simulated GPS
     def set_sim_gps(self, model) -> None:
@@ -331,7 +421,7 @@ class BridgeNode(Node):
         if model is None or self._last_odom is None:
             return
         t, x, y = self._last_odom
-        if time.monotonic() - t > 0.5:
+        if self._station_clock.now() - t > 0.5:
             return  # Gazebo paused or starting: no fake fixes from stale poses
         lat, lon = model.fix_for(x, y)
         msg = NavSatFix()
@@ -418,7 +508,7 @@ class BridgeNode(Node):
 
     # ------------------------------------------------------------ statistics
     def _emit_stats(self) -> None:
-        now = time.monotonic()
+        now = self._station_clock.now()
         window = self._cfg.diagnostics.rate_window_s
         snapshot = {
             name: {
@@ -430,3 +520,12 @@ class BridgeNode(Node):
             for name, st in self._stats.items()
         }
         self._bus.topic_stats_updated.emit(snapshot)
+
+
+def _json_object(text: str) -> dict | None:
+    """Decode a JSON status message; anything but an object is ignored."""
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None

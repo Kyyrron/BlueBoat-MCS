@@ -7,30 +7,40 @@ timeline currently displays.
 
 Design notes
 ------------
-* All times are ``time.monotonic()`` seconds stamped at message reception,
-  giving one consistent clock across every source topic.
+* All times are station-clock seconds stamped at message reception
+  (:func:`mcs.core.clock.station_clock`: ``time.monotonic()``, sim-paced
+  under ``/clock`` in a simulation launch), giving one consistent clock
+  across every source topic.
 * Derived quantities that already exist on a ROS topic are *not* recomputed
   here (e.g. the current path target comes from ``/monitoring_data``).  The
   only computations performed are pure display transforms: pinger body ->
   world frame, distances, travelled-distance integration, speed statistics.
+* **Run sessions** (real-robot launches): histories record only
+  while a RUN is active (:meth:`DataStore.recording`). Between runs the live
+  state (boat glyph, pinger, target) keeps updating, but nothing is appended,
+  so the trail, statistics, distance plot and timeline stay frozen on the last
+  run until the next Start Run resets them. Outside a session (simulation)
+  recording is unconditional.
 """
 
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
 
 from mcs.config.settings import AppConfig
+from mcs.core.clock import station_clock
 from mcs.core.geo import GeoReferencer
 from mcs.core.series import TimeSeries
 
 
 def now_mono() -> float:
-    return time.monotonic()
+    """Now on the station clock (``time.monotonic()`` outside a simulation
+    launch; sim-paced under ``/clock`` in one -- core/clock.py)."""
+    return station_clock().now()
 
 
 class TargetMode(Enum):
@@ -55,6 +65,8 @@ class RobotState:
     lon: float | None = None
     compass_heading: float | None = None    # true heading, rad CCW-from-east
     fcu_connected: bool = False
+    armed: bool = False                     # /mavros/state: the AUTOPILOT's arming
+    fcu_mode: str = ""                      # /mavros/state: ArduPilot mode name
     battery_v: float | None = None          # pack voltage, None = not reported
     battery_pct: float | None = None        # charge fraction 0..1
     battery_t: float | None = None          # reception time of the last message
@@ -92,22 +104,78 @@ class MissionState:
                                             # deferred deploy — runs as on real water
     manual_target: tuple[float, float] | None = None
     world_dir: str = ""                     # personalized world folder ("" = empty Gazebo)
+    # Gazebo replay of a recorded real-robot run: the recorded GPS,
+    # compass and odom drive the map exactly as on real water, so the map
+    # waits for a real GPS anchor; nothing commands the replayed boat.
+    replay: bool = False
     sea_choice: object = None               # SeaChoice chosen at launch (sim only)
-    started_t: float | None = None          # first odom after launch
+    started_t: float | None = None          # first odom after launch (session: of the run)
+    stopped_t: float | None = None          # session: when the last run stopped
     path_target: tuple[float, float] | None = None   # x_d, y_d from /monitoring_data
+    # False only in an idle run session: no path / pinger is being followed.
+    following: bool = True
 
     @property
     def target_mode(self) -> TargetMode:
         if self.manual_target is not None:
             return TargetMode.MANUAL
-        if not self.launch_running or self.controller_type == "":
+        if (not self.launch_running or self.controller_type == ""
+                or not self.following):
             return TargetMode.NONE
         return TargetMode.PINGER if self.use_pinger else TargetMode.PATH
 
     def elapsed_s(self) -> float | None:
         if self.started_t is None:
             return None
-        return now_mono() - self.started_t
+        end = self.stopped_t if self.stopped_t is not None else now_mono()
+        return max(0.0, end - self.started_t)
+
+
+@dataclass
+class NextMission:
+    """What the next run of a session executes (launch dialog / Update Mission)."""
+
+    source: str = ""                        # designer runtime YAML ("" = pinger)
+    name: str = ""
+    anchored: bool = False                  # source carries a geo_anchor
+    use_pinger: bool = False
+    controller_type: str = "PID"
+    note: str = ""
+
+    def summary(self) -> str:
+        what = "USBL pinger" if self.use_pinger else (self.name or "no path")
+        return f"{what} · {self.controller_type}"
+
+
+@dataclass
+class SessionState:
+    """A real-robot run session (connected; runs started and stopped by hand).
+
+    ``state`` / ``log`` are the last ``/blueboat/run_state`` (master_control)
+    and ``/blueboat/run_log`` (robot_interface) JSON payloads; ``run_active``
+    follows master_control's acknowledgement, ``run_pending`` the command the
+    station sent and is still waiting on."""
+
+    active: bool = False
+    motors_enabled: bool = False            # launched with enable_motors:=True
+    next: NextMission = field(default_factory=NextMission)
+    run_active: bool = False
+    run_pending: str = ""                   # "start" | "stop" | ""
+    run: int = 0                            # run counter (current / last)
+    state: dict = field(default_factory=dict)
+    state_t: float | None = None
+    log: dict = field(default_factory=dict)
+    log_t: float | None = None
+    arrow_active: bool = False
+    arrow_cmd: tuple[float, float] = (0.0, 0.0)   # (right, left) N
+
+    @property
+    def run_in_progress(self) -> bool:
+        """A run is active, or its start was sent and is awaiting the ack."""
+        return self.run_active or self.run_pending == "start"
+
+    def state_fresh(self, max_age_s: float) -> bool:
+        return self.state_t is not None and (now_mono() - self.state_t) <= max_age_s
 
 
 @dataclass
@@ -126,6 +194,7 @@ class DataStore:
     robot: RobotState = field(default_factory=RobotState)
     pinger: PingerState = field(default_factory=PingerState)
     mission: MissionState = field(default_factory=MissionState)
+    session: SessionState = field(default_factory=SessionState)
 
     def __post_init__(self) -> None:
         self.geo = GeoReferencer(self.cfg.geo)
@@ -138,6 +207,8 @@ class DataStore:
         self.mission_path: np.ndarray | None = None  # (n, 3) x, y, yaw
         self._t0: float | None = None             # experiment time origin
         self.sea = None                           # SeaReadout | None (sim only)
+        self.replay = None                        # ReplayReadout | None (bag replay)
+        self.guardian = None                      # GuardianReadout | None (real sessions)
 
     # -------------------------------------------------------------- updates
     def on_odom(self, t: float, pose, twist) -> None:
@@ -147,6 +218,9 @@ class DataStore:
         r.x, r.y, r.yaw = float(pose[0]), float(pose[1]), float(pose[5])
         r.speed = math.hypot(float(twist[0]), float(twist[1]))
         r.has_odom = True
+        if not self.recording():
+            # Idle run session: the glyph moves, nothing is recorded.
+            return
         if prev is not None:
             step = math.hypot(r.x - prev[0], r.y - prev[1])
             if step < 5.0:  # reject origin-reset jumps from the odometry source
@@ -158,14 +232,10 @@ class DataStore:
 
         self.robot_track.append(t, (r.x, r.y, r.yaw))
         self.speed_hist.append(t, (r.speed,))
-        # NOTE: geo pairing happens in on_gps (at GPS rate, with a freshness
-        # guard on the odom pose) — pairing here at odom rate re-used one GPS
-        # fix against ~4 different odom positions and biased the estimate.
-        # NOTE: the pinger world position is deliberately NOT recomputed here.
-        # Re-anchoring a (possibly stale, dead-reckoned) body-frame pinger
-        # vector to every new robot pose made the pinger marker follow the
-        # robot's motion; it is now computed once per pinger message, with
-        # the pose concurrent with that message (see on_pinger_body).
+        # Geo pairing happens in on_gps (at GPS rate, with a freshness guard
+        # on the odom pose): pairing at odom rate would reuse one GPS fix
+        # against several odom positions and bias the estimate. The pinger
+        # world position is deliberately NOT recomputed here (on_pinger_body).
         self._record_target_distance(t)
 
     def on_sea_state(self, t: float, payload: dict) -> None:
@@ -175,14 +245,27 @@ class DataStore:
         if r is not None:
             self.sea = r
 
+    def on_guardian_status(self, t: float, payload: dict) -> None:
+        """Latest link-guardian report (``/link_guardian/status`` JSON)."""
+        from mcs.core.guardian import GuardianReadout
+        r = GuardianReadout.from_json(payload, received_mono=t)
+        if r is not None:
+            self.guardian = r
+
+    def on_replay_state(self, t: float, payload: dict) -> None:
+        """Latest bag-replay state (``/replay/state`` JSON)."""
+        from mcs.core.replay import parse_state
+        r = parse_state(payload, received_mono=t)
+        if r is not None:
+            self.replay = r
+
     def on_compass(self, t: float, heading_deg: float) -> None:
         """Absolute heading from /mavros/global_position/compass_hdg
         (degrees, clockwise from north). Convert to the math convention used
         everywhere else (radians, CCW from east): east=0, north=pi/2, so
         heading_math = 90 - compass_deg."""
-        import math as _m
-        a = _m.radians(90.0 - float(heading_deg))
-        self.robot.compass_heading = _m.atan2(_m.sin(a), _m.cos(a))
+        a = math.radians(90.0 - float(heading_deg))
+        self.robot.compass_heading = math.atan2(math.sin(a), math.cos(a))
 
     def on_gps(self, t: float, lat: float, lon: float) -> None:
         if lat == 0.0 and lon == 0.0:
@@ -195,11 +278,12 @@ class DataStore:
             self.geo.add_pair(t, r.x, r.y, lat, lon)
 
     def on_mavros_state(self, t: float, connected: bool, armed: bool, mode: str) -> None:
-        # Only the connection flag is consumed (the readiness count in the left
-        # panel). `armed` and `mode` are kept in the signal signature because
-        # they ride the same mavros_msgs/State message, but nothing displays
-        # them -- storing them would be state no widget ever reads.
+        # The connection flag feeds the readiness count; the arming state and
+        # the ArduPilot mode the GUARDIAN box - the autopilot's own arming,
+        # distinct from robot_interface's motor gate.
         self.robot.fcu_connected = connected
+        self.robot.armed = armed
+        self.robot.fcu_mode = mode
 
     def on_battery(self, t: float, volts, pct) -> None:
         """A field the FCU does not report arrives as None and must not
@@ -214,11 +298,11 @@ class DataStore:
     def on_pinger_body(self, t: float, xyz) -> None:
         """Pinger message received: THIS is the only place the pinger's world
         position is computed, using the robot pose concurrent with the
-        message. Between messages the marker stays fixed in the world —
-        composing an older body-frame vector with newer robot poses (the
-        previous behaviour) dragged the pinger along with the robot.
-        Residual lag now comes only from the robot side (Waterlinked
-        'filaco' filtering + dead-reckoning drift, see 03_ros_integration)."""
+        message (N4). Between messages the marker stays fixed in the world —
+        composing an older body-frame vector with newer robot poses would
+        drag the pinger along with the robot. Residual lag comes only from
+        the source (robot_interface: Waterlinked 'filaco' filtering +
+        dead-reckoning drift, see 03_ros_integration)."""
         p = self.pinger
         p.t = t
         p.body = (float(xyz[0]), float(xyz[1]), float(xyz[2]) if len(xyz) > 2 else 0.0)
@@ -232,6 +316,8 @@ class DataStore:
         xw = r.x + c * p.body[0] - s * p.body[1]
         yw = r.y + s * p.body[0] + c * p.body[1]
         p.world = (xw, yw)
+        if not self.recording():
+            return
         last = self.pinger_track.last()
         if last is None or (t - last[0]) > 0.2:  # trail stored at <= 5 Hz
             self.pinger_track.append(t, (xw, yw))
@@ -246,16 +332,18 @@ class DataStore:
         # which captures the world target before its inRobotFrame() conversion
         # (the '--- world-frame monitoring target ---' markers, all branches).
         # (Do NOT re-add a robot->world fixup here: it would double-convert.
-        # If the boat is running a STALE build that predates that capture,
+        # If ~/ros2_ws/install holds a STALE build that predates that capture,
         # LoS-path/manual/pinger targets arrive robot-frame and will display
-        # off-path — rebuild the boat workspace, do not compensate here.)
+        # off-path — colcon build in ~/ros2_ws, do not compensate here.)
         if len(data) >= 7:
             self.mission.path_target = (float(data[4]), float(data[5]))
-        self._record_target_distance(t)
+        if self.recording():
+            self._record_target_distance(t)
 
     def on_thruster(self, t: float, right: float, left: float) -> None:
         self.robot.thrust_right, self.robot.thrust_left = right, left
-        self.thrust_hist.append(t, (right, left))
+        if self.recording():
+            self.thrust_hist.append(t, (right, left))
 
     def on_controller_ready(self, t: float, ready: bool) -> None:
         self.robot.controller_ready = ready
@@ -267,6 +355,12 @@ class DataStore:
         self.mission_path = np.asarray(poses, dtype=np.float64) if len(poses) else None
 
     # -------------------------------------------------------------- derived
+    def recording(self) -> bool:
+        """Do histories record right now? Always, except in a run session
+        between runs (a start already sent counts as running, so the first
+        samples of a run are never lost waiting for its acknowledgement)."""
+        return not self.session.active or self.session.run_in_progress
+
     def active_target_world(self) -> tuple[float, float] | None:
         """World position of whatever the boat is currently steering to."""
         mode = self.mission.target_mode
@@ -304,18 +398,20 @@ class DataStore:
 
         * non-GPS sim (no anchored mission): immediately — the sim world is
           already ENU, identity anchor, no tiles;
-        * GPS-sim (anchored mission, synthesised NavSatFix feed) and real
-          water: once the odom->GPS translation is anchored (a few fixes,
-          no vehicle motion required).
+        * GPS-sim (anchored mission, synthesised NavSatFix feed), the Gazebo
+          replay of a recorded run (its recorded fixes) and real water: once
+          the odom->GPS translation is anchored (a few fixes, no vehicle
+          motion required).
 
         Nothing is drawn on the map before this."""
         return self.geo.is_valid or (
-            self.mission.simulation and not self.mission.gps_simulated)
+            self.mission.simulation and not self.mission.gps_simulated
+            and not self.mission.replay)
 
     def reset_georeference(self) -> None:
         """Fresh anchor for a fresh run — called on every mission launch.
 
-        Each launch restarts the robot side, which latches a NEW world
+        Each launch restarts the control stack, which latches a NEW world
         origin; pairs recorded against the previous run's origin are wrong
         by construction, and the rolling fit window would blend the two
         frames for minutes. Consumers read ``store.geo`` per tick, so
@@ -367,5 +463,7 @@ class DataStore:
             s.clear()
         self.robot.travelled_m = 0.0
         self.mission.started_t = None
+        self.mission.stopped_t = None
         self._t0 = None
         self.sea = None
+        self.replay = None

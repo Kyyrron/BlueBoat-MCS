@@ -1,20 +1,30 @@
 """High-level operator commands, the **E-STOP** and the **safe-shutdown guarantee**.
 
-Three operator actions, three separate jobs — they are deliberately NOT nested
-(2026-09-04). Before that, E-STOP published ``default``, which dropped out of
-override, and "E-STOP + Stop Override" additionally killed the launch, so an
-operator could not cut the motors without also giving the servo mapping back and
-could not give the mapping back without ending the mission:
+Three operator actions, three separate jobs — deliberately NOT nested, so the
+operator can cut the motors without giving the servo mapping back, and give the
+mapping back without ending the mission:
 
 ===========================  =========================  ===========================
 Action                       Publishes                  Terminates the launch?
 ===========================  =========================  ===========================
 E-STOP                       ``stop``                   **no**
 E-STOP + Stop Override       ``stop`` then ``default``  **no**
+Release E-STOP               ``enable``                 **no**
 Stop Mission / App Exit      ``default``                yes, after confirmation
+(Turn Off Connection in a
+real-robot run session)
 ===========================  =========================  ===========================
 
-``stop`` is what an emergency stop should be: robot-side it zeroes the thrust,
+In a run session (every real-robot launch) the two terminating
+paths first end a run that is still active (``stop`` on
+``/blueboat/run_command``, so its CSV is closed and filed by the control stack
+rather than by the teardown), then run the same sequence, unchanged.
+``Release E-STOP`` exists because a session stays connected between runs: it
+publishes ``enable``, the only token that clears ``robot_interface``'s latch --
+which also re-opens the motor gate, so the station offers it only in a session
+launched with motors enabled.
+
+``stop`` is what an emergency stop should be: ``robot_interface`` zeroes the thrust,
 disables the motor gate, disarms and **latches** until an explicit ``enable``, all
 without leaving override. Leaving override is a *transfer* of authority — the RC
 channels go back to whatever else is transmitting — so it is the operator's
@@ -39,8 +49,8 @@ How the guarantee is implemented (layered, strongest evidence first)
    proves ``robot_interface``'s subscription has completed QoS discovery
    with this publisher: under DDS reliable QoS, a sample handed to the
    writer will then be delivered (with retransmission) as long as the writer
-   stays alive. A count of 0 is reported to the operator (nothing on the
-   robot side could receive the command) and the sequence still publishes
+   stays alive. A count of 0 is reported to the operator (no subscriber
+   in the control stack could receive the command) and the sequence still publishes
    and re-checks, in case discovery completes within the window.
 2. **Publication.** ``publish()`` is synchronous into the DDS writer: when
    it returns, the sample is queued in the reliable send path. This is the
@@ -51,8 +61,10 @@ How the guarantee is implemented (layered, strongest evidence first)
    ``/blueboat/param_mode``. Receiving ``'default'`` back proves the command
    traversed publisher → robot_interface → param_set and was *acted on*, not
    merely delivered. The sequence waits for this echo up to
-   ``estop_confirm_timeout_s``; at half the timeout it republishes once
-   (idempotent — 'default' is a mode, not an increment).
+   ``shutdown_confirm_timeout_s`` (25 s: param_set's pull + writes + read-back
+   over the WiFi link outlast a couple of seconds, and a launch killed
+   mid-sequence leaves the thrusters on passthrough); at half the timeout it
+   republishes once (idempotent — 'default' is a mode, not an increment).
 
    ``param_set`` now HEARTBEATS that topic at 1 Hz so a late station sees the
    mode without waiting for a transition. A heartbeat is not evidence that this
@@ -62,11 +74,23 @@ How the guarantee is implemented (layered, strongest evidence first)
    the operator asked — the state being demanded already holds, and that is
    reported as its own confirmation level rather than dressed up as an echo.
 4. **Reliable-writer flush fallback.** If no echo arrives (e.g. ``param_set``
-   not running), the matched-subscription evidence from step 1 plus a
+   not running) and the sequence would **terminate**, nothing is killed yet:
+   ``SignalBus.shutdown_unconfirmed`` asks the operator, who either waits
+   again (:meth:`shutdown_retry`, 'default' republished) or terminates
+   anyway (:meth:`shutdown_force`); a late echo meanwhile still confirms. A
+   non-terminating sequence (Stop Override) and the operator's "terminate
+   anyway" fall back to the matched-subscription evidence from step 1 plus a
    ``estop_flush_delay_s`` grace period — during which the process, node and
    writer are deliberately kept alive so the reliable protocol can complete
    its handshake/retransmissions — is accepted as transmission confirmation,
    and the operator is told which level of confirmation was obtained.
+4b. **MANUAL (guardian OFF only).** When the operator turned the link guardian
+   OFF first (:meth:`guardian_off_and_disarm` succeeded) and 'default' is
+   confirmed, a terminating sequence publishes ``manual`` (robot_interface
+   sets the autopilot's MANUAL mode) unless ``/mavros/state`` already reads
+   MANUAL, and waits up to ``guardian.manual_confirm_timeout_s`` for it, so the
+   boat is left in the mode BlueOS / QGC drive it in. Never after "Keep ON":
+   there the guardian is meant to take the boat HOME.
 5. **Only after 3 or 4 completes** does node termination begin
    (:meth:`LaunchManager.stop`, itself SIGINT-first). The ordering is
    enforced structurally: termination lives in :meth:`_finish`, reachable
@@ -81,6 +105,8 @@ asynchronous callers (Application Exit) can proceed.
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from enum import Enum, auto
 
 from PySide6.QtCore import QObject, QTimer
@@ -96,6 +122,8 @@ _LOG = logging.getLogger(__name__)
 class _Phase(Enum):
     IDLE = auto()
     WAIT_CONFIRM = auto()
+    WAIT_OPERATOR = auto()   # no echo in time; the operator decides
+    WAIT_MANUAL = auto()     # 'manual' published, waiting for /mavros/state
     FLUSHING = auto()
 
 
@@ -118,6 +146,14 @@ class CommandCenter(QObject):
         self._terminate_after = False
         self._republished = False
         self._simulation = False
+        self._reason = ""
+        # Set when the guardian was confirmed OFF for this turn-off: the
+        # terminating sequence then also returns the autopilot to MANUAL.
+        self._restore_manual = False
+        self._manual_deadline = 0.0
+        self._manual_timer = QTimer(self)
+        self._manual_timer.setInterval(100)
+        self._manual_timer.timeout.connect(self._poll_manual)
         self._mode_toggle_next = "default"  # state of the Default/Override button
         # Last mode seen on /blueboat/param_mode. param_set heartbeats that topic,
         # so a repeat is not evidence of anything; the sequence needs a
@@ -136,10 +172,34 @@ class CommandCenter(QObject):
         # in _phase: the panic button must never be blocked by, and must never
         # block, an in-flight 'default' sequence.
         self._estop_pending = False
+        # Latched since the last 'stop' this station published, until it
+        # publishes 'enable' (Release E-STOP). What the robot really holds is
+        # confirmed by controller_ready; this is the station's own record.
+        self._estop_latched = False
         self._estop_timer = QTimer(self)
         self._estop_timer.setSingleShot(True)
         self._estop_timer.timeout.connect(self._on_estop_timeout)
         bus.controller_ready_received.connect(self._on_controller_ready)
+
+        # Run sessions: called before a terminating sequence so an active run
+        # is stopped (and filed) first. Set by RunSession; None outside one.
+        self._before_terminate: Callable[[], None] | None = None
+
+        # Link guardian: commands to its companion are seq-numbered; the
+        # turn-off pre-step watches the companion's report and /mavros/state.
+        self._guardian_seq = 0
+        self._guardian = None               # last GuardianReadout
+        self._fcu_armed = False
+        self._fcu_mode = ""
+        self._goff_done: Callable[[bool, str], None] | None = None
+        self._goff_phase = ""               # '' | 'off' | 'disarm'
+        self._goff_seq = -1
+        self._goff_deadline = 0.0
+        self._goff_timer = QTimer(self)
+        self._goff_timer.setInterval(100)
+        self._goff_timer.timeout.connect(self._poll_guardian_off)
+        bus.guardian_status_received.connect(self._on_guardian_status)
+        bus.mavros_state_received.connect(self._on_mavros_state)
 
     # ------------------------------------------------------------- commands
     def _node(self):
@@ -209,6 +269,153 @@ class CommandCenter(QObject):
         node.publish_sea_state_command(payload)
         return True
 
+    def send_replay_command(self, cmd: str, rate: float | None = None) -> bool:
+        """Pause / resume / re-rate the Gazebo replay of a recorded run."""
+        from mcs.core.replay import command_json
+        node = self._ros.node
+        if node is None:
+            return False
+        node.publish_replay_command(command_json(cmd, rate))
+        return True
+
+    # ---------------------------------------------------------- run sessions
+    def send_run_command(self, payload: dict) -> bool:
+        """Publish one run-session command on /blueboat/run_command."""
+        node = self._node()
+        if node is None:
+            return False
+        try:
+            node.publish_run_command(payload)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            _LOG.error("run_command publish raised: %s", exc)
+            self._bus.ros_log.emit(f"Run command not sent: {exc}")
+            return False
+        return True
+
+    def run_command_subscriber_count(self) -> int:
+        """Matched master_control subscriptions; -1 when unknown."""
+        node = self._ros.node
+        if node is None:
+            return -1
+        try:
+            return int(node.run_command_subscriber_count())
+        except Exception:  # noqa: BLE001 - graph query is diagnostic only
+            return -1
+
+    # ---------------------------------------------------------- link guardian
+    def _on_guardian_status(self, t: float, payload: dict) -> None:
+        from mcs.core.guardian import GuardianReadout
+        r = GuardianReadout.from_json(payload, received_mono=t)
+        if r is not None:
+            self._guardian = r
+
+    def _on_mavros_state(self, _t: float, _connected: bool, armed: bool, mode: str) -> None:
+        self._fcu_armed = armed
+        self._fcu_mode = mode
+
+    def send_guardian_command(self, cmd: str, **extra) -> int | None:
+        """One command to the guardian companion; returns its seq (None = not sent)."""
+        from mcs.core.guardian import command_json
+        node = self._node()
+        if node is None:
+            return None
+        self._guardian_seq += 1
+        try:
+            node.publish_guardian_command(command_json(cmd, self._guardian_seq, **extra))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            _LOG.error("guardian command publish raised: %s", exc)
+            self._bus.ros_log.emit(f"Guardian command not sent: {exc}")
+            return None
+        return self._guardian_seq
+
+    def rearm(self) -> None:
+        """'rearm': robot_interface re-runs its arm-before-override sequence
+        (normal mapping -> arm -> override; refused during a run or E-STOP)."""
+        node = self._node()
+        if node is not None:
+            node.publish_input_str("rearm")
+
+    def guardian_off_and_disarm(self, done: Callable[[bool, str], None]) -> None:
+        """Turn Off Connection / exit, "turn the guardian off first".
+
+        Sends ``off`` and waits for the companion to report the autopilot's
+        confirmation (its ack, or ``guardian_on`` False), then publishes
+        ``disarm`` and waits for ``/mavros/state`` to show it. ``done(ok,
+        detail)`` is called once: ``ok`` False means the guardian may still be
+        ON and the caller must not terminate. A disarm that is not confirmed
+        does not fail the step - with the guardian OFF the boat stays put.
+        """
+        if self._goff_done is not None:
+            done(False, "already turning the guardian off")
+            return
+        seq = self.send_guardian_command("off")
+        if seq is None:
+            done(False, "the guardian companion could not be reached")
+            return
+        self._goff_done = done
+        self._goff_phase = "off"
+        self._goff_seq = seq
+        self._goff_deadline = time.monotonic() + self._cfg.guardian.off_confirm_timeout_s
+        self._goff_timer.start()
+
+    def _poll_guardian_off(self) -> None:
+        now = time.monotonic()
+        if self._goff_phase == "off":
+            r = self._guardian
+            ack = r.ack if r is not None else None
+            if ack and ack.get("seq") == self._goff_seq:
+                if not ack.get("ok"):
+                    self._goff_finish(False, f"the autopilot refused: {ack.get('detail', '?')}")
+                    return
+                self._goff_phase = "disarm"
+            elif now > self._goff_deadline:
+                self._goff_finish(False, "no confirmation that the guardian is OFF")
+                return
+            else:
+                return
+            # Guardian confirmed OFF: disarm (skipped when already disarmed).
+            if not self._fcu_armed:
+                self._goff_finish(True, "guardian OFF, autopilot disarmed")
+                return
+            node = self._node()
+            if node is not None:
+                node.publish_input_str("disarm")
+            self._goff_deadline = now + self._cfg.guardian.disarm_confirm_timeout_s
+            return
+        if self._goff_phase == "disarm":
+            if not self._fcu_armed:
+                self._goff_finish(True, "guardian OFF, autopilot disarmed")
+            elif now > self._goff_deadline:
+                self._goff_finish(True, "guardian OFF (disarm not confirmed)")
+
+    def _goff_finish(self, ok: bool, detail: str) -> None:
+        self._goff_timer.stop()
+        done, self._goff_done = self._goff_done, None
+        self._goff_phase = ""
+        _LOG.info("guardian off-and-disarm: %s (%s)", "ok" if ok else "FAILED", detail)
+        self._bus.ros_log.emit(f"Link guardian: {detail}.")
+        # Guardian OFF: nothing will bring the boat home, so the shutdown that
+        # follows leaves it in MANUAL for BlueOS / QGC (step 4b).
+        self._restore_manual = ok
+        if done is not None:
+            done(ok, detail)
+
+    def publish_arrow_thrust(self, right: float, left: float) -> None:
+        """Arrow-key stream tick: [right, left] N (silent when ROS is down)."""
+        node = self._ros.node
+        if node is not None:
+            node.publish_arrow_thrust([right, left])
+
+    def release_arrows(self) -> None:
+        """Release arrow control in master_control (an empty array)."""
+        node = self._ros.node
+        if node is not None:
+            node.publish_arrow_thrust([])
+
+    def set_before_terminate(self, hook: Callable[[], None] | None) -> None:
+        """Run-session hook called by the terminating paths before 'default'."""
+        self._before_terminate = hook
+
     def set_simulation_mode(self, simulation: bool) -> None:
         """Adapt the safe-shutdown sequence to the running graph.
 
@@ -251,6 +458,7 @@ class CommandCenter(QObject):
             return
 
         self._estop_pending = True
+        self._estop_latched = True
         self._bus.estop_state_changed.emit("estop")
         self._estop_timer.start(int(self._cfg.estop_confirm_timeout_s * 1000))
 
@@ -265,6 +473,28 @@ class CommandCenter(QObject):
         _LOG.warning("E-STOP + Stop Override triggered")
         self.emergency_stop()
         self.safe_shutdown(terminate_nodes=False, reason="Stop Override")
+
+    @property
+    def estop_latched(self) -> bool:
+        """True from a published 'stop' until 'enable' is published."""
+        return self._estop_latched
+
+    def release_estop(self) -> None:
+        """Release E-STOP: publish 'enable', the only token that clears
+        robot_interface's latch. It ALSO turns the motor gate back on
+        (release_estop -> set_motors(True)), so the GUI only offers it in a
+        session launched with motors enabled. It does not touch the parameter
+        mode: after E-STOP + Stop Override the boat is in 'default' and the
+        operator publishes 'override' again with the mode button."""
+        node = self._node()
+        if node is None:
+            return
+        _LOG.warning("Release E-STOP: publishing 'enable'")
+        node.publish_input_str("enable")
+        self._estop_latched = False
+        self._estop_pending = False
+        self._estop_timer.stop()
+        self._bus.estop_state_changed.emit("estop-released")
 
     def _on_controller_ready(self, _t: float, ready: bool) -> None:
         """robot_interface withdraws readiness the instant it latches the stop."""
@@ -287,14 +517,26 @@ class CommandCenter(QObject):
     # ------------------------------------------------------- shutdown paths
 
     def safe_stop_mission(self) -> None:
-        """Stop Mission button: guarantee 'default' before graceful teardown."""
+        """Stop Mission / Turn Off Connection: guarantee 'default' before
+        graceful teardown (an active run is stopped first, in a session)."""
         _LOG.info("Stop Mission requested — running safe-shutdown sequence")
+        self._stop_active_run()
         self.safe_shutdown(terminate_nodes=True, reason="Stop Mission")
 
     def safe_app_exit(self) -> None:
         """Application Exit with a mission running: same guarantee."""
         _LOG.info("Application exit requested — running safe-shutdown sequence")
+        self._stop_active_run()
         self.safe_shutdown(terminate_nodes=True, reason="Application Exit")
+
+    def _stop_active_run(self) -> None:
+        hook = self._before_terminate
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as exc:  # noqa: BLE001 - never blocks the shutdown
+            _LOG.error("stopping the active run before shutdown failed: %s", exc)
 
     # ------------------------------------------------------------- sequence
     def safe_shutdown(self, terminate_nodes: bool, reason: str) -> None:
@@ -319,8 +561,8 @@ class CommandCenter(QObject):
             return
         node = self._ros.node
         if node is None:
-            # Degraded mode: nothing can be published, but nothing robot-side
-            # is reachable either. Tear the launch down if asked and finish.
+            # Degraded mode: nothing can be published, but no control-stack
+            # node is reachable either. Tear the launch down if asked and finish.
             self._bus.ros_log.emit(
                 f"{reason}: ROS layer unavailable — skipping publish, "
                 "stopping launch process only.")
@@ -331,6 +573,7 @@ class CommandCenter(QObject):
 
         self._terminate_after = terminate_nodes
         self._republished = False
+        self._reason = reason
         self._phase = _Phase.WAIT_CONFIRM
         # Snapshot BEFORE publishing: the echo that confirms this command must
         # be a transition into 'default', not param_set's 1 Hz heartbeat.
@@ -389,11 +632,14 @@ class CommandCenter(QObject):
             _LOG.info("%s: boat already in 'default' — no transition to wait for",
                       reason)
             QTimer.singleShot(
-                int(self._cfg.estop_flush_delay_s * 1000), self._finish)
+                int(self._cfg.estop_flush_delay_s * 1000), self._after_default)
             return
 
         # (3) Wait for the end-to-end param_mode echo; republish once at T/2.
-        timeout_ms = int(self._cfg.estop_confirm_timeout_s * 1000)
+        self._start_confirm_wait()
+
+    def _start_confirm_wait(self) -> None:
+        timeout_ms = int(self._cfg.shutdown_confirm_timeout_s * 1000)
         self._confirm_timer.start(timeout_ms)
         self._retry_timer.start(timeout_ms // 2)
 
@@ -413,18 +659,33 @@ class CommandCenter(QObject):
 
     def _on_param_mode(self, _t: float, mode: str) -> None:
         self._last_param_mode = mode
-        if (self._phase is _Phase.WAIT_CONFIRM and mode == "default"
-                and self._mode_before != "default"):
+        # A late echo still confirms while the operator is being asked.
+        if (self._phase in (_Phase.WAIT_CONFIRM, _Phase.WAIT_OPERATOR)
+                and mode == "default" and self._mode_before != "default"):
             # (3) succeeded: full-chain, acted-upon confirmation.
             self._confirm_timer.stop()
             self._retry_timer.stop()
             _LOG.info("safe-shutdown: 'default' confirmed by param_mode echo")
             self._bus.estop_state_changed.emit("confirmed")
-            self._finish()
+            self._after_default()
 
     def _on_confirm_timeout(self) -> None:
         if self._phase is not _Phase.WAIT_CONFIRM:
             return
+        if self._terminate_after:
+            # Terminating now would very likely kill param_set mid-sequence,
+            # leaving SERVO1/3 on passthrough and the GCS sysid on mavros: the
+            # boat then answers no other ground station. Ask instead.
+            self._phase = _Phase.WAIT_OPERATOR
+            self._bus.estop_state_changed.emit("unconfirmed")
+            self._bus.ros_log.emit(
+                f"{self._reason}: 'default' not confirmed by the boat after "
+                f"{self._cfg.shutdown_confirm_timeout_s:.0f} s — nothing terminated.")
+            self._bus.shutdown_unconfirmed.emit(self._reason)
+            return
+        self._flush_unconfirmed()
+
+    def _flush_unconfirmed(self) -> None:
         # (4) Fallback: no application echo. The command was handed to a
         # reliable writer with (normally) a matched subscription; keep the
         # writer alive for the flush delay so DDS can complete delivery,
@@ -436,12 +697,72 @@ class CommandCenter(QObject):
             "reliable writer; flushing before any node termination.")
         QTimer.singleShot(int(self._cfg.estop_flush_delay_s * 1000), self._finish)
 
+    def shutdown_retry(self) -> None:
+        """Operator: "Wait again" — republish 'default' and wait once more."""
+        if self._phase is not _Phase.WAIT_OPERATOR:
+            return
+        _LOG.info("safe-shutdown: operator waits again for 'default'")
+        self._phase = _Phase.WAIT_CONFIRM
+        self._republished = False
+        self._bus.estop_state_changed.emit("publishing")
+        self._safe_republish()
+        self._start_confirm_wait()
+
+    def shutdown_force(self) -> None:
+        """Operator: "Terminate anyway" — the step-4 flush, then terminate."""
+        if self._phase is not _Phase.WAIT_OPERATOR:
+            return
+        _LOG.warning("safe-shutdown: operator terminates without a 'default' echo")
+        self._flush_unconfirmed()
+
+    def _after_default(self) -> None:
+        """'default' holds: return the autopilot to MANUAL first when the
+        guardian was turned OFF for this turn-off (step 4b), then finish."""
+        if not (self._terminate_after and self._restore_manual
+                and not self._simulation and self._fcu_mode != "MANUAL"):
+            self._finish()
+            return
+        node = self._ros.node
+        if node is None:
+            self._finish()
+            return
+        try:
+            node.publish_input_str("manual")
+        except Exception as exc:  # noqa: BLE001 - never blocks the shutdown
+            _LOG.error("publish('manual') raised: %s", exc)
+            self._finish()
+            return
+        _LOG.info("safe-shutdown: guardian OFF — 'manual' published (mode %s)",
+                  self._fcu_mode or "unknown")
+        self._phase = _Phase.WAIT_MANUAL
+        self._bus.estop_state_changed.emit("manual")
+        self._manual_deadline = (time.monotonic()
+                                 + self._cfg.guardian.manual_confirm_timeout_s)
+        self._manual_timer.start()
+
+    def _poll_manual(self) -> None:
+        if self._phase is not _Phase.WAIT_MANUAL:
+            self._manual_timer.stop()
+            return
+        if self._fcu_mode == "MANUAL":
+            _LOG.info("safe-shutdown: autopilot in MANUAL")
+        elif time.monotonic() > self._manual_deadline:
+            self._bus.ros_log.emit(
+                f"safe-shutdown: the autopilot did not report MANUAL (still "
+                f"'{self._fcu_mode or '?'}') — set it from BlueOS / QGC.")
+        else:
+            return
+        self._manual_timer.stop()
+        self._phase = _Phase.FLUSHING
+        QTimer.singleShot(int(self._cfg.estop_flush_delay_s * 1000), self._finish)
+
     def _finish(self) -> None:
         """(5) Termination — structurally reachable only after 3 or 4."""
         self._phase = _Phase.IDLE
         terminate = self._terminate_after
         self._terminate_after = False
         if terminate:
+            self._restore_manual = False
             self._launcher.stop()
         # Return the toolbar's status label to blank. Without this the last
         # phase text ("no echo — check chain") stuck for the rest of the

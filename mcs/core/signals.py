@@ -40,6 +40,14 @@ class SignalBus(QObject):
     param_mode_received = Signal(float, str)
     #: t_mono, decoded /sim/sea_state JSON (simulator sea state; sim only)
     sea_state_received = Signal(float, object)
+    #: t_mono, decoded /blueboat/run_state JSON (master_control, run session)
+    run_state_received = Signal(float, object)
+    #: t_mono, decoded /blueboat/run_log JSON (robot_interface, run session)
+    run_log_received = Signal(float, object)
+    #: t_mono, decoded /replay/state JSON (bag_replay, Gazebo replay of a run)
+    replay_state_received = Signal(float, object)
+    #: t_mono, decoded /link_guardian/status JSON (guardian.py watch, real sessions)
+    guardian_status_received = Signal(float, object)
 
     # ---- Mission path ----------------------------------------------------
     #: list[(x, y, yaw)] returned by the /path_request service
@@ -63,3 +71,7 @@ class SignalBus(QObject):
     #: terminate nodes) has fully completed. Used by Stop Mission and by the
     #: asynchronous application-exit path.
     shutdown_sequence_finished = Signal()
+    #: A terminating safe-shutdown sequence got no 'default' echo within
+    #: shutdown_confirm_timeout_s. Nothing is terminated until the operator
+    #: answers through CommandCenter.shutdown_retry / shutdown_force.
+    shutdown_unconfirmed = Signal(str)      # the reason ("Stop Mission", …)

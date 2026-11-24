@@ -23,7 +23,7 @@ Provides:
 
 * smooth wheel zoom anchored under the cursor, drag panning;
 * toggleable layers: satellite, robot trajectory, mission path, pinger
-  (position + trajectory), robot↔target line, heading arrow, metric grid;
+  (position + trajectory), robot↔target line, metric grid;
 * a click inspector (world + GPS coordinates + live distance to robot);
 * the Distance Tool (two-click measurement, ported from the SSS viewer);
 * the Manual Target tool (publishes ``/blueboat/manual_target``, highlights
@@ -59,6 +59,7 @@ from mcs.gui.map.map_items import (
     MissionPathItem,
     PolylineItem,
     RobotItem,
+    StartMarkerItem,
     TargetLineItem,
     draw_grid,
     draw_north_indicator,
@@ -116,6 +117,7 @@ class MapView(QGraphicsView):
         self.pinger_track = PolylineItem(theme.C_PINGER_TRACK, 1.6,
                                          Qt.PenStyle.DotLine, z=19)
         self.mission_path = MissionPathItem()
+        self.start_marker = StartMarkerItem()   # circled "S": where the run begins
         self.predicted_path = PolylineItem(theme.C_PREDICTED, 1.8,
                                            Qt.PenStyle.DashLine, z=32)
         self.target_line = TargetLineItem()
@@ -124,10 +126,12 @@ class MapView(QGraphicsView):
         self.manual_marker = CrosshairItem(theme.C_MANUAL_TARGET)
         self.click_marker = MarkerItem(QColor(theme.C_MEASURE), 4.0, "", z=41)
         for item in (self.robot_track, self.pinger_track, self.mission_path,
+                     self.start_marker,
                      self.predicted_path, self.target_line, self.robot_item,
                      self.pinger_marker, self.manual_marker, self.click_marker):
             self._scene.addItem(item)
         self.pinger_marker.setVisible(False)
+        self.start_marker.setVisible(False)
         # Checkbox *intent* per layer; the refresh() gate may hide any item
         # while the map frame is not anchored, so actual visibility is
         # re-derived from these each tick.
@@ -234,7 +238,6 @@ class MapView(QGraphicsView):
             "pinger": self._set_pinger_layer_enabled,
             "pinger_track": _intent("_pinger_track_enabled", self.pinger_track),
             "target_line": _intent("_target_line_enabled", self.target_line),
-            "heading": self.robot_item.set_heading_visible,
             "grid": self._set_grid_visible,
         }
         fn = mapping.get(layer)
@@ -315,7 +318,7 @@ class MapView(QGraphicsView):
             self._waiting_label.move(
                 (self.width() - self._waiting_label.width()) // 2, 12)
             for item in (self.robot_item, self.robot_track, self.pinger_track,
-                         self.mission_path, self.predicted_path,
+                         self.mission_path, self.start_marker, self.predicted_path,
                          self.target_line, self.pinger_marker,
                          self.manual_marker, self.click_marker):
                 item.setVisible(False)
@@ -363,8 +366,12 @@ class MapView(QGraphicsView):
 
         if store.mission_path is not None:
             self.mission_path.set_points(self._scene_points(store.mission_path[:, 0:2]))
+            self.start_marker.set_world_pos(*self._to_scene(
+                float(store.mission_path[0, 0]), float(store.mission_path[0, 1])))
         else:
             self.mission_path.set_points(np.empty((0, 2)))
+        self.start_marker.setVisible(self._mission_path_enabled
+                                     and store.mission_path is not None)
 
         target = store.active_target_world()
         if target is not None and robot.has_odom:
