@@ -273,6 +273,10 @@ another, e.g. `sonar_config:=/home/<you>/calib/raycast/correction/raycast_harbou
 range at 20 m (at most 30 m, whether set by `range_length_mm:=` in Extra args or by the GCS's
 range control): above 40 m it runs out of GPU memory (the simulator's README, "Range advice for
 the ray-cast").
+Since 2026-11-24 the menu opens on **Ray-cast — harbour, fast** (the production profile used for every
+result) and no longer lists its five bracket variants (flash narrow / wide, shells opaque, corner low / high);
+for a bracket run put `sonar_config:=<bracket file>` in **Extra args**. Both lists are settings
+(`sim_speed.default_variant`, `sim_speed.hidden_variants` in `config.json`).
 
 **Launch Mission** opens the configuration dialog. The **Mission type**
 selector chooses between the *Real robot* launch and the *Gazebo simulation*

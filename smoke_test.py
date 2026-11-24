@@ -3011,7 +3011,8 @@ assert _drop(_spe) and _spe.sonar_renderer == _RG and _spe.real_time_factor == 1
 assert not _drop(_spe) and not _drop(_pdc.replace(_spw))
 
 # Dialog rows: Gazebo + Controller only; Slow-down only for the ray-cast.
-_sd = _PLD(cfg, None)
+# (default_variant "" = the pre-2026-11-24 Geometric default this block pins.)
+_sd = _PLD(_pdc.replace(cfg, sim_speed=_pdc.replace(cfg.sim_speed, default_variant="")), None)
 assert not _sd._sonar_model.isVisibleTo(_sd) and not _sd._slowdown.isVisibleTo(_sd)
 _sd._mode.setCurrentText("Gazebo simulation")
 assert _sd._sonar_model.isVisibleTo(_sd) and not _sd._slowdown.isVisibleTo(_sd)
@@ -3085,6 +3086,22 @@ with _tfv.TemporaryDirectory() as _vdir:
     assert _sv2._sonar_model.currentIndex() == _vi
     _sv.deleteLater()
     _sv2.deleteLater()
+    # Hidden variants and the preselected variant (owner, 2026-11-24).
+    _cfgh = _pdc.replace(cfg, sim_speed=_pdc.replace(
+        cfg.sim_speed, variant_dirs=[str(_vd)], hidden_variants=["raycast_zz_sonar.yaml"],
+        default_variant=""))
+    _sh = _PLD(_cfgh, None)
+    assert _sh._sonar_model.findText("Ray-cast - test") < 0
+    _sh.deleteLater()
+    _cfgd = _pdc.replace(cfg, sim_speed=_pdc.replace(
+        cfg.sim_speed, variant_dirs=[str(_vd)], hidden_variants=[],
+        default_variant="raycast_zz_sonar.yaml"))
+    _sdv = _PLD(_cfgd, None)
+    _sdv._mode.setCurrentText("Gazebo simulation")
+    assert _sdv._sonar_model.currentText() == "Ray-cast - test"
+    assert _sdv._slowdown.isVisibleTo(_sdv)
+    assert _sdv.parameters().sonar_profile == _vs[0].path
+    _sdv.deleteLater()
 # The simulator's own variants, when the superproject checkout is beside us.
 _simcfg = (Path(__file__).resolve().parent.parent / "BlueBoat-SSS-Sim"
            / "blueboat_sss_sim" / "config")
@@ -3092,6 +3109,15 @@ if _simcfg.is_dir():
     _names = {v.file for v in _lv([_simcfg])}
     assert {"raycast_live_sonar.yaml", "raycast_fast_sonar.yaml"} <= _names, _names
     assert "raycast_default_sonar.yaml" not in _names     # the plain Ray-cast item
+    # Default config (owner, 2026-11-24): brackets hidden, harbour-fast preselected.
+    _sdf = _PLD(cfg, None)
+    _sdf._mode.setCurrentText("Gazebo simulation")
+    _menu = {Path(str(_sdf._sonar_model.itemData(i)).partition("|")[2]).name
+             for i in range(_sdf._sonar_model.count())}
+    assert not (_menu & set(cfg.sim_speed.hidden_variants)), _menu
+    assert _sdf.parameters().sonar_profile.endswith("/raycast_harbour_fast_sonar.yaml")
+    _sdf.deleteLater()
+print("sonar variant filter ok")
 
 # Station clock: monotonic until fed while following; sim-paced; wall pace
 # after a stall; never backwards; ignored when not following (real, replay).

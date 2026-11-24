@@ -285,6 +285,20 @@ class SimSpeedConfig:
     # 2026-11-09; mcs/core/sonar_variants.py); the simulator's installed
     # config/ and the superproject checkout are always searched after them.
     variant_dirs: list[str] = field(default_factory=list)
+    # Owner order 2026-11-24: every remaining run uses the production profile
+    # raycast_harbour_fast_sonar.yaml. Variant profile file names left out of
+    # the Sonar model menu (the harbour-fast bracket ends; a bracket run still
+    # passes sonar_config:=<file> in Extra args), and the variant a fresh
+    # dialog preselects ("" = Geometric, the pre-2026-11-24 default; a
+    # remembered last launch still wins).
+    hidden_variants: list[str] = field(default_factory=lambda: [
+        "raycast_harbour_fast_flash_narrow_sonar.yaml",
+        "raycast_harbour_fast_flash_wide_sonar.yaml",
+        "raycast_harbour_fast_shell_opaque_sonar.yaml",
+        "raycast_harbour_fast_corner_low_sonar.yaml",
+        "raycast_harbour_fast_corner_high_sonar.yaml",
+    ])
+    default_variant: str = "raycast_harbour_fast_sonar.yaml"
 
 
 @dataclass

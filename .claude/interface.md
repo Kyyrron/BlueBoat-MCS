@@ -141,6 +141,9 @@ lines unchanged; Extra args still win). Today: *Ray-cast — live* (first-order 
 bit-identical) and *— fast* (also no diffraction, identical by eye). The simulator also pauses
 Gazebo while a slow ping renders (its `sonar_hold_sim`, on by default), so the hint now says x0.500
 is the fastest setting; the SIM badge's measured factor drops during those pauses.
+(2026-11-24, owner) A fresh dialog preselects *Ray-cast — harbour, fast* (`SimSpeedConfig.default_variant`;
+"" = Geometric) and the menu leaves out the five harbour-fast bracket variants (flash narrow/wide, shells
+opaque, corner low/high; `SimSpeedConfig.hidden_variants`); a bracket run passes `sonar_config:=<file>` in Extra args.
 
 **Thrust gain (CR-03-3, 2026-11-16).** Launch dialog, Gazebo + Controller: **Thrust gain**
 `[right,left]` (empty = the description's 0.493 / 0.493; FIT nominal `[0.3805,0.6055]`),

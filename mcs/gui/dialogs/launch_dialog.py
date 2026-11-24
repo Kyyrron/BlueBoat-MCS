@@ -46,7 +46,11 @@ Two mission types, matching the two launch files of the stack:
   renders far slower than its 50 ms ping period, and a slowed run keeps one
   clock, so it pings at 20 Hz in sim time and every record is the same as at
   real speed. Only a personalized world has a sonar; without one the launch
-  runs geometric at x1 (the toolbar says so).
+  runs geometric at x1 (the toolbar says so). Since 2026-11-24 (owner) a
+  fresh dialog preselects *Ray-cast — harbour, fast*
+  (``SimSpeedConfig.default_variant``) and the harbour-fast bracket variants
+  are left out of the menu (``SimSpeedConfig.hidden_variants``; a bracket run
+  passes ``sonar_config:=<file>`` in Extra args).
 
 The dialog returns a :class:`~mcs.ros.launch_manager.LaunchParameters`;
 ``to_cli`` then emits exactly the arguments the chosen launch file declares.
@@ -312,6 +316,8 @@ class LaunchDialog(QDialog):
         # profiles that switch off only what costs GPU time without changing
         # how the image looks; each item's tooltip says what and how much.
         for _v in list_variants(default_variant_dirs(cfg.sim_speed.variant_dirs)):
+            if _v.file in cfg.sim_speed.hidden_variants:   # owner, 2026-11-24
+                continue
             self._sonar_model.addItem(_v.label, f"{RENDERER_RAYCAST}{_VARIANT_SEP}{_v.path}")
             self._sonar_model.setItemData(self._sonar_model.count() - 1,
                                           _v.description, Qt.ItemDataRole.ToolTipRole)
@@ -321,6 +327,15 @@ class LaunchDialog(QDialog):
             "Ray-cast: the 3-D ray-cast sensor -- far slower than the 50 ms ping\n"
             "period, so the whole simulation is slowed down (Slow-down).")
         form.addRow("Sonar model", self._sonar_model)
+        # Preselected variant (owner, 2026-11-24): harbour-fast; a remembered
+        # last launch, restored below, still wins.
+        _dv = str(cfg.sim_speed.default_variant or "").strip()
+        if _dv:
+            for _i in range(self._sonar_model.count()):
+                _p = str(self._sonar_model.itemData(_i) or "").partition(_VARIANT_SEP)[2]
+                if _p and Path(_p).name == _dv:
+                    self._sonar_model.setCurrentIndex(_i)
+                    break
         sp = cfg.sim_speed
         self._slowdown = QDoubleSpinBox()
         self._slowdown.setDecimals(3)
