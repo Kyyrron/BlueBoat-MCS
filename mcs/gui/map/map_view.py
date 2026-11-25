@@ -22,8 +22,11 @@ off — there is no GPS to place them with.
 Provides:
 
 * smooth wheel zoom anchored under the cursor, drag panning;
-* toggleable layers: satellite, robot trajectory, mission path, pinger
-  (position + trajectory), robot↔target line, metric grid;
+* toggleable layers: satellite, robot trajectory, mission path, the pinger
+  (2026-11-24: FILTERED estimate position + track + 95 % ellipse, straight
+  from ``/blueboat/pinger/estimate``; LEGACY position + track; raw fixes
+  coloured by the filter's decision) with a small pinger legend,
+  robot↔target line, metric grid;
 * a click inspector (world + GPS coordinates + live distance to robot);
 * the Distance Tool (two-click measurement, ported from the SSS viewer);
 * the Manual Target tool (publishes ``/blueboat/manual_target``, highlights
@@ -51,10 +54,14 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core.geo import latlon_to_local_en
 from mcs.core.los_predictor import predict_los_path
 from mcs.gui import theme
+from mcs.gui.map.legend import PingerLegend
 from mcs.gui.map.map_items import (
     CrosshairItem,
+    EllipseItem,
+    FixPointsItem,
     MarkerItem,
     MissionPathItem,
     PolylineItem,
@@ -122,22 +129,53 @@ class MapView(QGraphicsView):
                                            Qt.PenStyle.DashLine, z=32)
         self.target_line = TargetLineItem()
         self.robot_item = RobotItem()
-        self.pinger_marker = MarkerItem(theme.C_PINGER, 6.0, "pinger", z=42)
+        # The pinger (2026-11-24): the LEGACY algorithm's position and trail
+        # (orange, as always), the FILTERED estimate's (purple) with its 95 %
+        # ellipse, and the raw fixes coloured by the filter's decision.
+        self.pinger_marker = MarkerItem(theme.C_PINGER, 6.0, "legacy", z=42)
+        self.pinger_filtered_marker = MarkerItem(theme.C_PINGER_FILTERED, 7.0,
+                                                 "pinger", z=43)
+        self.pinger_filtered_track = PolylineItem(theme.C_PINGER_FILTERED_TRACK, 2.0,
+                                                  Qt.PenStyle.SolidLine, z=19.5)
+        self.pinger_ellipse = EllipseItem(theme.C_PINGER_ELLIPSE, z=18)
+        self.pinger_fixes = FixPointsItem(z=17)
         self.manual_marker = CrosshairItem(theme.C_MANUAL_TARGET)
         self.click_marker = MarkerItem(QColor(theme.C_MEASURE), 4.0, "", z=41)
+        # (2026-11-25) The run's safety way back (sent to the link guardian at
+        # START RUN), dashed orange, its last point marked LOITER. Shown with the
+        # mission-path layer; placed from lat/lon in the scene's east/north.
+        self.safety_path = PolylineItem(theme.C_SAFETY, 2.0, Qt.PenStyle.DashLine, z=21)
+        self.safety_end = MarkerItem(theme.C_SAFETY, 5.0, "LOITER", z=41)
+        self._scene.addItem(self.safety_path)
+        self._scene.addItem(self.safety_end)
+        self.safety_path.setVisible(False)
+        self.safety_end.setVisible(False)
+        # Change keys of the overlays rebuilt only when their input changes.
+        self._safety_drawn = None
+        self._filtered_track_key = None
+        self._fixes_key = None
         for item in (self.robot_track, self.pinger_track, self.mission_path,
                      self.start_marker,
                      self.predicted_path, self.target_line, self.robot_item,
-                     self.pinger_marker, self.manual_marker, self.click_marker):
+                     self.pinger_marker, self.pinger_filtered_marker,
+                     self.pinger_filtered_track, self.pinger_ellipse,
+                     self.pinger_fixes, self.manual_marker, self.click_marker):
             self._scene.addItem(item)
         self.pinger_marker.setVisible(False)
+        self.pinger_filtered_marker.setVisible(False)
+        self.pinger_ellipse.setVisible(False)
         self.start_marker.setVisible(False)
         # Checkbox *intent* per layer; the refresh() gate may hide any item
         # while the map frame is not anchored, so actual visibility is
         # re-derived from these each tick.
-        self._pinger_layer_enabled = True
+        self._pinger_layer_enabled = True          # legacy marker
         self._robot_track_enabled = True
-        self._pinger_track_enabled = True
+        self._pinger_track_enabled = True          # legacy trail
+        self._pinger_filtered_enabled = True
+        self._pinger_filtered_track_enabled = True
+        self._pinger_ellipse_enabled = False
+        self._pinger_fixes_enabled = False
+        self._pinger_legend_enabled = True
         self._mission_path_enabled = True
         self._target_line_enabled = True
         self.manual_marker.setVisible(False)
@@ -182,6 +220,9 @@ class MapView(QGraphicsView):
         self._banner_timer.setSingleShot(True)
         self._banner_timer.timeout.connect(self._banner.hide)
         self._reached_announced = False
+
+        # The pinger legend (bottom-left, above the scale bar).
+        self.legend = PingerLegend(self)
 
     # ================================================================= modes
     def set_mode(self, mode: MapMode) -> None:
@@ -237,6 +278,14 @@ class MapView(QGraphicsView):
             "mission_path": _intent("_mission_path_enabled", self.mission_path),
             "pinger": self._set_pinger_layer_enabled,
             "pinger_track": _intent("_pinger_track_enabled", self.pinger_track),
+            "pinger_filtered": self._data_gated("_pinger_filtered_enabled",
+                                                self.pinger_filtered_marker),
+            "pinger_filtered_track": _intent("_pinger_filtered_track_enabled",
+                                             self.pinger_filtered_track),
+            "pinger_ellipse": self._data_gated("_pinger_ellipse_enabled",
+                                               self.pinger_ellipse),
+            "pinger_fixes": _intent("_pinger_fixes_enabled", self.pinger_fixes),
+            "pinger_legend": self._set_legend_enabled,
             "target_line": _intent("_target_line_enabled", self.target_line),
             "grid": self._set_grid_visible,
         }
@@ -252,6 +301,29 @@ class MapView(QGraphicsView):
         self._pinger_layer_enabled = enabled
         if not enabled:
             self.pinger_marker.setVisible(False)
+
+    def _data_gated(self, attr: str, item):
+        """Checkbox intent for an item refresh() shows only with data (like
+        the legacy marker): switching the layer on never conjures a ghost."""
+        def apply(v: bool) -> None:
+            setattr(self, attr, v)
+            if not v:
+                item.setVisible(False)
+        return apply
+
+    def _set_legend_enabled(self, enabled: bool) -> None:
+        self._pinger_legend_enabled = enabled
+        if not enabled:
+            self.legend.hide()
+
+    def pinger_layers(self) -> dict[str, bool]:
+        """Checkbox intent of every pinger layer (the legend's lines)."""
+        return {"pinger_filtered": self._pinger_filtered_enabled,
+                "pinger_filtered_track": self._pinger_filtered_track_enabled,
+                "pinger_ellipse": self._pinger_ellipse_enabled,
+                "pinger_fixes": self._pinger_fixes_enabled,
+                "pinger": self._pinger_layer_enabled,
+                "pinger_track": self._pinger_track_enabled}
 
     def _set_grid_visible(self, visible: bool) -> None:
         self._grid_visible = visible
@@ -280,6 +352,26 @@ class MapView(QGraphicsView):
         if fit is not None:
             return fit.enu_to_world(sx, sy)
         return sx, sy
+
+    def _refresh_safety_path(self, store) -> None:
+        pts = store.session.safety_way_back
+        fit = store.geo.fit
+        show = bool(self._mission_path_enabled and fit is not None and len(pts) >= 2)
+        self.safety_path.setVisible(show)
+        self.safety_end.setVisible(show)
+        if not show:
+            return
+        # The route changes only at START / STOP RUN (a new list each time)
+        # and lat0 / lon0 are latched: project it once, not every tick.
+        key = (fit.lat0, fit.lon0)
+        if self._safety_drawn is not None and self._safety_drawn[0] is pts \
+                and self._safety_drawn[1] == key:
+            return
+        en = np.array([latlon_to_local_en(lat, lon, fit.lat0, fit.lon0)
+                       for lat, lon in pts])
+        self.safety_path.set_points(en)
+        self.safety_end.set_world_pos(float(en[-1, 0]), float(en[-1, 1]))
+        self._safety_drawn = (pts, key)
 
     def _scene_points(self, xy) -> np.ndarray:
         fit = self._store.geo.fit
@@ -320,8 +412,12 @@ class MapView(QGraphicsView):
             for item in (self.robot_item, self.robot_track, self.pinger_track,
                          self.mission_path, self.start_marker, self.predicted_path,
                          self.target_line, self.pinger_marker,
-                         self.manual_marker, self.click_marker):
+                         self.pinger_filtered_marker, self.pinger_filtered_track,
+                         self.pinger_ellipse, self.pinger_fixes,
+                         self.manual_marker, self.click_marker,
+                         self.safety_path, self.safety_end):
                 item.setVisible(False)
+            self.legend.hide()
             self.tiles.update_view(
                 None,
                 self.mapToScene(self.viewport().rect()).boundingRect(),
@@ -333,6 +429,8 @@ class MapView(QGraphicsView):
         self.robot_item.setVisible(True)
         self.robot_track.setVisible(self._robot_track_enabled)
         self.pinger_track.setVisible(self._pinger_track_enabled)
+        self.pinger_filtered_track.setVisible(self._pinger_filtered_track_enabled)
+        self.pinger_fixes.setVisible(self._pinger_fixes_enabled)
         self.mission_path.setVisible(self._mission_path_enabled)
         self.target_line.setVisible(self._target_line_enabled)
 
@@ -350,6 +448,26 @@ class MapView(QGraphicsView):
         _, pxy = store.pinger_track.decimated_window(t0, t1, max_pts)
         self.pinger_track.set_points(self._scene_points(pxy)
                                      if len(pxy) else np.empty((0, 2)))
+        # The filtered track and the raw fixes change only at the fix rate:
+        # rebuilt when their length, the window or the anchor changes, and
+        # the fixes only while their layer is on.
+        fit = store.geo.fit
+        anchor = (fit.tx, fit.ty) if fit is not None else None
+        key = (len(store.pinger_est_track), self._window, anchor)
+        if key != self._filtered_track_key:
+            self._filtered_track_key = key
+            _, fxy = store.pinger_est_track.decimated_window(t0, t1, max_pts)
+            self.pinger_filtered_track.set_points(self._scene_points(fxy)
+                                                  if len(fxy) else np.empty((0, 2)))
+        pad_m = 8.0 / max(self._px_per_m(), 1e-6)
+        key = (len(store.pinger_fixes), self._window, anchor, pad_m)
+        if self._pinger_fixes_enabled and key != self._fixes_key:
+            self._fixes_key = key
+            _, raw = store.pinger_fixes.decimated_window(t0, t1, max_pts)
+            self.pinger_fixes.set_points(
+                self._scene_points(raw[:, 0:2]) if len(raw) else np.empty((0, 2)),
+                raw[:, 2] if len(raw) else [],
+                pad_m=pad_m)
 
         if robot.has_odom:
             sx, sy = self._to_scene(robot.x, robot.y)
@@ -363,6 +481,21 @@ class MapView(QGraphicsView):
         self.pinger_marker.setVisible(self._pinger_layer_enabled and has_pinger)
         if has_pinger:
             self.pinger_marker.set_world_pos(*self._to_scene(*self._store.pinger.world))
+        # The filtered estimate: its own world x, y and ellipse, placed in
+        # the scene like every world quantity (_to_scene), never re-derived.
+        est = store.pinger_est
+        has_est = est.world is not None
+        self.pinger_filtered_marker.setVisible(self._pinger_filtered_enabled and has_est)
+        if has_est:
+            ex, ey = self._to_scene(*est.world)
+            self.pinger_filtered_marker.set_world_pos(ex, ey)
+            if est.ellipse is not None:
+                self.pinger_ellipse.set_ellipse(ex, ey, *est.ellipse)
+        self.pinger_ellipse.setVisible(self._pinger_ellipse_enabled and has_est
+                                       and est.ellipse is not None)
+        self._refresh_legend(has_pinger or has_est or len(store.pinger_fixes) > 0
+                             or len(store.pinger_track) > 0
+                             or len(store.pinger_est_track) > 0)
 
         if store.mission_path is not None:
             self.mission_path.set_points(self._scene_points(store.mission_path[:, 0:2]))
@@ -372,6 +505,7 @@ class MapView(QGraphicsView):
             self.mission_path.set_points(np.empty((0, 2)))
         self.start_marker.setVisible(self._mission_path_enabled
                                      and store.mission_path is not None)
+        self._refresh_safety_path(store)
 
         target = store.active_target_world()
         if target is not None and robot.has_odom:
@@ -392,6 +526,18 @@ class MapView(QGraphicsView):
         )
         if self._grid_visible:
             self.viewport().update()
+
+    def _refresh_legend(self, has_data: bool) -> None:
+        """The pinger legend: bottom-left above the scale bar, while some
+        pinger data exists and at least one pinger layer is on."""
+        lines = self.legend.set_layers(self.pinger_layers())
+        show = self._pinger_legend_enabled and has_data and lines
+        self.legend.setVisible(show)
+        if show:
+            pos = (8, max(0, self.height() - self.legend.height() - 34))
+            if (self.legend.x(), self.legend.y()) != pos:
+                self.legend.move(*pos)
+            self.legend.raise_()
 
     def _refresh_manual_target(self) -> None:
         store = self._store

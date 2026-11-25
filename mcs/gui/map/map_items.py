@@ -7,7 +7,8 @@ applies a y-flip so +y points up on screen.  Items that must keep constant
 ``ItemIgnoresTransformations`` around a world-anchored origin.
 
 Z-order (back to front): tiles(-100) < grid(view background) < mission path
-< its start "S" < trajectories < target line < prediction < markers < robot.
+< its start "S" < pinger raw fixes < pinger 95 % ellipse < trajectories <
+target line < prediction < markers < robot.
 """
 
 from __future__ import annotations
@@ -302,3 +303,81 @@ def draw_grid(painter, rect: QRectF, px_per_m: float,
             if i > 400:
                 break
     return spacing
+
+
+class FixPointsItem(QGraphicsItem):
+    """Raw pinger fixes as constant-pixel dots, coloured by the filter's
+    decision (``theme.fix_color``). One item draws every point: a cosmetic
+    round pen of ``2 * radius_px`` turns each ``drawPoint`` into a dot of
+    that pixel size at any zoom. ``pad_m`` (set by the view from its scale)
+    keeps the bounding rect around the dots."""
+
+    def __init__(self, z: float = 17.0, radius_px: float = 3.0) -> None:
+        super().__init__()
+        self.setZValue(z)
+        self._radius = radius_px
+        self._xy = np.empty((0, 2))
+        self._codes = np.empty(0, dtype=int)
+        self._groups: list[tuple[QColor, QPolygonF]] = []
+        self._rect = QRectF()
+
+    def set_points(self, xy: np.ndarray, codes, pad_m: float) -> None:
+        self.prepareGeometryChange()
+        self._xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        self._codes = np.asarray(codes, dtype=int).reshape(-1)
+        # Polygons built once per change, not per repaint (pan / zoom).
+        # Grey first, accepted last (on top).
+        self._groups = [
+            (theme.fix_color(code),
+             QPolygonF([QPointF(float(x), float(y))
+                        for x, y in self._xy[self._codes == code]]))
+            for code in sorted(set(self._codes.tolist()), key=lambda c: (c < 3, -c))]
+        if len(self._xy):
+            lo, hi = self._xy.min(axis=0), self._xy.max(axis=0)
+            self._rect = QRectF(lo[0] - pad_m, lo[1] - pad_m,
+                                hi[0] - lo[0] + 2 * pad_m, hi[1] - lo[1] + 2 * pad_m)
+        else:
+            self._rect = QRectF()
+        self.update()
+
+    def point_count(self) -> int:
+        return len(self._xy)
+
+    def codes(self) -> list[int]:
+        return [int(c) for c in self._codes]
+
+    def boundingRect(self) -> QRectF:
+        return self._rect
+
+    def paint(self, painter, _option, _widget=None) -> None:
+        for color, poly in self._groups:
+            painter.setPen(_cosmetic_pen(color, 2.0 * self._radius))
+            painter.drawPoints(poly)
+
+
+class EllipseItem(QGraphicsEllipseItem):
+    """The filtered pinger's 95 % uncertainty ellipse, in METRES (it scales
+    with the map), placed and rotated from the estimate's own ``ellipse``
+    block: semi-axes ``a`` (major) and ``b``, ``theta`` radians CCW from east
+    of the major axis. The scene is ENU (y north), so a scene rotation of
+    +degrees(theta) maps the major axis onto (cos theta, sin theta)."""
+
+    def __init__(self, color: QColor, z: float = 18.0) -> None:
+        super().__init__()
+        self.setZValue(z)
+        self.setPen(_cosmetic_pen(color, 1.4, Qt.PenStyle.DashLine))
+        fill = QColor(color)
+        fill.setAlpha(40)
+        self.setBrush(QBrush(fill))
+        self._geom: tuple[float, float, float, float, float] | None = None
+
+    def set_ellipse(self, x: float, y: float, a: float, b: float, theta: float) -> None:
+        a, b = max(float(a), 0.0), max(float(b), 0.0)
+        self.setRect(QRectF(-a, -b, 2.0 * a, 2.0 * b))
+        self.setPos(x, y)
+        self.setRotation(math.degrees(theta))
+        self._geom = (float(x), float(y), a, b, float(theta))
+
+    def geometry(self) -> tuple[float, float, float, float, float] | None:
+        """(x, y, a, b, theta) last placed, for tests."""
+        return self._geom

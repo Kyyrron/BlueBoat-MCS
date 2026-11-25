@@ -12,7 +12,11 @@ CAD-style waypoint editing:
   default snap-to-waypoint within a pixel radius (**Alt** disables);
 * rubber-band multi-selection, middle-button panning, wheel zoom;
 * live preview: interpolation curves, travel-direction chevrons, waypoint
-  numbering, START / END markers.
+  numbering, START / END markers;
+* the **safety way back** (2026-11-25, GPS-anchored missions): a second,
+  orange polyline with its own handles and add mode (``EditMode.ADD_SAFETY``),
+  ending in a LOITER marker. The link guardian follows it if the link is lost
+  during a run of this mission.
 
 The view owns no mission logic: it reads/writes the
 :class:`~mcs.designer.model.MissionModel` and emits editing intents. It
@@ -32,6 +36,7 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsItemGroup,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -54,11 +59,16 @@ C_WAYPOINT_SEL = QColor("#2f81f7")
 C_WAYPOINT_LOCK = QColor("#8a949e")
 C_PREVIEW = QColor("#3fb950")
 C_WORLD = QColor("#d29922")     # Gazebo-world limits reference rectangle
+C_SAFETY = theme.C_SAFETY     # safety way back
 
 
 class EditMode(Enum):
     SELECT = auto()
     ADD = auto()
+    ADD_SAFETY = auto()          # clicks append to the safety way back
+
+
+ADDING_MODES = (EditMode.ADD, EditMode.ADD_SAFETY)
 
 
 class WaypointItem(QGraphicsEllipseItem):
@@ -104,12 +114,49 @@ class WaypointItem(QGraphicsEllipseItem):
         return super().itemChange(change, value)
 
 
+class SafetyPointItem(QGraphicsRectItem):
+    """Constant-pixel-size, draggable handle of one safety-way-back point."""
+
+    R = 5.5
+
+    def __init__(self, index: int, host: DesignerMapView) -> None:
+        super().__init__(-self.R, -self.R, 2 * self.R, 2 * self.R)
+        self.index = index
+        self._host = host
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+                      | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+                      | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+                      | QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setZValue(58)
+        self.label = QGraphicsSimpleTextItem(f"B{index + 1}", self)
+        self.label.setBrush(QBrush(C_SAFETY))
+        self.label.setFont(QFont("DejaVu Sans", 8))
+        self.label.setPos(self.R + 3, -self.R - 2)
+        self._restyle()
+
+    def _restyle(self) -> None:
+        self.setBrush(QBrush(C_WAYPOINT_SEL if self.isSelected() else C_SAFETY))
+        self.setPen(QPen(QColor("white"), 1.2))
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange \
+                and not self._host.syncing:
+            return self._host.constrain_move(self, value)
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged \
+                and not self._host.syncing:
+            self._host.on_safety_moved(self)
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._restyle()
+        return super().itemChange(change, value)
+
+
 class DesignerMapView(QGraphicsView):
     """The designer's central map."""
 
     selection_changed = Signal()
     edit_started = Signal()        # push an undo snapshot before a drag
     point_added = Signal(float, float)
+    safety_point_added = Signal(float, float)
 
     def __init__(self, cfg: AppConfig, model: MissionModel, parent=None) -> None:
         super().__init__(parent)
@@ -117,7 +164,7 @@ class DesignerMapView(QGraphicsView):
         self._model = model
         self.syncing = False
         self._mode = EditMode.SELECT
-        self._drag_origin: dict[int, QPointF] = {}
+        self._drag_origin: dict[QGraphicsItem, QPointF] = {}
         self._panning: QPointF | None = None
 
         self._scene = QGraphicsScene(self)
@@ -158,6 +205,14 @@ class DesignerMapView(QGraphicsView):
         self._scene.addItem(self._world_marker)
 
         self._wp_items: dict[int, WaypointItem] = {}
+        # Safety way back: dashed orange line, handles, LOITER marker at its end.
+        self.safety_preview = PolylineItem(C_SAFETY, 2.0, Qt.PenStyle.DashLine, z=22)
+        self._scene.addItem(self.safety_preview)
+        self._safety_end = MarkerItem(C_SAFETY, 5.0, "LOITER", z=56)
+        self._safety_end.setVisible(False)
+        self._scene.addItem(self._safety_end)
+        self._safety_items: list[SafetyPointItem] = []
+        model.changed.connect(self.update_safety_preview)
         self._scene.selectionChanged.connect(self._on_scene_selection)
 
     def _on_scene_selection(self) -> None:
@@ -171,7 +226,8 @@ class DesignerMapView(QGraphicsView):
                          if mode is EditMode.SELECT
                          else QGraphicsView.DragMode.NoDrag)
         self.viewport().setCursor(
-            Qt.CursorShape.CrossCursor if mode is EditMode.ADD
+            Qt.CursorShape.CrossCursor
+            if mode in ADDING_MODES
             else Qt.CursorShape.ArrowCursor)
 
     @property
@@ -191,8 +247,17 @@ class DesignerMapView(QGraphicsView):
             item.set_locked(self._model.effective_locked(wp))
             self._scene.addItem(item)
             self._wp_items[wp.uid] = item
+        for item in self._safety_items:
+            self._scene.removeItem(item)
+        self._safety_items = []
+        for i, (x, y) in enumerate(self._model.safety_way_back):
+            item = SafetyPointItem(i, self)
+            item.setPos(x, y)
+            self._scene.addItem(item)
+            self._safety_items.append(item)
         self.syncing = False
         self.refresh_labels()
+        self.update_safety_preview()
 
     def sync_positions(self) -> None:
         """Model geometry changed programmatically: move handles."""
@@ -202,6 +267,8 @@ class DesignerMapView(QGraphicsView):
             if item is not None:
                 item.setPos(wp.x, wp.y)
                 item.set_locked(self._model.effective_locked(wp))
+        for item, (x, y) in zip(self._safety_items, self._model.safety_way_back):
+            item.setPos(x, y)
         self.syncing = False
         self.refresh_labels()
 
@@ -214,6 +281,18 @@ class DesignerMapView(QGraphicsView):
     def selected_uids(self) -> set[int]:
         return {it.uid for it in self._scene.selectedItems()
                 if isinstance(it, WaypointItem)}
+
+    def selected_safety_indices(self) -> list[int]:
+        return sorted(it.index for it in self._scene.selectedItems()
+                      if isinstance(it, SafetyPointItem))
+
+    def update_safety_preview(self) -> None:
+        pts = self._model.safety_way_back
+        self.safety_preview.set_points(np.array(pts, dtype=float) if len(pts) >= 2
+                                       else np.empty((0, 2)))
+        if pts:
+            self._safety_end.set_world_pos(*pts[-1])
+        self._safety_end.setVisible(len(pts) >= 2)
 
     def select_uids(self, uids: set[int]) -> None:
         self.syncing = True
@@ -263,7 +342,7 @@ class DesignerMapView(QGraphicsView):
     # ============================================================ constraints
     def constrain_move(self, item: WaypointItem, pos: QPointF) -> QPointF:
         mods = QGuiApplication.keyboardModifiers()
-        origin = self._drag_origin.get(item.uid)
+        origin = self._drag_origin.get(item)
         x, y = pos.x(), pos.y()
         if origin is not None and mods & Qt.KeyboardModifier.ShiftModifier:
             if abs(x - origin.x()) >= abs(y - origin.y()):
@@ -274,7 +353,7 @@ class DesignerMapView(QGraphicsView):
             g = self._cfg.designer.grid_snap_m
             x, y = round(x / g) * g, round(y / g) * g
         elif not mods & Qt.KeyboardModifier.AltModifier:
-            snapped = self._snap_to_waypoint(x, y, exclude=item.uid)
+            snapped = self._snap_to_waypoint(x, y, exclude=getattr(item, "uid", 0))
             if snapped is not None:
                 x, y = snapped
         return QPointF(x, y)
@@ -297,6 +376,10 @@ class DesignerMapView(QGraphicsView):
         if wp is not None:
             wp.x, wp.y = item.pos().x(), item.pos().y()
             self._model.changed.emit()
+
+    def on_safety_moved(self, item: SafetyPointItem) -> None:
+        if item.index < len(self._model.safety_way_back):
+            self._model.move_safety_point(item.index, item.pos().x(), item.pos().y())
 
     # ================================================================ painting
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
@@ -367,17 +450,20 @@ class DesignerMapView(QGraphicsView):
             if self._mode is EditMode.ADD:
                 self._add_point(world)
                 return
+            if self._mode is EditMode.ADD_SAFETY:
+                self._add_safety_point(world)
+                return
             # SELECT: snapshot origins for constraint + undo before a drag
             if self.itemAt(event.position().toPoint()) is not None:
                 self.edit_started.emit()
                 self._drag_origin = {
-                    it.uid: it.pos() for it in self._scene.selectedItems()
-                    if isinstance(it, WaypointItem)}
+                    it: it.pos() for it in self._scene.selectedItems()
+                    if isinstance(it, (WaypointItem, SafetyPointItem))}
                 under = self.itemAt(event.position().toPoint())
-                if isinstance(under, WaypointItem):
-                    self._drag_origin.setdefault(under.uid, under.pos())
+                if isinstance(under, (WaypointItem, SafetyPointItem)):
+                    self._drag_origin.setdefault(under, under.pos())
         if event.button() == Qt.MouseButton.RightButton \
-                and self._mode is EditMode.ADD:
+                and self._mode in ADDING_MODES:
             self.set_mode(EditMode.SELECT)
             return
         if event.button() == Qt.MouseButton.MiddleButton or event.button() == Qt.MouseButton.RightButton:
@@ -402,7 +488,7 @@ class DesignerMapView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.MiddleButton or event.button() == Qt.MouseButton.RightButton and self._mode is not EditMode.ADD:
+        if event.button() == Qt.MouseButton.MiddleButton or event.button() == Qt.MouseButton.RightButton and self._mode not in ADDING_MODES:
             self._panning = None
             self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
             self._update_tiles()
@@ -434,6 +520,24 @@ class DesignerMapView(QGraphicsView):
                     x = last.x + dx / d * d_snap
                     y = last.y + dy / d * d_snap
         self.point_added.emit(x, y)
+
+    def _add_safety_point(self, world: QPointF) -> None:
+        """Append to the safety way back (Shift: horizontal / vertical from its
+        last point; snapping to a survey waypoint as for a drag, Alt disables)."""
+        mods = QGuiApplication.keyboardModifiers()
+        x, y = world.x(), world.y()
+        pts = self._model.safety_way_back
+        if pts and mods & Qt.KeyboardModifier.ShiftModifier:
+            lx, ly = pts[-1]
+            if abs(x - lx) >= abs(y - ly):
+                y = ly
+            else:
+                x = lx
+        elif not mods & Qt.KeyboardModifier.AltModifier:
+            snapped = self._snap_to_waypoint(x, y, exclude=0)
+            if snapped is not None:
+                x, y = snapped
+        self.safety_point_added.emit(x, y)
 
     # ================================================================== tiles
     def set_geo_fit(self, fit) -> None:

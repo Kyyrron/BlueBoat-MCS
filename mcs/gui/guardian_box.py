@@ -51,6 +51,13 @@ _COLORS = {"ok": theme.OK, "warn": theme.WARN, "err": theme.ERR,
 _MAX_CHARS = 34
 
 
+_WAY_BACK_TIP = (
+    "What the boat follows if this laptop goes silent: its own trail, or the "
+    "safety way back drawn in the designer for this GPS-anchored path "
+    "(joined at its point closest to the boat, held at its last point). "
+    "Loaded at START RUN, cleared at STOP RUN.")
+
+
 class GuardianBox(CollapsibleSection):
     """The link guardian's read-out and controls."""
 
@@ -70,7 +77,7 @@ class GuardianBox(CollapsibleSection):
         layout.addWidget(self.state_label)
 
         self.grid = InfoGrid()
-        for key in ("Link", "Autopilot", "Guardian", "Setup", "HOME"):
+        for key in ("Link", "Autopilot", "Guardian", "Setup", "HOME", "Way back"):
             self.grid.add_row(key)
         layout.addWidget(self.grid)
 
@@ -147,13 +154,15 @@ class GuardianBox(CollapsibleSection):
             self.action_requested.emit("reclaim")
 
     # ---------------------------------------------------------------- refresh
-    def _set(self, key: str, value: tuple[str, str]) -> None:
+    def _set(self, key: str, value: tuple[str, str], tip: str | None = None) -> None:
+        """One row; its tooltip is ``tip`` when given, else the full text."""
         text, level = value
         shown = text if len(text) <= _MAX_CHARS else text[:_MAX_CHARS - 1] + "…"
         self.grid.set(key, shown, _COLORS.get(level))
         label = self.grid._values.get(key)
-        if label is not None and label.toolTip() != text:
-            label.setToolTip(text)
+        tip = text if tip is None else tip
+        if label is not None and label.toolTip() != tip:
+            label.setToolTip(tip)
 
     @staticmethod
     def _apply(button: QPushButton, action: Action, tip: str) -> None:
@@ -171,6 +180,7 @@ class GuardianBox(CollapsibleSection):
         self._set("Guardian", view.flag)
         self._set("Setup", view.setup)
         self._set("HOME", view.home)
+        self._set("Way back", view.way_back, _WAY_BACK_TIP)
         if readout is not None and readout.check is not None:
             details = "\n".join(f"{i.get('name')}: {i.get('text')}"
                                 for i in readout.check_items())

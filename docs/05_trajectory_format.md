@@ -23,6 +23,7 @@ created: "2026-07-15T10:12:03"       # informative
 frame: world                         # the ROS local/world frame of the stack
 speed: 0.5                           # m/s used for time-parameterization
 loop: false                          # true => evaluation wraps t modulo duration
+                                     #   (the designer's "Repeat forever")
 length_m: 118.402                    # informative
 duration_s: 236.804                  # informative (= points[-1][0])
 points:                              # REQUIRED, ordered by strictly increasing t
@@ -40,7 +41,17 @@ Semantics:
   angular interpolation of `yaw` (shortest way, wrap-safe).
 * `t` beyond the last sample: **clamped** to the final pose — the same
   "default to last known point" convention as the hard-coded trajectories —
-  unless `loop: true`, in which case `t` wraps modulo `duration_s`.
+  unless `loop: true`, in which case `t` wraps modulo `duration_s` and the
+  path repeats forever. In a run session `master_control` reports a clamped
+  (`loop: false`) path that has ended as `path_complete` on
+  `/blueboat/run_state`; the station's RUN box then shows *Path complete —
+  holding final pose*.
+* `loop` is written from the designer's **Repeat forever** option only
+  (2026-11-24). A closing leg back to the first waypoint (**Return to
+  start**) is not a runtime flag: it is part of the samples, so a closed path
+  with `loop: false` drives back to its start once and holds there. Before
+  2026-11-24 one "Loop" box set both — 19 of 23 saved missions then carried
+  `loop: true` and repeated forever.
 * `speed` is the mission cruise speed; per-segment speeds set in the
   designer are already baked into the sample timing (`t` column), so the
   runtime needs no per-segment knowledge;
@@ -82,6 +93,29 @@ does not consult the station's live georeference, so opening and re-saving an
 anchored mission while the boat has a GPS lock leaves `geo_anchor` byte-for-byte
 unchanged.
 
+### Optional `safety_way_back` block — GPS-anchored missions (2026-11-25)
+
+```yaml
+safety_way_back:
+  format: blueboat_safety_way_back/1
+  points:                 # [lat, lon] in degrees, in the order the boat follows them
+  - [33.6604210, 130.6579120]
+  - [33.6601980, 130.6577800]   # the LAST point is where the boat holds (LOITER)
+```
+
+Written by the designer only for a GPS-anchored mission with at least 2 safety
+points (at most 200): the hand-drawn route the **link guardian** follows if the
+link to the laptop is lost during a run of this mission (superproject
+`link_guardian/README.md` §2). It is in lat/lon, so it needs no transform:
+`deploy_mission` copies it into the deployed / session file unchanged. The
+station reads it from the designer file at START RUN
+(`io_yaml.read_safety_way_back`) and sends it to `guardian.py`
+(`/link_guardian/command` `safety_load`); at STOP RUN it sends `safety_clear`.
+The control stack, the GCS and the simulator ignore the key. Readers must
+reject an unknown `format` inside the block (the station does: it then treats
+the mission as having none). The editor keeps the design-frame points in the
+meta file (`model.safety_way_back`, `[[x, y], ...]`).
+
 Start-alignment note: a non-GPS runtime file is normally *start-aligned* —
 its first sample is `(0,0)` and the first tangent is `+x` — so that on
 launch (world frame zeroed at the boat) the robot starts at the mission and
@@ -99,7 +133,8 @@ model:
   name: harbor_survey
   comment: "east breakwater, spring campaign"
   speed: 0.5
-  loop: false
+  close_path: false            # "Return to start": closing leg last -> first (samples)
+  repeat: false                # "Repeat forever": the runtime file's loop
   items:                       # ordered; waypoint or group
     - type: group
       uid: 4
@@ -123,8 +158,15 @@ model:
 mission cruise speed". Per-segment speeds are already baked into the runtime
 file's `t` column, which is why the control stack never reads this.
 
+`close_path` and `repeat` (2026-11-24) replace the single `loop` key of older
+files. A model without either key is migrated on load: its `loop` sets **both**
+(`loop: true` -> closing leg and repeat), so an old mission behaves exactly as
+before until it is re-saved; new files write the two keys and no `loop`.
+
 If the metadata file is missing, the editor re-imports the runtime samples as
-plain waypoints (decimated), so a mission is never unopenable.
+plain waypoints (decimated), so a mission is never unopenable; the samples
+already hold any closing leg, so the re-imported mission gets
+`close_path: false` and `repeat` = the runtime `loop`.
 
 ## 3. Selecting a YAML trajectory at launch
 
@@ -140,6 +182,11 @@ The station's Launch Mission dialog builds this string automatically when a
 "custom: …" entry is selected in a Gazebo launch. An optional dedicated
 `yaml_path` node parameter is also supported (`trajectory:=from_yaml
 yaml_path:=<path>`) for hand-written launch files.
+
+The station's launch and Update Mission dialogs show each path's end read-only
+from the runtime file (`io_yaml.read_path_ending`): *repeats forever (loop: true)*
+or *ends — holds the final pose*, plus *returns to start* when its last sample lies
+within `start_align_tol_m` of its first. The designer remains the place to change it.
 
 ## 4. Run sessions — one watched file, rewritten per run
 
@@ -171,7 +218,8 @@ just **before** each `start` on `/blueboat/run_command`, so the first window
   `deployed_from`, `placed_at: {x, y, yaw}`. Refused for an anchored mission.
 
 The file is deleted at connection, when Update Mission picks a non-anchored
-path or the pinger, and after a placed run stops, so neither the station nor
+path or a run without a path (pinger mode *Follow*, or *Off* / *Log* with "(no path)",
+2026-11-24 — such a run writes no file at START RUN), and after a placed run stops, so neither the station nor
 the GCS ever shows a previous run's path as the next one. A missing file
 leaves `path_generation` on what it last loaded — harmless, since an idle
 session requests no path. Built-in shapes are not offered in a session.

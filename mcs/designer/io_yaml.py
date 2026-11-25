@@ -4,7 +4,9 @@ Two files per mission, in ``designer.trajectories_dir``:
 
 * ``<name>.yaml`` — the **runtime** trajectory: only what execution needs
   (format tag, speed, loop, time-stamped ``[t, x, y, yaw]`` samples plus
-  informative length/duration). Consumed by the control stack's
+  informative length/duration). ``loop`` is the model's ``repeat`` option
+  ("Repeat forever"); a closing leg ("Return to start", ``close_path``) is
+  already in the samples. Consumed by the control stack's
   ``BlueBoat-Control/blueboat_control/src/_custom_libraries/yaml_trajectory.py``;
   documented in ``docs/05_trajectory_format.md``.
 * ``<name>.meta.yaml`` — **editor** metadata: the full designer model
@@ -14,7 +16,7 @@ Two files per mission, in ``designer.trajectories_dir``:
 
 The read-only helpers the launch dialogs call once per saved mission
 (:func:`read_geo_anchor`, :func:`read_first_point`,
-:func:`read_start_misalignment`) parse through libyaml when it is installed and
+:func:`read_start_misalignment`, :func:`read_path_ending`) parse through libyaml when it is installed and
 memoize the parsed file by ``(mtime, size)``, so a dialog that badges every
 saved path costs one ``stat`` per file once the files have been read.
 """
@@ -37,6 +39,8 @@ if TYPE_CHECKING:  # annotation only -- see mcs/designer/sampling.py
     from mcs.designer.model import MissionModel
 
 FORMAT = "blueboat_trajectory/1"
+SAFETY_FORMAT = "blueboat_safety_way_back/1"
+SAFETY_MAX_POINTS = 200          # link_guardian.lua's SAFE_MAX
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 # libyaml's loader when the build has it (~9x faster on the dense sample files);
@@ -107,7 +111,9 @@ def save_mission(directory: Path, name: str, model: MissionModel,
             timespec="seconds"),
         "frame": "world",
         "speed": float(model.speed),
-        "loop": bool(model.loop),
+        # Repeat forever (the control stack wraps t modulo duration). Only
+        # model.repeat drives it -- never the closing leg (close_path).
+        "loop": bool(model.repeat),
         "length_m": round(samples.length_m, 3),
         "duration_s": round(samples.duration_s, 3),
         "points": points,
@@ -118,12 +124,61 @@ def save_mission(directory: Path, name: str, model: MissionModel,
             "lon0": float(geo_anchor["lon0"]),
             "theta_deg": float(geo_anchor.get("theta_deg", 0.0)),
         }
+        safety = safety_way_back_latlon(model.safety_way_back, runtime["geo_anchor"])
+        if safety is not None:
+            # Lat/lon, so it needs no transform when the file is deployed: the
+            # station hands it to the link guardian at START RUN (README of
+            # link_guardian/). Control, the GCS and the simulator ignore the key.
+            runtime["safety_way_back"] = {"format": SAFETY_FORMAT, "points": safety}
     path = runtime_path(directory, name)
     path.write_text(yaml.safe_dump(runtime, sort_keys=False,
                                    default_flow_style=None))
     meta = {"format": "blueboat_trajectory_meta/1", "model": model.to_dict()}
     meta_path(directory, name).write_text(yaml.safe_dump(meta, sort_keys=False))
     return path
+
+
+def design_to_latlon(points, geo_anchor: dict) -> list[tuple[float, float]]:
+    """Design-frame (x, y) points -> (lat, lon) through a mission's
+    ``geo_anchor``: design -> EN about the anchor origin (identity for
+    ``theta_deg == 0``; a legacy anchor recorded design = R(theta) @ EN),
+    then EN -> lat/lon. The one copy of this convention."""
+    from mcs.core.geo import local_en_to_latlon as _en_to_ll
+
+    theta = math.radians(float(geo_anchor.get("theta_deg", 0.0)))
+    c, s = math.cos(theta), math.sin(theta)
+    lat0, lon0 = float(geo_anchor["lat0"]), float(geo_anchor["lon0"])
+    return [_en_to_ll(c * float(x) + s * float(y), -s * float(x) + c * float(y),
+                      lat0, lon0)
+            for x, y in points]
+
+
+def safety_way_back_latlon(points, geo_anchor: dict) -> list[list[float]] | None:
+    """The design-frame safety way back as [[lat, lon], ...] through the mission's
+    anchor, or None when it has fewer than 2 points."""
+    if len(points) < 2:
+        return None
+    return [[round(lat, 8), round(lon, 8)]
+            for lat, lon in design_to_latlon(points, geo_anchor)]
+
+
+def read_safety_way_back(yaml_path: Path) -> list[tuple[float, float]] | None:
+    """The safety way back of a GPS-anchored runtime file, [(lat, lon), ...], or
+    None when the file has none (or an unusable one)."""
+    try:
+        data = _read_data(yaml_path)
+    except (OSError, yaml.YAMLError):
+        return None
+    block = data.get("safety_way_back")
+    if not isinstance(block, dict) or block.get("format") != SAFETY_FORMAT:
+        return None
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in block.get("points", [])]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not 2 <= len(pts) <= SAFETY_MAX_POINTS:
+        return None
+    return pts
 
 
 def read_geo_anchor(yaml_path: Path) -> dict | None:
@@ -185,6 +240,30 @@ def read_start_misalignment(yaml_path: Path, tol_m: float, tol_deg: float
     return start_misalignment(pts[:, 1:3], tol_m, tol_deg)
 
 
+def read_path_ending(yaml_path: Path, tol_m: float = 0.05
+                     ) -> tuple[bool, bool] | None:
+    """``(loop, returns_to_start)`` of a runtime file, read-only.
+
+    ``loop`` is the file's runtime flag (true: the control stack repeats the
+    path forever; false: the boat holds the final pose when it ends);
+    ``returns_to_start`` says whether its last sample lies within *tol_m* of
+    its first. Never raises: an unreadable or malformed file answers None,
+    so it cannot break a launch dialog."""
+    try:
+        data = _read_data(yaml_path)
+    except (OSError, yaml.YAMLError):
+        return None
+    try:
+        pts = np.asarray(data.get("points", []), dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if pts.ndim != 2 or pts.shape[0] < 1 or pts.shape[1] < 3:
+        return None
+    returns = (pts.shape[0] >= 2 and math.hypot(float(pts[-1, 1] - pts[0, 1]),
+                                                float(pts[-1, 2] - pts[0, 2])) <= tol_m)
+    return bool(data.get("loop", False)), bool(returns)
+
+
 def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     """Convert a GPS-anchored mission into the CURRENT run's world frame.
 
@@ -201,8 +280,6 @@ def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     """
     import math as _math
 
-    from mcs.core.geo import local_en_to_latlon as _en_to_ll
-
     # A usable translation fit is all deployment needs: no rotation is
     # estimated (the odom frame is local ENU), so no vehicle motion is
     # required. The watcher retries until fixes have anchored the frame.
@@ -214,15 +291,10 @@ def deploy_mission(src: Path, current_fit, dst: Path) -> Path:
     if not anchor:
         raise ValueError(f"{src} has no geo_anchor")
     theta_a = _math.radians(float(anchor.get("theta_deg", 0.0)))
-    lat0_a, lon0_a = float(anchor["lat0"]), float(anchor["lon0"])
-    ca, sa = _math.cos(theta_a), _math.sin(theta_a)
+    points = data.get("points", [])
+    latlon = design_to_latlon([(x, y) for _t, x, y, _yaw in points], anchor)
     out_points = []
-    for t_s, x, y, yaw in data.get("points", []):
-        # design -> EN about the anchor origin. For theta_deg == 0 this is
-        # the identity; a legacy anchor recorded design = R(theta_a) @ EN.
-        e = ca * float(x) + sa * float(y)
-        n = -sa * float(x) + ca * float(y)
-        lat, lon = _en_to_ll(e, n, lat0_a, lon0_a)
+    for (t_s, _x, _y, yaw), (lat, lon) in zip(points, latlon, strict=True):
         wx, wy = current_fit.latlon_to_world(lat, lon)
         yaw2 = _math.atan2(_math.sin(float(yaw) - theta_a),
                            _math.cos(float(yaw) - theta_a))
@@ -312,8 +384,11 @@ def load_mission(directory: Path, name: str, model: MissionModel) -> dict | None
     rp = runtime_path(directory, name)
     data = yaml.safe_load(rp.read_text()) or {}
     pts = np.asarray(data.get("points", []), dtype=float)
+    # Re-imported samples already hold any closing leg: only the runtime
+    # repeat flag carries over.
     model.from_dict({"name": name, "speed": data.get("speed", 0.5),
-                     "loop": data.get("loop", False), "items": []})
+                     "close_path": False, "repeat": bool(data.get("loop", False)),
+                     "items": []})
     if len(pts):
         keep = _decimate(pts[:, 1:3], min_step=5.0)
         for i in keep:

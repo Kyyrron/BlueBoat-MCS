@@ -5,7 +5,12 @@ Sections (all collapsible):
   hosted at the very top via :meth:`set_header`.
 * **Robot** — live pose, GPS, heading, speed, controller, mission state,
   motor commands, battery charge, travelled distance, elapsed time.
-* **Pinger** — world & robot-frame coordinates, live distance, last update.
+* **Pinger** (2026-11-24) — the run's pinger mode and source, the applied
+  filter, then the FILTERED estimate as ``/blueboat/pinger/estimate`` reports
+  it (status coloured, position, distance, fix age and rate, 95 % radius,
+  speed, % down-weighted / set aside over its window), then the LEGACY
+  algorithm's position, body vector and distance, and the age of the last
+  raw USBL packet. Every number is read from a topic, never derived.
 * **Target** — robot↔pinger or robot↔path distance depending on mode.
 * **ROS diagnostics** — per-topic rate / age / LED status.
 * **RUN** (real-robot run session only) — pinned below the scroll area, so it
@@ -31,16 +36,25 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core import pinger_filter as pf
 from mcs.core.clock import format_clock, station_clock
 from mcs.gui import theme
 from mcs.gui.widgets import CollapsibleSection, InfoGrid, StatusLed
-from mcs.models.store import DataStore, TargetMode
+from mcs.models.store import DataStore, TargetMode, finite_float
 
 # Battery row thresholds: below 40 % is a "plan the return" warning, below
 # 20 % an error. A row older than this is greyed rather than trusted.
 _BATTERY_WARN_FRAC = 0.40
 _BATTERY_ERR_FRAC = 0.20
 _BATTERY_STALE_S = 15.0
+
+#: Status colours of the filtered pinger estimate.
+_STATUS_COLORS = {"tracking": theme.OK, "coasting": theme.WARN, "stale": theme.ERR,
+                  "initialising": theme.TEXT_DIM, "no_data": theme.TEXT_DIM}
+_MODE_TEXT = {pf.MODE_OFF: "off (path)", pf.MODE_FOLLOW: "follow pinger",
+              pf.MODE_LOG: "log only"}
+_SOURCE_TEXT = {pf.SOURCE_FILTER: "filtered", pf.SOURCE_LEGACY: "legacy (dragged)"}
+
 
 class LeftPanel(QWidget):
     """Live-information sidebar."""
@@ -79,7 +93,10 @@ class LeftPanel(QWidget):
         # ---- Pinger -----------------------------------------------------------
         sec_pinger = CollapsibleSection("PINGER")
         self.pinger_grid = InfoGrid()
-        for key in ("World (x, y)", "Robot frame", "Distance", "Last update"):
+        for key in ("Mode", "Source", "Filter", "Status", "World (x, y)", "Distance",
+                    "Fix age", "Fix rate", "95 % radius", "Speed", "Down-weighted",
+                    "Set aside", "Legacy (x, y)", "Legacy body", "Legacy distance",
+                    "Last update"):
             self.pinger_grid.add_row(key)
         sec_pinger.add_widget(self.pinger_grid)
         layout.addWidget(sec_pinger)
@@ -134,17 +151,9 @@ class LeftPanel(QWidget):
         elapsed = s.mission.elapsed_s()
         g.set("Elapsed", format_clock(elapsed) if elapsed is not None else "—")
 
+        self._refresh_pinger()
         p = s.pinger
         pg = self.pinger_grid
-        if p.seen:
-            if p.world is not None:
-                pg.set("World (x, y)", f"{p.world[0]:+8.2f}, {p.world[1]:+8.2f} m")
-            pg.set("Robot frame", f"{p.body[0]:+7.2f}, {p.body[1]:+7.2f} m")
-            pg.set("Distance", f"{p.distance_m:6.2f} m" if p.distance_m else "—")
-        else:
-            pg.set("World (x, y)", "not detected", theme.TEXT_DIM)
-            pg.set("Robot frame", "—")
-            pg.set("Distance", "—")
         if p.last_raw_update_t is not None:
             age = station_clock().now() - p.last_raw_update_t
             color = theme.OK if age < 3 else (theme.WARN if age < 10 else theme.ERR)
@@ -161,6 +170,90 @@ class LeftPanel(QWidget):
         self.target_grid.set("Mode", text, color)
         d = s.active_target_distance()
         self.target_grid.set("Distance", f"{d:6.2f} m" if d is not None else "—")
+
+    def _refresh_pinger(self) -> None:
+        """The PINGER section above "Last update" (read from the store)."""
+        s = self._store
+        m = s.mission
+        pg = self.pinger_grid
+        if not m.launch_running:
+            pg.set("Mode", "—", theme.TEXT_DIM)
+        elif m.replay:
+            pg.set("Mode", "replay", theme.TEXT_DIM)
+        elif m.simulation:
+            pg.set("Mode", "n/a (simulation)", theme.TEXT_DIM)
+        else:
+            pg.set("Mode", _MODE_TEXT.get(m.pinger_mode, m.pinger_mode or "—"))
+
+        est = s.pinger_est
+        echo = s.pinger_filter.echo
+        src = echo.get("pinger_source") or (est.source if est.payload else "")
+        pg.set("Source", _SOURCE_TEXT.get(src, "—"))
+        if echo:
+            text = f"{echo.get('preset', '?')} · {str(echo.get('hash') or '')[:8]}"
+            pf_state = s.pinger_filter
+            if pf_state.sent_seq is None:
+                color = None
+            elif pf_state.applied():
+                color = theme.OK
+            elif pf_state.refusal() is not None:
+                text, color = "refused — " + pf_state.refusal(), theme.ERR
+            else:
+                text, color = text + " (applying…)", theme.WARN
+            pg.set("Filter", text, color)
+        else:
+            pg.set("Filter", "—", theme.TEXT_DIM)
+
+        p = est.payload
+        if est.t is None:
+            pg.set("Status", "no estimate", theme.TEXT_DIM)
+        else:
+            age = station_clock().now() - est.t
+            stale_s = self._cfg.diagnostics.warn_age_s.get(
+                self._cfg.topics.pinger_estimate, 3.0)
+            if age > stale_s:
+                pg.set("Status", f"no estimate for {age:4.0f} s", theme.ERR)
+            else:
+                status = est.status
+                event = p.get("event")
+                pg.set("Status", status + (f" ({event})" if event else ""),
+                       _STATUS_COLORS.get(status, theme.TEXT_DIM))
+        if est.world is not None:
+            pg.set("World (x, y)", f"{est.world[0]:+8.2f}, {est.world[1]:+8.2f} m")
+        else:
+            pg.set("World (x, y)", "no estimate" if est.t is None else "not initialised",
+                   theme.TEXT_DIM)
+        rng = finite_float(p.get("range_m"))
+        if rng is None and est.source == pf.SOURCE_FILTER and est.body is not None \
+                and any(abs(c) > 1e-9 for c in est.body):
+            rng = math.hypot(est.body[0], est.body[1])
+        pg.set("Distance", f"{rng:6.2f} m" if rng is not None else "—")
+        fix_age, fix_rate, r95 = (finite_float(p.get(k)) for k in ("fix_age", "fix_rate", "r95"))
+        pg.set("Fix age", f"{fix_age:5.1f} s" if fix_age is not None else "—")
+        pg.set("Fix rate", f"{fix_rate:5.2f} /s" if fix_rate is not None else "—")
+        pg.set("95 % radius", f"{r95:6.2f} m" if r95 is not None else "—")
+        vx, vy = finite_float(p.get("vx")), finite_float(p.get("vy"))
+        pg.set("Speed", f"{math.hypot(vx, vy):5.2f} m/s"
+               if vx is not None and vy is not None and est.world is not None else "—")
+        stats = p.get("stats") if isinstance(p.get("stats"), dict) else {}
+        win = finite_float(stats.get("window_s"))
+        suffix = f" / {win:.0f} s" if win is not None else ""
+        for key, field in (("Down-weighted", "pct_downweighted"),
+                           ("Set aside", "pct_set_aside")):
+            v = finite_float(stats.get(field))
+            pg.set(key, f"{v:5.1f} %{suffix}" if v is not None else "—")
+
+        leg = s.pinger
+        if leg.seen:
+            if leg.world is not None:
+                pg.set("Legacy (x, y)", f"{leg.world[0]:+8.2f}, {leg.world[1]:+8.2f} m")
+            pg.set("Legacy body", f"{leg.body[0]:+7.2f}, {leg.body[1]:+7.2f} m")
+            pg.set("Legacy distance",
+                   f"{leg.distance_m:6.2f} m" if leg.distance_m else "—")
+        else:
+            pg.set("Legacy (x, y)", "not detected", theme.TEXT_DIM)
+            pg.set("Legacy body", "—")
+            pg.set("Legacy distance", "—")
 
     def _mission_state_text(self) -> tuple[str, str]:
         s = self._store

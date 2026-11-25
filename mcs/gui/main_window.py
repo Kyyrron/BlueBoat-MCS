@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from mcs.config.settings import AppConfig
 from mcs.core.clock import sim_badge, station_clock
+from mcs.core.pinger_filter import MODE_OFF
 from mcs.core.signals import SignalBus
 from mcs.gui import theme
 from mcs.gui.arrow_box import FloatingArrowBox
@@ -171,7 +172,11 @@ class MainWindow(QMainWindow):
         bus.compass_received.connect(store.on_compass)
         bus.mavros_state_received.connect(store.on_mavros_state)
         bus.battery_received.connect(store.on_battery)
-        bus.pinger_body_received.connect(store.on_pinger_body)
+        bus.pinger_body_received.connect(store.on_pinger_body)            # legacy layer
+        bus.pinger_coords_received.connect(store.on_pinger_coordinates)
+        bus.pinger_estimate_received.connect(store.on_pinger_estimate)    # filtered
+        bus.pinger_fix_received.connect(store.on_pinger_fix)
+        bus.pinger_filter_config_received.connect(store.on_pinger_filter_config)
         bus.uw_gps_raw_received.connect(store.on_uw_gps_raw)
         bus.monitoring_received.connect(store.on_monitoring)
         bus.thruster_received.connect(store.on_thruster)
@@ -331,6 +336,12 @@ class MainWindow(QMainWindow):
         m.launch_running = True
         m.controller_type = params.controller_type
         m.use_pinger = params.use_pinger
+        # The pinger (2026-11-24): no pinger in a Gazebo graph; a session's
+        # run_state then reports each run's mode.
+        sim_only = params.simulation and not params.replay_bag
+        m.pinger_mode = MODE_OFF if sim_only else params.effective_pinger_mode()
+        m.has_path = bool(params.has_path)
+        m.path_complete = False
         m.simulation = params.simulation
         m.gps_simulated = params.gps_simulated
         m.world_dir = params.world_dir
@@ -342,7 +353,8 @@ class MainWindow(QMainWindow):
         # replay keeps the wall clock); re-anchored before the store resets.
         station_clock().set_follow(params.simulation and not params.replay_bag)
         self._sim_rtf = params.real_time_factor
-        self.store.reset_experiment()
+        self.store.reset_experiment()           # pinger snapshots and trails too
+        self.store.reset_pinger_filter()        # a new estimator, a new echo
         if params.session:
             # Real robot = run session: connect, idle, runs by hand.
             self.run_session.begin(params)
@@ -816,7 +828,7 @@ class MainWindow(QMainWindow):
     def _on_clear_paths(self) -> None:
         self.store.clear_tracks()
         self.map_view.refresh()
-        self._status.showMessage("Robot and pinger trails cleared.", 4000)
+        self._status.showMessage("Robot and pinger trails (and raw fixes) cleared.", 4000)
 
     def _on_measure_mode(self, on: bool) -> None:
         if on and self.toolbar.manual_button.isChecked():

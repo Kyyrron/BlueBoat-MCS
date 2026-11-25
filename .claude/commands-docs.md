@@ -39,7 +39,10 @@ with `SMOKE TEST PASSED`. **Environment it needs** (else it aborts at the first 
 not a regression): the `sea state ok` timeline asserts need the simulator's installed
 `sea_states.yaml`; the bridge-node path-service block imports `bridge_node`, hence
 `nav_msgs` / `sensor_msgs` / `std_msgs` (a sourced ROS 2); `guardian ok` needs the
-superproject's `link_guardian/laptop/guardian.py` beside this repository. Uncovered: most of
+superproject's `link_guardian/laptop/guardian.py` beside this repository; (2026-11-24) the
+pinger blocks (`pinger schema ok` … `pinger layers ok`) need BlueBoat-Control's
+`config/pinger_filter.yaml` (installed share or the superproject checkout), and
+`designer split ok` pins the Return-to-start / Repeat-forever split and its migration. Uncovered: most of
 the designer UI (`designer_map.py`, `panels.py`, `designer_window.py`, the `_push_undo`
 contract). A green run is not field readiness — it cannot catch QoS mismatches, message-type
 drift or launch-argument errors.

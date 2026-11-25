@@ -135,7 +135,28 @@ class BridgeNode(Node):
         # (a RELIABLE subscriber against a BEST_EFFORT publisher receives
         # nothing at all -- CM-4).
         self.create_subscription(BatteryState, t.battery, self._on_battery, best_effort)
+        # The pinger pipeline (BlueBoat-Control pinger_estimator, 2026-11-24).
+        # /blueboat/pinger_coordinates is what master_control steers to (the
+        # filtered vector, or the legacy one with pinger_source legacy); the
+        # LEGACY map layer comes from /blueboat/pinger/legacy_body, the
+        # FILTERED one from /blueboat/pinger/estimate (world frame at the
+        # source). Each subscription matches its publisher's QoS (CM-4): the
+        # fixes reliable depth 50, the applied parameter set latched.
         self.create_subscription(Float32MultiArray, t.pinger_body, self._on_pinger, 10)
+        self.create_subscription(Float32MultiArray, t.pinger_legacy_body,
+                                 self._on_pinger_legacy, 10)
+        self.create_subscription(String, t.pinger_estimate, self._on_pinger_estimate, 10)
+        fix_qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE)
+        self.create_subscription(String, t.pinger_fix, self._on_pinger_fix, fix_qos)
+        filter_latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                    durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(String, t.pinger_filter_config,
+                                 self._on_pinger_filter_config, filter_latched)
+        # A control stack (or a replayed bag) older than the pinger pipeline
+        # publishes no legacy_body: its /blueboat/pinger_coordinates IS the
+        # legacy vector, and feeds the legacy layer (_on_pinger).
+        self._legacy_absent = False
+        self._legacy_checked = -math.inf
         self.create_subscription(Float32MultiArray, t.uw_gps_raw, self._on_uw_gps, 10)
         self.create_subscription(Float32MultiArray, t.monitoring, self._on_monitoring, 10)
         self.create_subscription(Float32MultiArray, t.thruster_input, self._on_thruster, 10)
@@ -279,10 +300,54 @@ class BridgeNode(Node):
         )
 
     def _on_pinger(self, msg: Float32MultiArray) -> None:
+        """/blueboat/pinger_coordinates: the body vector master_control steers
+        to. Also the legacy layer's input when nothing publishes
+        /blueboat/pinger/legacy_body (an older control stack or bag)."""
         t = self._mark(self._cfg.topics.pinger_body)
         data = list(msg.data)
         if len(data) >= 2:
+            self._bus.pinger_coords_received.emit(t, data)
+            if self._legacy_publisher_absent():
+                self._bus.pinger_body_received.emit(t, data)
+
+    def _legacy_publisher_absent(self) -> bool:
+        """No publisher on /blueboat/pinger/legacy_body (graph query, cached
+        for a second: _on_pinger runs at the odom rate)."""
+        now = time.monotonic()
+        if now - self._legacy_checked > 1.0:
+            self._legacy_checked = now
+            try:
+                self._legacy_absent = self.count_publishers(
+                    self._cfg.topics.pinger_legacy_body) == 0
+            except Exception:  # noqa: BLE001 - graph query failed: assume a new stack
+                self._legacy_absent = False
+        return self._legacy_absent
+
+    def _on_pinger_legacy(self, msg: Float32MultiArray) -> None:
+        """/blueboat/pinger/legacy_body -> the legacy layer (the store's
+        on_pinger_body: body -> world with the pose of that instant, N4)."""
+        t = self._mark(self._cfg.topics.pinger_legacy_body)
+        data = list(msg.data)
+        if len(data) >= 2:
             self._bus.pinger_body_received.emit(t, data)
+
+    def _on_pinger_estimate(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.pinger_estimate)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.pinger_estimate_received.emit(t, payload)
+
+    def _on_pinger_fix(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.pinger_fix)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.pinger_fix_received.emit(t, payload)
+
+    def _on_pinger_filter_config(self, msg: String) -> None:
+        t = self._mark(self._cfg.topics.pinger_filter_config)
+        payload = _json_object(msg.data)
+        if payload is not None:
+            self._bus.pinger_filter_config_received.emit(t, payload)
 
     def _on_uw_gps(self, msg: Float32MultiArray) -> None:
         t = self._mark(self._cfg.topics.uw_gps_raw)

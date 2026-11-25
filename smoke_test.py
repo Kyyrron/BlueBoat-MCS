@@ -2171,15 +2171,16 @@ try:
     _sa = _sd.parameters()
     assert _sa.gps_anchored_source == str(_sl_anch)
     assert _sa.gps_deployed_target == _sl_cfg.launch.session_trajectory_file
-    # MPC cannot follow the pinger: greyed out and left when it was chosen.
+    # MPC cannot follow the pinger: greyed out and left when it was chosen
+    # (pinger mode Follow, 2026-11-24; the checkbox it replaces did the same).
     _sd._controller.setCurrentText("MPC")
-    _sd._use_pinger.setChecked(True)
+    _sd._pinger.set_mode("follow")
     assert _sd._controller.currentText() == "PID"
     _mpc = _sd._controller.findText("MPC")
     assert not _sd._controller.model().item(_mpc).isEnabled()
     _spp = _sd.parameters()
     assert _spp.use_pinger and _spp.session_source == ""
-    _sd._use_pinger.setChecked(False)
+    _sd._pinger.set_mode("off")
     # Simulation keeps the v1.0 arguments: no session_mode.
     _sd._mode.setCurrentText("Gazebo simulation")
     assert "session_mode:=True" not in _sd.parameters().to_cli()
@@ -2368,6 +2369,14 @@ try:
     _rs_bus.shutdown_unconfirmed.connect(lambda _r: _rs_cc.shutdown_force())
     _rs_previews: list = []
     _rs.preview_requested.connect(_rs_previews.append)
+    # MainWindow's wiring of the latched filter echo (2026-11-24).
+    _rs_bus.pinger_filter_config_received.connect(_rs_store.on_pinger_filter_config)
+
+    def _filter_echo(seq, ok=True, **kw):
+        payload = {"seq": seq, "ok": ok, "detail": "applied", "pinger_source": "filter",
+                   "preset": "slow_rov", "params": {}}
+        payload.update(kw)
+        _rs_bus.pinger_filter_config_received.emit(time.monotonic(), payload)
 
     # Launch: a session whose first run follows a placed (non-anchored) path.
     _rs.begin(_LP(simulation=False, controller_type="LoS", use_pinger=False,
@@ -2440,6 +2449,9 @@ try:
     assert _cf and _cf[-1]["cmd"] == "configure" and _cf[-1]["use_pinger"] is True
     assert "mission settings not applied yet" in _rs.start_blockers()
     _state(seq=_cf[-1]["seq"], controller_type="PID", use_pinger=True, run=1)
+    # A pinger run also waits for the estimator's filter echo (2026-11-24).
+    assert _rs.start_blockers() == ["pinger filter configuration not applied yet"]
+    _filter_echo(_cf[-1]["seq"])
     assert _rs.start_blockers() == []
 
     # master_control restarted: its heartbeat echoes no command any more, so
@@ -2450,6 +2462,7 @@ try:
     assert [p["cmd"] for p in _again] == ["configure"], _rs_events
     assert _again[0]["use_pinger"] is True
     _state(seq=_again[0]["seq"], controller_type="PID", use_pinger=True, run=1)
+    _filter_echo(_again[0]["seq"])
     assert _rs.start_blockers() == []
 
     # E-STOP latched: START RUN waits for Release E-STOP.
@@ -3019,6 +3032,7 @@ assert _sd._sonar_model.isVisibleTo(_sd) and not _sd._slowdown.isVisibleTo(_sd)
 assert _sd.parameters().sonar_renderer == _RG and _sd.parameters().real_time_factor == 1.0
 assert (_sd._slowdown.minimum(), _sd._slowdown.maximum()) == (0.01, 4.0)
 from mcs.gui.dialogs.launch_dialog import slowdown_hint as _shint
+
 assert "faster than real time" in _shint(2.0) and "slower" not in _shint(2.0)
 assert "20 Hz in sim time" in _shint(2.0) and "10x slower" in _shint(0.1)
 assert abs(_sd._slowdown.value() - cfg.sim_speed.rtf_default) < 1e-9
@@ -3152,6 +3166,951 @@ from mcs.models.store import now_mono as _nm
 
 assert not _stc().following and abs(_nm() - time.monotonic()) < 0.5
 print("sim speed ok")
+
+# =========================================================================
+# THE PINGER (owner order, 2026-11-24): Control's pinger_estimator publishes
+# a FILTERED estimate (world frame) beside the LEGACY vector; the station
+# shows both, chooses the run's pinger mode / source / filter, waits for the
+# estimator's echo before START RUN, and the designer's single loop box is
+# split in two. Every block below is self-contained (own stubs / temp dirs).
+# =========================================================================
+
+# --- Pinger filter schema: Control's DATA file, read, never imported (N9) ---
+from mcs.core import pinger_filter as _pf
+
+_pschema = _pf.load_schema_or_none(cfg.pinger.schema_file, cfg.pinger.schema_checkout)
+assert _pschema is not None, _pf.schema_candidates(cfg.pinger.schema_file,
+                                                   cfg.pinger.schema_checkout)
+assert "pinger_params" not in sys.modules and not any(
+    m.startswith("blueboat_control") for m in sys.modules), "Control imported (N9)"
+_praw = _yaml.safe_load(_pschema.path.read_text())
+assert _pschema.group_names() == _praw["groups"]
+assert list(_pschema.parameters) == list(_praw["parameters"])
+assert _pschema.preset_values("slow_rov") == _pschema.defaults()       # defaults = slow_rov
+_pst_vals = _pschema.preset_values("static_target")
+assert _pst_vals["model"] == "static" and _pst_vals["v_max"] == 0.0
+assert _pf.validate(_pschema.defaults(), _pschema)[1] == []
+
+
+def _pprobs(**kw):
+    _v = _pschema.defaults()
+    _v.update(kw)
+    return _pf.validate(_v, _pschema)[1]
+
+
+assert any("y_sign" in _p for _p in _pprobs(y_sign=0))
+assert any("z_sign" in _p for _p in _pprobs(z_sign=0))
+assert _pprobs(y_sign=-1, z_sign=-1) == []
+assert _pprobs(gate_hard=3.0, gate_soft=5.0) == ["gate_hard must be >= gate_soft"]
+assert _pprobs(stale_timeout_s=1.0, coast_after_s=2.0) == [
+    "stale_timeout_s must be >= coast_after_s"]
+assert any("not one of" in _p for _p in _pprobs(robust="magic"))
+assert any("above the maximum" in _p for _p in _pprobs(latency_s=99.0))
+assert any("below the minimum" in _p for _p in _pprobs(min_receivers=-1))
+assert any("is not a int" in _p for _p in _pprobs(init_n=2.5))
+assert any("unknown parameter" in _p for _p in _pprobs(lattency_s=1.0))
+assert _pf.same_params({"a": 1, "b": True}, {"a": 1.0, "b": True})
+assert not _pf.same_params({"a": 1}, {"a": 1, "c": 2})
+assert not _pf.same_params({"b": True}, {"b": 1})
+assert _pf.filter_block(_pschema, "static_target") == {"preset": "static_target",
+                                                       "params": _pst_vals}
+assert _pf.filter_block(None, "slow_rov") == {"preset": "slow_rov", "params": {}}
+_pfd = Path(tempfile.mkdtemp(prefix="mcs_smoke_pf_"))
+try:
+    _cust = _pschema.preset_values("slow_rov")
+    _cust["latency_s"] = 1.2
+    _pf.write_param_file(_pfd / "a.yaml", "custom", _cust)
+    _pdoc = _yaml.safe_load((_pfd / "a.yaml").read_text())
+    assert (_pdoc["schema"], _pdoc["preset"], _pdoc["params"]) == (
+        _pf.SCHEMA_ID, "custom", _cust)
+    _pdoc["hash"] = "0123456789abcdef"       # Control writes one: ignored on load
+    (_pfd / "b.yaml").write_text(_yaml.safe_dump(_pdoc))
+    assert _pf.read_param_file(_pfd / "b.yaml", _pschema) == ("custom", _cust)
+    # A partial file applies over the preset it names (Control's order).
+    (_pfd / "c.yaml").write_text(_yaml.safe_dump(
+        {"schema": _pf.SCHEMA_ID, "preset": "static_target",
+         "params": {"latency_s": 0.5}}))
+    _pcp, _pcv = _pf.read_param_file(_pfd / "c.yaml", _pschema)
+    assert _pcp == "static_target" and _pcv["model"] == "static" and _pcv["latency_s"] == 0.5
+    (_pfd / "d.yaml").write_text(_yaml.safe_dump({"params": {"y_sign": 0}}))
+    try:
+        _pf.read_param_file(_pfd / "d.yaml", _pschema)
+        raise AssertionError("an invalid parameter file was accepted")
+    except ValueError as _exc:
+        assert "y_sign" in str(_exc), _exc
+finally:
+    shutil.rmtree(_pfd, ignore_errors=True)
+print("pinger schema ok")
+
+# --- Advanced panel: generated from the schema; invalid blocked; reset; YAML ---
+from PySide6.QtWidgets import QCheckBox as _QCB
+from PySide6.QtWidgets import QComboBox as _QCMB
+from PySide6.QtWidgets import QDialogButtonBox as _QDBB
+from PySide6.QtWidgets import QDoubleSpinBox as _QDSB
+from PySide6.QtWidgets import QSpinBox as _QSB
+from PySide6.QtWidgets import QWidget as _QW
+
+from mcs.gui.dialogs.pinger_filter_dialog import PingerFilterDialog, PingerForm
+
+_pa_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_pa_"))
+try:
+    _pa_cfg = AppConfig()
+    _pa_cfg.pinger.filter_dir = str(_pa_dir / "pf")
+    _pad = PingerFilterDialog(_pa_cfg, _pschema, "slow_rov")
+    # One row per schema parameter, one group box per schema group, in order.
+    assert list(_pad.editors) == list(_pschema.parameters)
+    assert _pad.groups == [g for g in _pschema.group_names() if _pschema.names_in_group(g)]
+    for _n, _spec in _pschema.parameters.items():
+        _ed = _pad.editors[_n]
+        assert _pad.units[_n].text() == str(_spec.get("unit") or ""), _n
+        assert _ed.toolTip() == _spec["description"] == _pad.labels[_n].toolTip(), _n
+        if _spec["type"] == "bool":
+            assert isinstance(_ed, _QCB), _n
+        elif _spec["type"] == "enum":
+            assert isinstance(_ed, _QCMB), _n
+            assert [_ed.itemText(i) for i in range(_ed.count())] == [
+                str(c) for c in _spec["choices"]], _n
+        elif _spec["type"] == "int":
+            assert isinstance(_ed, _QSB), _n
+            assert (_ed.minimum(), _ed.maximum()) == (_spec["min"], _spec["max"]), _n
+        else:
+            assert isinstance(_ed, _QDSB), _n
+            assert abs(_ed.minimum() - _spec["min"]) < 1e-9, _n
+            assert abs(_ed.maximum() - _spec["max"]) < 1e-9, _n
+    _pa_ok = _pad._buttons.button(_QDBB.StandardButton.Ok)
+    assert _pad.values() == _pschema.preset_values("slow_rov") and _pa_ok.isEnabled()
+    assert _pad.result_block() == {"preset": "slow_rov",
+                                   "params": _pschema.preset_values("slow_rov")}
+    # Invalid values are blocked, with the reason shown.
+    _pad.editors["y_sign"].setValue(0)
+    assert not _pa_ok.isEnabled() and "y_sign" in _pad._problem.text()
+    _pad.accept()
+    assert _pad.result() == 0, "an invalid set was accepted"
+    _pad.editors["y_sign"].setValue(-1)
+    assert _pa_ok.isEnabled() and _pad._problem.text() == ""
+    _pad.editors["gate_hard"].setValue(2.0)               # below gate_soft 5.99
+    assert not _pa_ok.isEnabled()
+    assert "gate_hard must be >= gate_soft" in _pad._problem.text()
+    _pad.editors["gate_hard"].setValue(18.42)
+    _pad.editors["stale_timeout_s"].setValue(1.0)         # below coast_after_s 2
+    assert "stale_timeout_s must be >= coast_after_s" in _pad._problem.text()
+    # Reset to preset.
+    _pad.reset_to_preset()
+    assert _pad.values() == _pschema.preset_values("slow_rov") and _pa_ok.isEnabled()
+    assert not _pad.is_custom()
+    # An edit makes the set "custom".
+    _pad.editors["latency_s"].setValue(1.2)
+    _pa_blk = _pad.result_block()
+    assert _pa_blk["preset"] == "custom" and _pa_blk["params"] == _cust
+    # Save / load round trip in the pinger_filter directory (created on demand).
+    _pa_file = _pad.save_yaml(_pad.filter_dir() / "trial.yaml")
+    assert _pa_file.parent == _pa_dir / "pf" and _pa_file.is_file()
+    _pad.reset_to_preset()
+    assert _pad.load_yaml(_pa_file) is None and _pad.values() == _cust
+    # A refused file changes nothing.
+    (_pa_dir / "bad.yaml").write_text(_yaml.safe_dump({"params": {"gate_hard": 1.0}}))
+    _pa_before = _pad.values()
+    _pa_why = _pad.load_yaml(_pa_dir / "bad.yaml")
+    assert _pa_why and "gate_hard" in _pa_why and _pad.values() == _pa_before
+    # Another preset loads its values.
+    _pad._preset.setCurrentText("static_target")
+    assert _pad.values() == _pst_vals and _pad.result_block()["preset"] == "static_target"
+    _pad.deleteLater()
+    # The shared dialog rows take the panel's result as the configure block.
+    _pa_host = _QW()
+    _pform = PingerForm(_pa_cfg, _pa_host)
+    assert _pform.filter_block() == {"preset": "slow_rov",
+                                     "params": _pschema.preset_values("slow_rov")}
+    _pform.apply_advanced("slow_rov", _pa_blk)
+    assert _pform.is_custom() and _pform.filter_block() == {"preset": "custom",
+                                                            "params": _cust}
+    assert "1 value(s) changed" in _pform.note.text(), _pform.note.text()
+    _pform.preset.setCurrentText("static_target")        # a new preset drops edits
+    assert not _pform.is_custom() and _pform.filter_block()["preset"] == "static_target"
+    _pa_host.deleteLater()
+finally:
+    shutil.rmtree(_pa_dir, ignore_errors=True)
+print("pinger advanced ok")
+
+# --- Field tuning tab: one card per schema field_tuning entry, picture, texts,
+# slider <-> value <-> expert editor, live effect line (the checkout's schema:
+# the source of the cards, whatever the installed share holds) ---
+_ft_schema = _pf.load_schema(Path(cfg.pinger.schema_checkout))
+assert _ft_schema.tuning, "the checkout schema has no field_tuning cards"
+_ft = PingerFilterDialog(AppConfig(), _ft_schema, "slow_rov")
+assert _ft.tabs.tabText(0) == "Field tuning" and _ft.tabs.currentIndex() == 0
+assert _ft.tabs.tabText(1).startswith("All parameters")
+assert list(_ft.cards) == [c["title"] for c in _ft_schema.tuning]
+for _c in _ft_schema.tuning:
+    _card = _ft.cards[_c["title"]]
+    assert _card.picture is not None and not _card.picture.full.isNull(), _c["title"]
+    assert list(_card.rows) == list(_c["params"])
+    for _n in _c["params"]:
+        _ed, _sl, _eff = _card.rows[_n]
+        assert _ed.value() == _ft.editors[_n].value(), _n           # starts at the preset
+        assert _eff.text().startswith("="), (_n, _eff.text())
+        assert (_sl is not None) == (_ft_schema.slider_range(_c, _n) is not None), _n
+# Slider -> value -> the expert editor, the result block and the effect line.
+_fd = _ft.cards["Fix delay"]
+_fd.rows["latency_s"][1].setValue(0)
+assert _ft.editors["latency_s"].value() == 0.0 and _ft.values()["latency_s"] == 0.0
+assert _ft.is_custom() and _ft.result_block()["params"]["latency_s"] == 0.0
+assert _fd.rows["latency_s"][2].text().startswith("▼"), _fd.rows["latency_s"][2].text()
+# A log slider lands on readable values inside its range.
+_ag = _ft.cards["Agility"]
+_ag.rows["sigma_a"][1].setValue(1000)
+assert _ft.values()["sigma_a"] == 0.5 and _ag.rows["sigma_a"][2].text().startswith("▲")
+_ag.rows["sigma_a"][1].setValue(0)
+assert _ft.values()["sigma_a"] == 0.001
+# Expert editor -> card (value and slider), outside the slider's range too.
+_ft.editors["v_max"].setValue(4.5)
+_tv = _ft.cards["Top speed"]
+assert _tv.rows["v_max"][0].value() == 4.5 and _tv.rows["v_max"][1].value() == 1000
+# An int knob, and a two-parameter card.
+_ft.cards["Jump to a new place"].rows["reinit_n"][0].setValue(6)
+assert _ft.values()["reinit_n"] == 6
+# An invalid pair typed on a card blocks OK like on the expert tab.
+_gu = _ft.cards["When to give up"]
+_gu.rows["stale_timeout_s"][0].setValue(1.0)                  # below coast_after_s 2
+assert not _ft._buttons.button(_QDBB.StandardButton.Ok).isEnabled()
+_gu.rows["stale_timeout_s"][0].setValue(6.0)
+# Reset to preset puts every card back on the preset.
+_ft.reset_to_preset()
+assert not _ft.is_custom()
+assert all(_e.text().startswith("=") for _cd in _ft.cards.values()
+           for _e in (r[2] for r in _cd.rows.values()))
+assert _fd.rows["latency_s"][0].value() == 1.5
+_ft.deleteLater()
+print("pinger field tuning ok")
+
+# --- Pinger modes in BOTH dialogs: path list, "(no path)", MPC gating ---
+from mcs.gui.dialogs.launch_dialog import NO_PATH, path_end_text
+from mcs.gui.dialogs.launch_dialog import LaunchDialog as _PMLD
+from mcs.gui.dialogs.mission_update_dialog import MissionUpdateDialog as _MUD
+from mcs.ros.launch_manager import write_pinger_filter_file
+
+_pm_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_pm_"))
+try:
+    _pm_cfg = AppConfig()
+    _pm_cfg.designer.trajectories_dir = str(_pm_dir)
+    _pm_cfg.launch.session_trajectory_file = str(_pm_dir / ".session" / "run.yaml")
+    _pm_cfg.pinger.filter_dir = str(_pm_dir / "pf")
+    # Two paths: one ends where it began (Return to start), one repeats.
+    _pm_m = MissionModel()
+    _pm_m.from_dict({"name": "e", "speed": 0.5, "close_path": True, "repeat": False,
+                     "items": []})
+    for _x, _y in ((0.0, 0.0), (8.0, 0.0), (8.0, 6.0)):
+        _pm_m.add_waypoint(_x, _y)
+    _pm_end = io_yaml.save_mission(_pm_dir, "ends", _pm_m, sample_mission(_pm_m, 0.25))
+    _pm_m.close_path, _pm_m.repeat = False, True
+    _pm_rep = io_yaml.save_mission(_pm_dir, "repeats", _pm_m, sample_mission(_pm_m, 0.25))
+    assert path_end_text(_pm_cfg, _pm_end) == "ends — holds the final pose · returns to start"
+    assert path_end_text(_pm_cfg, _pm_rep) == "repeats forever (loop: true)"
+
+    def _cdata(c):
+        return [c.itemData(i) for i in range(c.count())]
+
+    # Launch dialog, real robot.
+    _ld = _PMLD(_pm_cfg, None)
+    _ld._mode.setCurrentText("Real robot")
+    _ld_mpc = _ld._controller.findText("MPC")
+    assert [_ld._pinger.mode.itemText(i) for i in range(3)] == [
+        "Off", "Follow pinger (no path)", "Log pinger only"]
+    for _mode in ("off", "follow", "log", "off"):
+        _ld._pinger.set_mode(_mode)
+        assert _ld._trajectory.isEnabled() == (_mode != "follow"), _mode
+        assert (NO_PATH in _cdata(_ld._trajectory)) == (_mode != "follow"), _mode
+        assert _ld._controller.model().item(_ld_mpc).isEnabled() == (_mode != "follow")
+        assert _ld._pinger.mode.isVisibleTo(_ld)
+        # Source and filter only with the pinger on.
+        assert _ld._pinger.filter_row.isVisibleTo(_ld) == (_mode != "off"), _mode
+        assert _ld._pinger.source.isVisibleTo(_ld) == (_mode != "off"), _mode
+    # Off: the first designer path is preselected, "(no path)" is offered.
+    assert _ld._trajectory.currentData() not in (None, NO_PATH)
+    _ld._trajectory.setCurrentIndex(_ld._trajectory.findData(NO_PATH))
+    _lp = _ld.parameters()
+    assert (_lp.pinger_mode, _lp.has_path, _lp.session_source, _lp.use_pinger) == (
+        "off", False, "", False)
+    assert "has_path:=False" in _lp.to_cli() and "pinger_mode:=off" in _lp.to_cli()
+    _ld2 = _PMLD(_pm_cfg, _lp)
+    assert _ld2._pinger.mode_value() == "off" and _ld2._trajectory.currentData() == NO_PATH
+    assert not _ld2._pinger.filter_row.isVisibleTo(_ld2)
+    _ld2.deleteLater()
+    # Off + a path: any controller; the path's end is shown read-only.
+    _ld._controller.setCurrentText("MPC")
+    _ld._trajectory.setCurrentIndex(_ld._trajectory.findData(str(_pm_end)))
+    assert _ld._path_end.text() == path_end_text(_pm_cfg, _pm_end)
+    _lp = _ld.parameters()
+    assert (_lp.pinger_mode, _lp.has_path, _lp.use_pinger, _lp.controller_type) == (
+        "off", True, False, "MPC")
+    assert _lp.session_source == str(_pm_end)
+    for _a in ("pinger_mode:=off", "has_path:=True", "pinger_source:=filter",
+               "pinger_preset:=slow_rov", "use_pinger:=False", "session_mode:=True"):
+        assert _a in _lp.to_cli(), (_a, _lp.to_cli())
+    assert not any(a.startswith("pinger_filter_yaml") for a in _lp.to_cli())
+    # Log + "(no path)": any controller, has_path false.
+    _ld._pinger.set_mode("log")
+    assert _ld._controller.currentText() == "MPC"
+    _ld._trajectory.setCurrentIndex(_ld._trajectory.findData(NO_PATH))
+    assert _ld._path_end.text() == "no path"
+    _lp = _ld.parameters()
+    assert (_lp.pinger_mode, _lp.has_path, _lp.session_source, _lp.use_pinger) == (
+        "log", False, "", False)
+    assert "has_path:=False" in _lp.to_cli() and "pinger_mode:=log" in _lp.to_cli()
+    # Log + a path: a path run that also logs the pinger.
+    _ld._trajectory.setCurrentIndex(_ld._trajectory.findData(str(_pm_rep)))
+    _lp = _ld.parameters()
+    assert (_lp.has_path, _lp.session_source) == (True, str(_pm_rep))
+    assert _ld._path_end.text() == "repeats forever (loop: true)"
+    # Follow: no path, MPC left for PID.
+    _ld._pinger.set_mode("follow")
+    _lp = _ld.parameters()
+    assert _lp.use_pinger and _lp.session_source == "" and _lp.controller_type == "PID"
+    assert "pinger_mode:=follow" in _lp.to_cli() and "use_pinger:=True" in _lp.to_cli()
+    # Source and filter block.
+    _ld._pinger.set_source("legacy")
+    assert "pinger_source:=legacy" in _ld.parameters().to_cli()
+    assert _ld.parameters().pinger_filter == _pf.filter_block(_ld._pinger.schema, "slow_rov")
+    # The next dialog restores the last choice (Log, no path, legacy).
+    _ld._pinger.set_mode("log")
+    _ld._trajectory.setCurrentIndex(_ld._trajectory.findData(NO_PATH))
+    _ld2 = _PMLD(_pm_cfg, _ld.parameters())
+    assert _ld2._pinger.mode_value() == "log" and _ld2._trajectory.currentData() == NO_PATH
+    assert _ld2._pinger.source_value() == "legacy"
+    _ld2.deleteLater()
+    # Hidden in simulation: no pinger in a Gazebo graph, no pinger argument.
+    _ld._mode.setCurrentText("Gazebo simulation")
+    assert not _ld._pinger.mode.isVisibleTo(_ld)
+    assert not _ld._pinger.filter_row.isVisibleTo(_ld)
+    assert NO_PATH not in _cdata(_ld._trajectory) and _ld._trajectory.isEnabled()
+    _ld_mpc2 = _ld._controller.findText("MPC")
+    assert _ld._controller.model().item(_ld_mpc2).isEnabled()
+    assert not any(a.startswith(("pinger", "has_path")) for a in _ld.parameters().to_cli())
+    # Replay: "Re-estimate the pinger with the current filter".
+    _ld._source.setCurrentText("From a ros2bag")
+    _ld._bag.setText("/d/run/x-bag")
+    assert _ld._replay_estimator.isVisibleTo(_ld)
+    assert not _ld._pinger.filter_row.isVisibleTo(_ld)
+    _ld._replay_estimator.setChecked(True)
+    assert _ld._pinger.filter_row.isVisibleTo(_ld) and not _ld._pinger.mode.isVisibleTo(_ld)
+    _rpp = _ld.parameters()
+    assert _rpp.replay_pinger_estimator and "pinger_estimator:=true" in _rpp.to_cli()
+    assert "pinger_source:=legacy" in _rpp.to_cli()
+    _ld._replay_estimator.setChecked(False)
+    assert not any(a.startswith("pinger") for a in _ld.parameters().to_cli())
+    _ld.deleteLater()
+
+    # A customised filter becomes pinger_filter_yaml:= (written at launch).
+    _wl = _LP(session=True, controller_type="PID", pinger_mode="log", has_path=False,
+              pinger_filter={"preset": "custom", "params": _cust})
+    assert write_pinger_filter_file(_pm_cfg, _wl) == str(_pm_dir / "pf" / "last_launch.yaml")
+    assert f"pinger_filter_yaml:={_wl.pinger_filter_yaml}" in _wl.to_cli()
+    assert _pf.read_param_file(Path(_wl.pinger_filter_yaml), _pschema) == ("custom", _cust)
+    _wl2 = _LP(session=True, pinger_mode="off",
+               pinger_filter=_pf.filter_block(_pschema, "slow_rov"))
+    assert write_pinger_filter_file(_pm_cfg, _wl2) == "" and not _wl2.pinger_filter_yaml
+    _wl3 = _LP(simulation=True, controller_type="MPC",
+               pinger_filter={"preset": "custom", "params": _cust})
+    assert write_pinger_filter_file(_pm_cfg, _wl3) == ""         # Gazebo: never
+    _wl4 = _LP(simulation=True, replay_bag="/b", replay_pinger_estimator=True,
+               pinger_filter={"preset": "custom", "params": _cust})
+    assert write_pinger_filter_file(_pm_cfg, _wl4)
+    assert f"pinger_filter_yaml:={_wl4.pinger_filter_yaml}" in _wl4.to_cli()
+
+    # Update Mission: the same rows, the same rules.
+    _ud = _MUD(_pm_cfg, _RSNext(source=str(_pm_end), name="ends", controller_type="MPC"))
+    assert _ud._pinger.mode_value() == "off"
+
+    def _udata():
+        return [_ud._paths.item(i).data(_Qt.ItemDataRole.UserRole)
+                for i in range(_ud._paths.count())]
+
+    _ud_mpc = _ud._controller.findText("MPC")
+    for _mode in ("off", "follow", "log", "off"):
+        _ud._pinger.set_mode(_mode)
+        assert _ud._paths.isEnabled() == (_mode != "follow"), _mode
+        assert (NO_PATH in _udata()) == (_mode != "follow"), _mode
+        assert _ud._controller.model().item(_ud_mpc).isEnabled() == (_mode != "follow")
+        assert _ud._pinger.filter_row.isVisibleTo(_ud) == (_mode != "off"), _mode
+    assert _ud._controller.currentText() == "PID"      # Follow left MPC on the way
+    _ud._controller.setCurrentText("MPC")               # Off / Log: MPC allowed
+    assert _ud._controller.currentText() == "MPC"
+    assert _ud._path_end.text() == path_end_text(_pm_cfg, _pm_end)
+    # Off + "(no path)": Manual Target / arrows only.
+    _ud._paths.setCurrentRow(_udata().index(NO_PATH))
+    assert _ud._buttons.button(_ud._buttons.StandardButton.Ok).isEnabled()
+    _us = _ud.selection()
+    assert (_us.pinger_mode, _us.source, _us.has_path, _us.uses_path) == ("off", "", False, False)
+    assert _us.summary().startswith("no path")
+    _ud._pinger.set_mode("log")
+    _ud._paths.setCurrentRow(_udata().index(NO_PATH))
+    _us = _ud.selection()
+    assert (_us.pinger_mode, _us.source, _us.has_path, _us.uses_path, _us.use_pinger) == (
+        "log", "", False, False, False)
+    assert _us.controller_type == "MPC"
+    assert _us.pinger_filter == _pf.filter_block(_pschema, "slow_rov")
+    _ud._paths.setCurrentRow(_udata().index(str(_pm_end)))
+    _us = _ud.selection()
+    assert _us.has_path and _us.uses_path and _us.source == str(_pm_end)
+    _ud._pinger.set_mode("follow")
+    _us = _ud.selection()
+    assert _us.use_pinger and _us.source == "" and _us.controller_type == "PID"
+    _ud.deleteLater()
+    _ud2 = _MUD(_pm_cfg, _RSNext(pinger_mode="log", controller_type="LoS",
+                                 pinger_source="legacy"))
+    assert _ud2._pinger.mode_value() == "log" and _ud2._pinger.source_value() == "legacy"
+    assert _ud2._paths.currentItem().data(_Qt.ItemDataRole.UserRole) == NO_PATH
+    _ud2.deleteLater()
+    _ud3 = _MUD(_pm_cfg, _RSNext(pinger_mode="off", controller_type="MPC"))
+    assert _ud3._paths.currentItem().data(_Qt.ItemDataRole.UserRole) == NO_PATH
+    assert not _ud3._pinger.filter_row.isVisibleTo(_ud3)
+    _ud3.deleteLater()
+finally:
+    shutil.rmtree(_pm_dir, ignore_errors=True)
+print("pinger dialogs ok")
+
+# --- configure: the pinger fields, the estimator's echo, log without a path,
+# path complete ---
+from mcs.gui.run_panel import RunPanel as _RunPanel
+
+_pc_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_pc_"))
+_pc = None
+try:
+    _pc_cfg = AppConfig()
+    _pc_cfg.launch.session_trajectory_file = str(_pc_dir / ".session" / "run.yaml")
+    _pc_cfg.run.ack_timeout_s = 0.3
+    _pc_src = io_yaml.save_mission(_pc_dir, "lawn", _sl_m, _sl_s)
+    _pc_bus = SignalBus()
+    _pc_store = _RSStore(_pc_cfg)
+    _pc_bus.pinger_filter_config_received.connect(_pc_store.on_pinger_filter_config)
+    _pc_cc = CommandCenter(_pc_cfg, _pc_bus, _StubRos(_RunNode()), _RunLauncher())
+    _pc = _RunSession(_pc_cfg, _pc_bus, _pc_store, _pc_cc)
+    _pc_msgs: list = []
+    _pc.message.connect(lambda _m, _ms: _pc_msgs.append(_m))
+    _pc_prev: list = []
+    _pc.preview_requested.connect(_pc_prev.append)
+    _pc_blk = _pf.filter_block(_pschema, "static_target")
+    _rs_events.clear()
+    _pc.begin(_LP(simulation=False, controller_type="MPC", session=True,
+                  pinger_mode="log", has_path=False, pinger_source="legacy",
+                  pinger_preset="static_target", pinger_filter=_pc_blk, note="usbl"))
+    _pc_store.mission.launch_running = True
+    _pc_seq: dict = {}
+
+    def _pst(**kw):
+        payload = {"state": "idle", "controller_type": "MPC", "use_pinger": False,
+                   "note": "usbl", "run": 0, "ok": True, "detail": "",
+                   "seq": _pc_seq.get("last"), "pinger_mode": "log", "has_path": False,
+                   "pinger_source": "legacy", "path_source": "mission",
+                   "path_complete": False}
+        payload.update(kw)
+        _pc_seq["last"] = payload["seq"]
+        _pc_bus.run_state_received.emit(time.monotonic(), payload)
+
+    def _pecho(seq, ok=True, source="legacy", params=None, detail="applied"):
+        _pc_bus.pinger_filter_config_received.emit(time.monotonic(), {
+            "seq": seq, "ok": ok, "detail": detail, "pinger_source": source,
+            "preset": "static_target",
+            "params": dict(_pc_blk["params"] if params is None else params)})
+
+    def _last_cmd(cmd):
+        return [e[1] for e in _rs_events if e[0] == "run" and e[1]["cmd"] == cmd][-1]
+
+    _pst(seq=None)
+    _pcf = _last_cmd("configure")
+    assert (_pcf["pinger_mode"], _pcf["use_pinger"], _pcf["has_path"]) == ("log", False, False)
+    assert (_pcf["path_source"], _pcf["pinger_source"]) == ("mission", "legacy")
+    assert _pcf["pinger_filter"] == _pc_blk and _pcf["mission"] == "pinger_log"
+    assert _pcf["controller_type"] == "MPC"                     # Log: any controller
+    _pc_store.robot.has_odom = True
+    _pc_store.robot.controller_ready = True
+    # master_control's echo must carry the same pinger mode and has_path.
+    _pst(seq=_pcf["seq"], pinger_mode="off")
+    assert "mission settings not applied yet" in _pc.start_blockers()
+    _pst(seq=_pcf["seq"], has_path=True)
+    assert "mission settings not applied yet" in _pc.start_blockers()
+    _pst(seq=_pcf["seq"])
+    assert _pc.start_blockers() == ["pinger filter configuration not applied yet"]
+    # "Applied" only on the echo of THIS seq, ok, with the sent set and source.
+    _pecho(None)                                   # the latched "applied at start"
+    assert not _pc_store.pinger_filter.applied()
+    _pecho(_pcf["seq"], params=dict(_pc_blk["params"], latency_s=0.9))
+    assert not _pc_store.pinger_filter.applied()
+    _pecho(_pcf["seq"], source="filter")
+    assert not _pc_store.pinger_filter.applied()
+    _pecho(_pcf["seq"], ok=False, source="filter", params=_pschema.defaults(),
+           detail="a run is active")
+    assert not _pc_store.pinger_filter.applied()
+    assert _pc.start_blockers() == [
+        "pinger filter configuration not applied yet — refused: a run is active"]
+    assert sum("refused: a run is active" in _m for _m in _pc_msgs) == 1
+    _pecho(_pcf["seq"])
+    assert _pc_store.pinger_filter.applied() and _pc.start_blockers() == []
+    # START RUN resets the pinger snapshots; a log run without a path writes
+    # no session file and previews nothing.
+    _pc_store.on_odom(time.monotonic(), [1.0, 1.0, 0, 0, 0, 0.0], [0] * 6)
+    _pc_store.on_pinger_body(time.monotonic(), [2.0, 0.0, 0.0])
+    _pc_store.on_pinger_estimate(time.monotonic(), {"x": 3.0, "y": 1.0})
+    assert _pc_store.pinger.seen and _pc_store.pinger_est.world == (3.0, 1.0)
+    _rs_events.clear()
+    assert _pc.start_run()
+    assert not _pc_store.pinger.seen and _pc_store.pinger.world is None
+    assert _pc_store.pinger_est.world is None and len(_pc_store.pinger_track) == 0
+    assert not Path(_pc_cfg.launch.session_trajectory_file).exists() and _pc_prev == []
+    assert [e[1]["cmd"] for e in _rs_events if e[0] == "run"] == ["start"]
+    _pst(seq=_last_cmd("start")["seq"], state="running", run=1)
+    assert _pc_store.session.run_active
+    assert _pc_store.mission.target_mode is TargetMode.NONE    # logs, follows nothing
+    _pc.stop_run()
+    _pst(seq=_last_cmd("stop")["seq"], state="idle", run=1)
+    # Next run: Off with a placed path -- no filter wait, a path run.
+    _pc.update_mission(_RSNext(source=str(_pc_src), name="lawn", controller_type="MPC",
+                               note="usbl", pinger_mode="off", pinger_source="legacy",
+                               pinger_preset="static_target", pinger_filter=_pc_blk))
+    _pcf2 = _last_cmd("configure")
+    assert (_pcf2["pinger_mode"], _pcf2["has_path"], _pcf2["mission"]) == ("off", True, "lawn")
+    _pst(seq=_pcf2["seq"], pinger_mode="off", has_path=True, run=1)
+    assert _pc.start_blockers() == [], _pc.start_blockers()
+    assert _pc.start_run()
+    assert Path(_pc_cfg.launch.session_trajectory_file).exists() and _pc_prev
+    _pst(seq=_last_cmd("start")["seq"], state="running", run=2, pinger_mode="off",
+         has_path=True)
+    _rpanel = _RunPanel(_pc_store, _pc)
+    _rpanel.refresh()
+    assert not _pc.status().path_complete and _rpanel.path_complete.isHidden()
+    _pst(state="running", run=2, pinger_mode="off", has_path=True, path_complete=True)
+    _rpanel.refresh()
+    assert _pc.status().path_complete and _pc_store.mission.path_complete
+    assert not _rpanel.path_complete.isHidden()
+    assert _rpanel.path_complete.text() == "Path complete — holding final pose"
+    _pst(state="running", run=2, pinger_mode="off", has_path=True, path_complete=True)
+    assert sum("Path complete" in _m for _m in _pc_msgs) == 1     # said once
+    _pc.stop_run()
+    _pst(seq=_last_cmd("stop")["seq"], state="idle", run=2, pinger_mode="off",
+         has_path=True)
+    _rpanel.refresh()
+    assert not _pc.status().path_complete and _rpanel.path_complete.isHidden()
+    _rpanel.deleteLater()
+finally:
+    if _pc is not None:
+        _pc.end()
+    shutil.rmtree(_pc_dir, ignore_errors=True)
+print("pinger configure ok")
+
+# --- Store: the FILTERED pinger verbatim from /estimate, the LEGACY one via
+# legacy_body (N4), raw fixes by decision, resets ---
+_ps = _RSStore(AppConfig())
+_ps.on_odom(10.0, [5.0, -3.0, 0, 0, 0, 1.2], [0] * 6)
+_pest = {"schema": "blueboat_pinger_estimate/1", "status": "tracking", "x": 12.5,
+         "y": -7.25, "ellipse": {"a": 2.0, "b": 0.5, "theta": 0.6}, "vx": 0.1,
+         "vy": 0.2, "r95": 2.0, "range_m": 8.4, "source": "filter"}
+_ps.on_pinger_estimate(10.1, _pest)
+assert _ps.pinger_est.world == (12.5, -7.25)          # taken as published, world frame
+assert _ps.pinger_est.ellipse == (2.0, 0.5, 0.6)
+_ps.on_odom(10.2, [9.0, 4.0, 0, 0, 0, -2.0], [0] * 6)  # the boat moves and turns
+assert _ps.pinger_est.world == (12.5, -7.25)          # never re-transformed
+_ps.on_pinger_estimate(10.3, dict(_pest))             # heartbeat, same position
+assert len(_ps.pinger_est_track) == 1
+_ps.on_pinger_estimate(10.4, dict(_pest, x=13.0))     # a new position: one more point
+assert len(_ps.pinger_est_track) == 2
+_ps.on_pinger_estimate(10.5, dict(_pest, x=None, y=None, status="initialising"))
+assert _ps.pinger_est.world is None and _ps.pinger_est.ellipse is None
+_ps.mission.launch_running, _ps.mission.controller_type = True, "PID"
+_ps.mission.use_pinger, _ps.mission.pinger_mode = True, "follow"
+_ps.on_pinger_estimate(10.6, dict(_pest))
+assert _ps.mission.target_mode is TargetMode.PINGER
+assert _ps.active_target_world() == (12.5, -7.25)     # the FILTERED estimate
+_ps.on_pinger_body(10.7, [2.0, 0.0, -1.0])            # legacy: body -> world, N4
+assert abs(_ps.pinger.world[0] - (9.0 + 2.0 * math.cos(-2.0))) < 1e-9
+assert abs(_ps.pinger.world[1] - (4.0 + 2.0 * math.sin(-2.0))) < 1e-9
+assert _ps.active_target_world() == (12.5, -7.25)
+_ps.on_pinger_estimate(10.8, dict(_pest, source="legacy"))
+assert _ps.active_target_world() == _ps.pinger.world  # steering the legacy vector
+_ps.mission.use_pinger, _ps.mission.pinger_mode, _ps.mission.has_path = False, "log", False
+assert _ps.mission.target_mode is TargetMode.NONE
+_ps.on_pinger_fix(10.9, {"decision": "set_aside", "world": [1.0, 2.0]})
+_ps.on_pinger_fix(11.0, {"decision": "invalid", "world": None})
+_ps.on_pinger_fix(11.1, {"decision": "accepted", "world": [1.5, 2.5]})
+assert len(_ps.pinger_fixes) == 2 and list(_ps.pinger_fixes.v()[:, 2]) == [2.0, 0.0]
+_ps.clear_tracks()
+assert len(_ps.pinger_est_track) == len(_ps.pinger_fixes) == len(_ps.pinger_track) == 0
+_ps.on_pinger_estimate(11.2, dict(_pest, x=14.0))
+_ps.reset_experiment()                                # every launch and START RUN
+assert _ps.pinger.world is None and not _ps.pinger.seen
+assert _ps.pinger_est.world is None and _ps.pinger_est.payload == {}
+assert len(_ps.pinger_est_track) == len(_ps.pinger_fixes) == len(_ps.pinger_track) == 0
+# A launch resets the window's pinger and its filter echo.
+w.store.on_pinger_estimate(time.monotonic(), dict(_pest))
+w.store.on_pinger_filter_config(time.monotonic(), {"seq": None, "ok": True})
+w._on_mission_launched(_LP(simulation=True, controller_type="MPC", trajectory="circle"))
+assert w.store.pinger_est.world is None and w.store.pinger_filter.echo == {}
+assert w.store.mission.pinger_mode == "off"
+w._on_launch_state("idle")
+print("pinger store ok")
+
+# --- Bridge: each pinger topic reaches its layer; subscriptions match QoS ---
+import json as _pjson
+
+from mcs.core.clock import station_clock as _pstc
+
+_bp = _BridgeNode.__new__(_BridgeNode)
+_bp._cfg, _bp._bus, _bp._stats = cfg, SignalBus(), {}
+_bp._station_clock = _pstc()
+_bp._legacy_absent, _bp._legacy_checked = False, -math.inf
+_bp_pubs = {"n": 1}
+_bp.count_publishers = lambda _topic: _bp_pubs["n"]
+_bp_got: dict = {k: [] for k in ("legacy", "coords", "est", "fix", "cfg")}
+_bp._bus.pinger_body_received.connect(lambda _t, d: _bp_got["legacy"].append(d))
+_bp._bus.pinger_coords_received.connect(lambda _t, d: _bp_got["coords"].append(d))
+_bp._bus.pinger_estimate_received.connect(lambda _t, d: _bp_got["est"].append(d))
+_bp._bus.pinger_fix_received.connect(lambda _t, d: _bp_got["fix"].append(d))
+_bp._bus.pinger_filter_config_received.connect(lambda _t, d: _bp_got["cfg"].append(d))
+_bp._on_pinger(_NS(data=[1.0, 2.0, 0.5]))
+assert _bp_got["coords"] == [[1.0, 2.0, 0.5]] and _bp_got["legacy"] == []
+_bp._on_pinger_legacy(_NS(data=[3.0, 1.0, 0.0]))
+assert _bp_got["legacy"] == [[3.0, 1.0, 0.0]]
+# An older stack (no legacy_body publisher): its coordinates ARE the legacy vector.
+_bp_pubs["n"], _bp._legacy_checked = 0, -math.inf
+_bp._on_pinger(_NS(data=[4.0, 0.0, 0.0]))
+assert _bp_got["legacy"][-1] == [4.0, 0.0, 0.0]
+_bp._on_pinger_estimate(_NS(data=_pjson.dumps({"x": 1.0, "y": 2.0})))
+_bp._on_pinger_estimate(_NS(data="not json"))
+_bp._on_pinger_fix(_NS(data=_pjson.dumps({"decision": "accepted", "world": [1, 2]})))
+_bp._on_pinger_filter_config(_NS(data=_pjson.dumps({"seq": 3, "ok": True})))
+assert _bp_got["est"] == [{"x": 1.0, "y": 2.0}] and len(_bp_got["fix"]) == 1
+assert _bp_got["cfg"] == [{"seq": 3, "ok": True}]
+for _tp in (cfg.topics.pinger_legacy_body, cfg.topics.pinger_estimate,
+            cfg.topics.pinger_fix, cfg.topics.pinger_filter_config):
+    assert _tp in cfg.diagnostics.warn_age_s, _tp
+if w.ros.node is not None:      # a sourced ROS: the live node's subscriptions
+    from rclpy.qos import DurabilityPolicy as _DP
+    from rclpy.qos import ReliabilityPolicy as _RP
+    _bsubs = {s.topic_name: s.qos_profile for s in w.ros.node.subscriptions}
+    _fq = _bsubs[cfg.topics.pinger_fix]
+    assert _fq.depth == 50 and _fq.reliability == _RP.RELIABLE
+    _cq = _bsubs[cfg.topics.pinger_filter_config]
+    assert (_cq.depth, _cq.durability, _cq.reliability) == (
+        1, _DP.TRANSIENT_LOCAL, _RP.RELIABLE)
+    assert cfg.topics.pinger_legacy_body in _bsubs and cfg.topics.pinger_estimate in _bsubs
+print("pinger bridge ok")
+
+# --- Map: the pinger layers, each with its checkbox, and the legend; PINGER panel ---
+_pmv = w.map_view
+_plb = w.right_panel._layer_boxes
+for _k, _on in (("pinger_filtered", True), ("pinger_filtered_track", True),
+                ("pinger", True), ("pinger_track", True), ("pinger_fixes", False),
+                ("pinger_ellipse", False), ("pinger_legend", True)):
+    assert _plb[_k].isChecked() == _on, _k
+    assert _pmv.pinger_layers().get(_k, _pmv._pinger_legend_enabled) == _on, _k
+w.store.reset_experiment()
+w.store.geo = GeoReferencer(cfg.geo)          # identity anchor in a non-GPS sim
+w.store.mission.simulation, w.store.mission.launch_running = True, True
+_pmv.set_time_window(0.0, 0.0, True)
+_pnow = time.monotonic()
+w.store.on_odom(_pnow, [0.0, 0.0, 0, 0, 0, 0.0], [0] * 6)
+_pe1 = {"status": "tracking", "x": 6.0, "y": 2.0, "range_m": 6.3, "fix_age": 0.4,
+        "fix_rate": 1.5, "r95": 3.0, "vx": 0.3, "vy": 0.4, "source": "filter",
+        "ellipse": {"a": 3.0, "b": 1.0, "theta": 0.5},
+        "stats": {"window_s": 60.0, "pct_downweighted": 12.5, "pct_set_aside": 2.0}}
+w.store.on_pinger_estimate(_pnow, _pe1)
+w.store.on_pinger_estimate(_pnow + 0.1, dict(_pe1, x=6.5, y=2.2))
+w.store.on_pinger_body(_pnow, [1.0, 1.0, 0.0])
+for _dec, _xy in (("accepted", [6.1, 2.1]), ("downweighted", [6.6, 1.9]),
+                  ("set_aside", [9.0, 5.0]), ("reinit", [7.0, 2.0])):
+    w.store.on_pinger_fix(_pnow + 0.2, {"decision": _dec, "world": _xy})
+_pmv.refresh()
+assert _pmv.pinger_filtered_marker.isVisible()
+assert _pmv.pinger_filtered_marker.scene_pos() == _pmv._to_scene(6.5, 2.2)
+assert _pmv.pinger_marker.isVisible()                      # legacy, its own marker
+assert _pmv.pinger_filtered_track.isVisible()
+assert _pmv.pinger_filtered_track.path().elementCount() == 2
+assert not _pmv.pinger_fixes.isVisible() and not _pmv.pinger_ellipse.isVisible()
+assert _pmv.legend.isVisibleTo(_pmv)
+assert _pmv.legend.visible_texts() == ["pinger, filtered", "filtered track",
+                                       "pinger, legacy", "legacy track"]
+_plb["pinger_fixes"].setChecked(True)
+_plb["pinger_ellipse"].setChecked(True)
+_pmv.refresh()
+assert _pmv.pinger_fixes.isVisible() and _pmv.pinger_fixes.point_count() == 4
+assert sorted(_pmv.pinger_fixes.codes()) == [0, 1, 2, 6]
+assert _pmv.pinger_ellipse.isVisible()
+assert _pmv.pinger_ellipse.geometry() == (6.5, 2.2, 3.0, 1.0, 0.5)
+_ptip = _pmv.pinger_ellipse.mapToScene(QPointF(3.0, 0.0))  # the major axis, CCW from east
+assert abs(_ptip.x() - (6.5 + 3.0 * math.cos(0.5))) < 1e-6
+assert abs(_ptip.y() - (2.2 + 3.0 * math.sin(0.5))) < 1e-6
+assert "fix set aside" in _pmv.legend.visible_texts()
+assert "95 % uncertainty" in _pmv.legend.visible_texts()
+_plb["pinger_filtered"].setChecked(False)
+_pmv.refresh()
+assert not _pmv.pinger_filtered_marker.isVisible()
+assert "pinger, filtered" not in _pmv.legend.visible_texts()
+_plb["pinger_legend"].setChecked(False)
+_pmv.refresh()
+assert not _pmv.legend.isVisibleTo(_pmv)
+_plb["pinger_legend"].setChecked(True)
+_plb["pinger_filtered"].setChecked(True)
+# The PINGER panel reads the estimate as published.
+w.left_panel.refresh()
+_pg = w.left_panel.pinger_grid._values
+assert _pg["Status"].text() == "tracking" and theme.OK in _pg["Status"].styleSheet()
+assert _pg["World (x, y)"].text().split() == ["+6.50,", "+2.20", "m"]
+assert _pg["Distance"].text().strip() == "6.30 m"
+assert _pg["Fix rate"].text().strip() == "1.50 /s" and _pg["95 % radius"].text().strip() == "3.00 m"
+assert _pg["Speed"].text().strip() == "0.50 m/s"
+assert _pg["Down-weighted"].text().strip() == "12.5 % / 60 s"
+assert _pg["Set aside"].text().strip() == "2.0 % / 60 s"
+assert _pg["Legacy (x, y)"].text().split() == ["+1.00,", "+1.00", "m"]
+w.store.on_pinger_estimate(_pnow + 0.3, dict(_pe1, status="coasting"))
+w.left_panel.refresh()
+assert theme.WARN in _pg["Status"].styleSheet()
+w.store.pinger_est.t = time.monotonic() - 30.0               # the estimator went silent
+w.left_panel.refresh()
+assert _pg["Status"].text().startswith("no estimate for") and theme.ERR in _pg["Status"].styleSheet()
+# Nothing pinger is drawn before the map frame is anchored.
+w.store.mission.simulation = False
+_pmv.refresh()
+for _it in (_pmv.pinger_filtered_marker, _pmv.pinger_filtered_track, _pmv.pinger_ellipse,
+            _pmv.pinger_fixes, _pmv.pinger_marker, _pmv.pinger_track):
+    assert not _it.isVisible(), _it
+assert not _pmv.legend.isVisibleTo(_pmv)
+_plb["pinger_fixes"].setChecked(False)
+_plb["pinger_ellipse"].setChecked(False)
+w.store.mission.launch_running = False
+w.store.reset_experiment()
+print("pinger layers ok")
+
+# --- Designer: "Return to start" and "Repeat forever" are two options ---
+_dsp_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_dsp_"))
+try:
+    _old = MissionModel()
+    _old.from_dict({"name": "old", "speed": 0.5, "loop": True, "items": []})
+    assert (_old.close_path, _old.repeat) == (True, True)     # an old loop: both on
+    _old.from_dict({"name": "old", "speed": 0.5, "loop": False, "items": []})
+    assert (_old.close_path, _old.repeat) == (False, False)
+    assert (MissionModel().close_path, MissionModel().repeat) == (False, False)
+    _dm = MissionModel()
+    _dm.from_dict({"name": "sq", "speed": 0.5, "close_path": False, "repeat": False,
+                   "items": []})
+    for _x, _y in ((0.0, 0.0), (10.0, 0.0), (10.0, 10.0)):
+        _dm.add_waypoint(_x, _y)
+    _dopen = sample_mission(_dm, 0.25)
+    io_yaml.save_mission(_dsp_dir, "sq", _dm, _dopen)
+    _dmeta = _yaml.safe_load((_dsp_dir / "sq.meta.yaml").read_text())
+    assert (_dmeta["model"]["close_path"], _dmeta["model"]["repeat"]) == (False, False)
+    assert "loop" not in _dmeta["model"]
+    # A .meta.yaml written before the split: loop: true -> both on.
+    _dmeta["model"].pop("close_path")
+    _dmeta["model"].pop("repeat")
+    _dmeta["model"]["loop"] = True
+    (_dsp_dir / "sq.meta.yaml").write_text(_yaml.safe_dump(_dmeta))
+    _dback = MissionModel()
+    io_yaml.load_mission(_dsp_dir, "sq", _dback)
+    assert (_dback.close_path, _dback.repeat) == (True, True)
+    # Return to start only: the closing leg, but the runtime file ends.
+    _dm.close_path, _dm.repeat = True, False
+    _dclosed = sample_mission(_dm, 0.25)
+    assert abs(_dclosed.length_m - (_dopen.length_m + math.hypot(10.0, 10.0))) < 1e-6
+    assert np.allclose(_dclosed.xy[-1], _dclosed.xy[0])
+    _drt = io_yaml.save_mission(_dsp_dir, "closed", _dm, _dclosed)
+    assert _yaml.safe_load(_drt.read_text())["loop"] is False
+    assert io_yaml.read_path_ending(_drt) == (False, True)
+    # Repeat forever only: loop: true, no closing leg.
+    _dm.close_path, _dm.repeat = False, True
+    _drep = sample_mission(_dm, 0.25)
+    assert abs(_drep.length_m - _dopen.length_m) < 1e-9
+    _drt2 = io_yaml.save_mission(_dsp_dir, "rep", _dm, _drep)
+    assert _yaml.safe_load(_drt2.read_text())["loop"] is True
+    assert io_yaml.read_path_ending(_drt2) == (True, False)
+    _drb = MissionModel()
+    io_yaml.load_mission(_dsp_dir, "rep", _drb)
+    assert (_drb.close_path, _drb.repeat) == (False, True)
+    # Without its .meta.yaml the samples already hold the closing leg.
+    (_dsp_dir / "closed.meta.yaml").unlink()
+    _drc = MissionModel()
+    io_yaml.load_mission(_dsp_dir, "closed", _drc)
+    assert (_drc.close_path, _drc.repeat) == (False, False)
+    # The window: two boxes, each driving only its own option.
+    _dsp_cfg = AppConfig()
+    _dsp_cfg.designer.trajectories_dir = str(_dsp_dir)
+    _dsw = DesignerWindow(_dsp_cfg, w.store)
+    try:
+        assert not _dsw._close_path.isChecked() and not _dsw._repeat.isChecked()
+        assert "loop: true" in _dsw._repeat.toolTip()
+        assert "closing leg" in _dsw._close_path.toolTip()
+        _dsw._close_path.setChecked(True)
+        assert (_dsw.model.close_path, _dsw.model.repeat) == (True, False)
+        _dsw._repeat.setChecked(True)
+        assert (_dsw.model.close_path, _dsw.model.repeat) == (True, True)
+        _dsw._close_path.setChecked(False)
+        assert (_dsw.model.close_path, _dsw.model.repeat) == (False, True)
+        _dsw.model.from_dict({"name": "x", "speed": 0.5, "loop": True, "items": []})
+        assert _dsw._close_path.isChecked() and _dsw._repeat.isChecked()
+    finally:
+        _dsw._dirty = False
+        _dsw.close()
+finally:
+    shutil.rmtree(_dsp_dir, ignore_errors=True)
+print("designer split ok")
+
+# --- Safety way back (2026-11-25, owner order): a second, hand-drawn polyline of a
+# GPS-anchored mission; saved in lat/lon, handed to the link guardian at START RUN,
+# cleared at STOP RUN; the GUARDIAN box says which way back a link loss would use ---
+from mcs.models.store import NextMission as _SWNext
+from mcs.ros.run_session import RunSession as _SWRunSession
+
+_sw_dir = Path(tempfile.mkdtemp(prefix="mcs_smoke_sw_"))
+try:
+    # Model: round-trip, an old meta without the key, rigid Align to Start.
+    _swm = MissionModel()
+    assert _swm.safety_way_back == []
+    _swm.from_dict({"name": "old", "speed": 0.5, "items": []})
+    assert _swm.safety_way_back == []
+    for _x, _y in ((0.0, 0.0), (40.0, 0.0), (40.0, 20.0)):
+        _swm.add_waypoint(_x, _y)
+    _swm.add_safety_point(40.0, 25.0)
+    _swm.add_safety_point(0.0, 25.0)
+    _swm.add_safety_point(0.0, 0.0)
+    assert abs(_swm.safety_length_m() - 65.0) < 1e-9
+    _swm2 = MissionModel()
+    _swm2.from_dict(_swm.to_dict())
+    assert _swm2.safety_way_back == [[40.0, 25.0], [0.0, 25.0], [0.0, 0.0]]
+    _swm2.remove_safety_points([1])
+    assert _swm2.safety_way_back == [[40.0, 25.0], [0.0, 0.0]]
+    _swm2.clear_safety_way_back()
+    assert _swm2.safety_way_back == []
+
+    # Save: lat/lon block only when anchored and >= 2 points.
+    _sw_s = sample_mission(_swm, 0.25)
+    _sw_anchor = {"lat0": 33.66, "lon0": 130.65, "theta_deg": 0.0}
+    _sw_src = io_yaml.save_mission(_sw_dir, "sw", _swm, _sw_s, geo_anchor=_sw_anchor)
+    _sw_rt = _yaml.safe_load(_sw_src.read_text())
+    assert _sw_rt["safety_way_back"]["format"] == "blueboat_safety_way_back/1"
+    _sw_pts = io_yaml.read_safety_way_back(_sw_src)
+    assert len(_sw_pts) == 3
+    for (_la, _lo), (_x, _y) in zip(_sw_pts, _swm.safety_way_back, strict=True):
+        _e, _n = latlon_to_local_en(_la, _lo, 33.66, 130.65)
+        assert abs(_e - _x) < 0.01 and abs(_n - _y) < 0.01, (_e, _n, _x, _y)
+    _sw_meta = _yaml.safe_load((_sw_dir / "sw.meta.yaml").read_text())
+    assert _sw_meta["model"]["safety_way_back"] == [[40.0, 25.0], [0.0, 25.0], [0.0, 0.0]]
+    _sw_plain = io_yaml.save_mission(_sw_dir, "sw_plain", _swm, _sw_s)
+    assert "safety_way_back" not in _yaml.safe_load(_sw_plain.read_text())
+    assert io_yaml.read_safety_way_back(_sw_plain) is None
+    _swm3 = MissionModel()
+    _swm3.from_dict(_swm.to_dict())
+    _swm3.safety_way_back = [[1.0, 1.0]]
+    _sw_one = io_yaml.save_mission(_sw_dir, "sw_one", _swm3, _sw_s, geo_anchor=_sw_anchor)
+    assert io_yaml.read_safety_way_back(_sw_one) is None
+    # Deployment keeps it unchanged (lat/lon does not depend on the run's frame).
+    _sw_dst = _sw_dir / ".session" / "run.yaml"
+    io_yaml.deploy_mission(_sw_src, _GeoFit(tx=3.0, ty=-2.0, lat0=33.66, lon0=130.65,
+                                            rms_m=0.1, n_pairs=10), _sw_dst)
+    assert io_yaml.read_safety_way_back(_sw_dst) == _sw_pts
+
+    # Run session: safety_load at START RUN of an anchored path with one,
+    # safety_clear at STOP RUN; nothing for a path without one.
+    class _SWCommands:
+        def __init__(self):
+            self.sent = []
+
+        def send_guardian_command(self, cmd, **extra):
+            self.sent.append((cmd, extra))
+            return len(self.sent)
+
+        def send_run_command(self, payload):
+            return True
+
+        def set_before_terminate(self, fn):
+            pass
+
+        def estop_latched(self):
+            return False
+
+    _sw_cfg = AppConfig()
+    _sw_store = _RSStore(_sw_cfg)
+    _sw_cmd = _SWCommands()
+    _sw_rs = _SWRunSession(_sw_cfg, SignalBus(), _sw_store, _sw_cmd)
+    _sw_rs._send_safety_way_back(_SWNext(source=str(_sw_src), name="sw", anchored=True))
+    assert _sw_cmd.sent[-1][0] == "safety_load", _sw_cmd.sent
+    assert _sw_cmd.sent[-1][1]["run"] == "sw"
+    assert _sw_cmd.sent[-1][1]["points"] == [[la, lo] for la, lo in _sw_pts]
+    assert _sw_store.session.safety_way_back == _sw_pts
+    _sw_store.session.active = True
+    _sw_store.session.run_active = True
+    assert _sw_rs.stop_run()
+    assert _sw_cmd.sent[-1] == ("safety_clear", {}) and not _sw_store.session.safety_way_back
+    _n_sent = len(_sw_cmd.sent)
+    _sw_rs._send_safety_way_back(_SWNext(source=str(_sw_plain), name="p", anchored=False))
+    assert len(_sw_cmd.sent) == _n_sent          # nothing loaded, nothing to clear
+
+    # GUARDIAN box: the Way back row and the state line.
+    def _swr(safety):
+        return _g.GuardianReadout.from_json(
+            {"connected": True, "armed": True, "mode": "MANUAL", "want_on": True,
+             "guardian_on": True, "check": _ready, "safety": safety},
+            received_mono=_now)
+
+    _v = _sum(_swr(None))
+    assert _v.way_back == ("its own trail", "ok") and "retraces its path" in _v.state
+    _v = _sum(_swr({"state": "ready", "n": 3, "run": "sw", "detail": "loaded"}))
+    assert _v.way_back[0].startswith("safety way back (3 pts)"), _v.way_back
+    assert "follows the safety way back after 15 s" in _v.state, _v.state
+    _v = _sum(_swr({"state": "failed", "n": 3, "detail": "mission upload refused"}))
+    assert _v.way_back[1] == "err" and "mission upload refused" in _v.way_back[0]
+    assert _v.level == "warn" and "NOT loaded" in _v.state
+    _v = _sum(_swr({"state": "loading", "n": 3}))
+    assert _v.way_back[1] == "info"
+    _v = _sum(_swr({"state": "ready", "n": 3}), fcu_connected=False)
+    assert "follows the safety way back on its own" in _v.state, _v.state
+
+    # The station's map draws the run's way back (through the live fit's origin).
+    w.store.reset_georeference()
+    _t_sw = time.monotonic()
+    for i in range(20):
+        w.bus.odom_received.emit(_t_sw + i * 0.05, [0.0, 0.0, 0, 0, 0, 0.0], [0] * 6)
+        w.bus.gps_received.emit(_t_sw + i * 0.05, *local_en_to_latlon(0.0, 0.0, 33.66, 130.65))
+    app.processEvents()
+    assert w.store.geo.is_valid and w.store.geo.fit is not None
+    w.store.session.safety_way_back = list(_sw_pts)
+    w.map_view._refresh_safety_path(w.store)
+    assert w.map_view.safety_path.isVisible() and w.map_view.safety_end.isVisible()
+    _fit = w.store.geo.fit
+    _end = latlon_to_local_en(*_sw_pts[-1], _fit.lat0, _fit.lon0)
+    _pos = w.map_view.safety_end.scene_pos()
+    assert abs(_pos[0] - _end[0]) < 0.01 and abs(_pos[1] - _end[1]) < 0.01, (_pos, _end)
+    assert w.map_view.safety_path.path().elementCount() == 3
+    w.store.session.safety_way_back = []
+    w.map_view._refresh_safety_path(w.store)
+    assert not w.map_view.safety_path.isVisible()
+
+    # Designer window: the tool needs an anchor; add / undo / delete.
+    _swd = DesignerWindow(cfg, w.store)
+    _swd._dir = _sw_dir
+    try:
+        assert not _swd._safety_act.isEnabled()
+        _swd._safety_act.setChecked(True)
+        _swd._toggle_add_safety(True)
+        assert not _swd._safety_act.isChecked()       # refused without an anchor
+        _swd._set_anchor(_GeoFit(tx=0.0, ty=0.0, lat0=33.66, lon0=130.65,
+                                 rms_m=0.0, n_pairs=0), "typed")
+        assert _swd._safety_act.isEnabled() and not _swd._safety_clear_act.isEnabled()
+        _swd._on_safety_point_added(0.0, 10.0)
+        _swd._on_safety_point_added(10.0, 10.0)
+        _swd._on_safety_point_added(10.0, 0.0)
+        assert _swd.model.safety_way_back == [[0.0, 10.0], [10.0, 10.0], [10.0, 0.0]]
+        assert len(_swd.map._safety_items) == 3 and _swd._safety_clear_act.isEnabled()
+        _swd._undo_op()
+        assert len(_swd.model.safety_way_back) == 2 and len(_swd.map._safety_items) == 2
+        _swd.map._safety_items[0].setSelected(True)
+        _swd._on_action("delete", None)
+        assert _swd.model.safety_way_back == [[10.0, 10.0]]
+        _swd._clear_safety()
+        assert _swd.model.safety_way_back == [] and not _swd._safety_clear_act.isEnabled()
+    finally:
+        _swd._dirty = False
+        _swd.close()
+finally:
+    shutil.rmtree(_sw_dir, ignore_errors=True)
+print("safety way back ok")
 
 # --- Shared display helpers: one elapsed-time format, one middle elision,
 # one "a run is in progress" rule (every read-out and gate uses these) ---

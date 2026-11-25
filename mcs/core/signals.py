@@ -26,8 +26,19 @@ class SignalBus(QObject):
     #: Both are ``object`` because either is legitimately absent -- MAVROS
     #: sends NaN on a field the FCU does not report.
     battery_received = Signal(float, object, object)
-    #: t_mono, pinger position in robot/body frame [x, y, z]
+    #: t_mono, the LEGACY pinger vector in robot/body frame [x, y, z]
+    #: (/blueboat/pinger/legacy_body; /blueboat/pinger_coordinates only from
+    #: a control stack that has no legacy_body publisher)
     pinger_body_received = Signal(float, object)
+    #: t_mono, /blueboat/pinger_coordinates [x, y, z] body frame: the vector
+    #: master_control steers to (filtered, or legacy with pinger_source legacy)
+    pinger_coords_received = Signal(float, object)
+    #: t_mono, decoded /blueboat/pinger/estimate JSON (blueboat_pinger_estimate/1)
+    pinger_estimate_received = Signal(float, object)
+    #: t_mono, decoded /blueboat/pinger/fix JSON (blueboat_pinger_fix/1)
+    pinger_fix_received = Signal(float, object)
+    #: t_mono, decoded /blueboat/pinger/filter_config JSON (latched)
+    pinger_filter_config_received = Signal(float, object)
     #: t_mono (wall reception time) — raw underwater-GPS packet seen
     uw_gps_raw_received = Signal(float)
     #: t_mono, [t_ctrl, x, y, psi, x_d, y_d, psi_d, u1, u2]

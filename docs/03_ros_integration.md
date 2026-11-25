@@ -13,14 +13,18 @@ defaults below match the stack as provided.
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | MAVROS | **Robot glyph heading (preferred source)** — degrees clockwise from north (0=N, 90=E), converted to the app convention (radians CCW from east) as `radians(90 - hdg)`. The fallback is the odom yaw directly, which is absolute ENU too. BEST_EFFORT QoS |
 | `/mavros/state` | `mavros_msgs/State` | MAVROS | FCU **connected** flag (one of the three readiness inputs); since v1.1 also `armed` (the **autopilot's** arming, not the motor gate) and `mode` for the GUARDIAN box. Only subscribed when `mavros_msgs` imports; absent in simulation |
 | `/mavros/battery` | `sensor_msgs/BatteryState` | MAVROS (`sys_status`) | Battery charge in the left panel's ROBOT section. `percentage` is a **0..1 fraction** (MAVROS divides the MAVLink percent by 100); `percentage`/`voltage` arrive NaN when the FCU reports neither and are then shown as "no data" rather than as a number. BEST_EFFORT QoS. Real boat only — no simulation graph publishes it |
-| `/blueboat/pinger_coordinates` | `Float32MultiArray[3]` | `robot_interface.py` | Pinger in **robot/body frame** (sensor-fused); distance; world position computed once per message, with the pose concurrent with it, and held fixed in between (§3 N4) |
+| `/blueboat/pinger_coordinates` | `Float32MultiArray[3]` | `pinger_estimator.py` (since 2026-11-24; `robot_interface.py` before) | The **body-frame** vector `master_control` steers to: the filtered estimate (zeros until the filter initialises), or the legacy vector with `pinger_source:=legacy`. Kept for the PINGER panel's distance fallback. When **nothing publishes `/blueboat/pinger/legacy_body`** (an older control stack, a replay of a bag recorded before 2026-11-24) it also feeds the legacy layer, since it then *is* the legacy vector (`BridgeNode._legacy_publisher_absent`, a cached graph query) |
+| `/blueboat/pinger/legacy_body` | `Float32MultiArray[3]` | `pinger_estimator.py` | **2026-11-24.** The legacy algorithm's body vector ("dragged by the boat between fixes"), always published at odom rate → the **legacy** map layer: world position computed once per message with the pose concurrent with it, held fixed in between (§3 N4) |
+| `/blueboat/pinger/estimate` | `std_msgs/String` (JSON `blueboat_pinger_estimate/1`) | `pinger_estimator.py` | **2026-11-24.** The filter's estimate at each processed fix plus a ~1 Hz heartbeat: `status` (`no_data` / `initialising` / `tracking` / `coasting` / `stale`), `x, y` in the **world frame** (`/blueboat/odom` local ENU), `ellipse {a, b, theta}` (95 %), `r95`, `vx, vy`, `fix_age`, `fix_rate`, `stats` (% down-weighted / set aside over `window_s`), `source`, `range_m`. The **filtered** marker, track and ellipse are drawn straight from `x, y` / `ellipse` (no frame transform in the station); `TargetMode.PINGER` steers to it (to the legacy position when `source` is `legacy`). Older than 3 s = "no estimate" in the PINGER panel |
+| `/blueboat/pinger/fix` | `std_msgs/String` (JSON `blueboat_pinger_fix/1`) | `pinger_estimator.py` | **2026-11-24. RELIABLE depth 50** (the publisher's profile). One per processed fix: its `world` position and the filter's `decision` (`accepted` / `downweighted` / `set_aside` / `invalid` / `duplicate` / `initialising` / `reinit`) → the raw-fix layer, coloured by decision |
+| `/blueboat/pinger/filter_config` | `std_msgs/String` (JSON) | `pinger_estimator.py` | **2026-11-24. TRANSIENT_LOCAL depth 1, RELIABLE** (latched). The applied parameter set: `preset`, `params`, `hash`, `pinger_source`, `seq` (the `configure` it answers, or null at start), `ok`, `detail`, `mapping`, `allow_live_retune`. START RUN waits for the echo of the last `configure`'s `seq` with `ok` and the sent parameters whenever the pinger mode is not off; a refusal shows its `detail` |
 | `/uw_gps_data` | `Float32MultiArray[19]` | `uwgps_log.py` | Timestamp of the last raw USBL packet ("Last update" field) |
 | `/monitoring_data` | `Float32MultiArray[9]` `[t,x,y,ψ,x_d,y_d,ψ_d,u1,u2]` | `master_control.py` | **Current path target** `(x_d, y_d)` → target line and robot↔path distance; no recomputation of the controller's target |
 | `/thruster_input` | `Float32MultiArray[2]` `[right, left]` (N) | `master_control.py` | Motor command display and history |
 | `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface.py` | Mission-readiness aggregation |
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set.py` | Confirmation echo of `default`/`override`; E-STOP acknowledgement |
-| `/blueboat/run_state` | `std_msgs/String` (JSON) | `master_control.py` | **Real-robot run session only.** `{seq, ok, detail, state: idle/loading/running/error, controller_type, use_pinger, note, mission, run, npy}`: the answer to every run command (`seq`) and a 1 Hz heartbeat. Drives the RUN box and START RUN's gating; it is the truth about whether a run is active |
-| `/blueboat/run_log` | `std_msgs/String` (JSON) | `robot_interface.py` | **Real-robot run session only.** `{run, logging, csv, layout, bag_enabled, bag_recording, bag}`, 1 Hz: confirms the run's position CSV is being written (RUN box "Log" row; flagged if a started run is not confirmed within 3 s) and, since v1.1, its ros2bag (RUN box "Bag" row, flagged the same way; the `bag_*` fields are absent from an older control stack) |
+| `/blueboat/run_state` | `std_msgs/String` (JSON) | `master_control.py` | **Real-robot run session only.** `{seq, ok, detail, state: idle/loading/running/error, controller_type, use_pinger, note, mission, run, npy}` + (additive, 2026-11-24) `pinger_mode`, `pinger_source`, `has_path`, `tau`, `path_complete`: the answer to every run command (`seq`) and a 1 Hz heartbeat. Drives the RUN box and START RUN's gating; it is the truth about whether a run is active. Mission settings count as applied only when it echoes the sent controller, note, pinger mode (an echo without `pinger_mode` — an older stack — only for off / follow) and, when present, `has_path` and `path_source: mission`. `path_complete` during a run shows **Path complete — holding final pose** in the RUN box |
+| `/blueboat/run_log` | `std_msgs/String` (JSON) | `robot_interface.py` | **Real-robot run session only.** `{run, logging, csv, layout, bag_enabled, bag_recording, bag}` (`layout`: `no_pinger`, `pinger`, or since 2026-11-24 `pinger_log`), 1 Hz: confirms the run's position CSV is being written (RUN box "Log" row; flagged if a started run is not confirmed within 3 s) and, since v1.1, its ros2bag (RUN box "Bag" row, flagged the same way; the `bag_*` fields are absent from an older control stack) |
 | `/link_guardian/status` | `std_msgs/String` (JSON) | `guardian.py watch` (superproject `link_guardian/`, started by the station) | **Real-robot session only (v1.1).** 1 Hz: `{connected, armed, mode, want_on, guardian_on, check{ready, script, items[{name, level, text}]}, home{lat, lon, source}, run_running, messages[], busy, ack{seq, cmd, ok, detail}}` → the GUARDIAN box (`mcs.core.guardian`) |
 | `/replay/state` | `std_msgs/String` (JSON) | `bag_replay` (BlueBoat-Control) | **Bag replay only (v1.1).** `{bag, t, duration, rate, paused, finished, frame, world, world_offset, pose_source, gazebo}` at 2 Hz → the floating REPLAY box. Subscribed **TRANSIENT_LOCAL depth 1**, like the sea state |
 | `/clock` | `rosgraph_msgs/Clock` | Gazebo (ros_gz bridge) | **Simulation only (2026-11-07).** BEST_EFFORT. Paces the station clock in a simulation launch (`core/clock.StationClock`): every rate, age, elapsed time and plot is in sim seconds, so a run slowed below real time for the ray-cast sonar reads like a real-speed one; the toolbar SIM badge shows the measured factor. Not in the diagnostics table. Ignored in real-robot and replay launches |
@@ -39,7 +43,7 @@ defaults below match the stack as provided.
 | `/link_guardian/command` | `std_msgs/String` (JSON) | `{"cmd": "on"\|"off"\|"check"\|"setup"\|"reclaim", "seq": n}` | **Real-robot session only (v1.1).** To `guardian.py watch`: the guardian flag `LGRD_ON` on the autopilot, the readiness check, the recommended failsafe parameters, and Take back control (HOLD → servo mapping back to `param_set`'s → MANUAL). Answered in `/link_guardian/status.ack`. |
 | `/blueboat/manual_target` | `Float32MultiArray[2]` | `[x, y]` world metres | `master_control` steers to it with LoS, overriding the mission. |
 | `/blueboat/manual_target` | `Float32MultiArray[2]` | `[0.0, 0.0]` | Sentinel: `master_control` resumes the original mission (between the runs of a session: just releases the target). Published **only** by the explicit **Continue Original Mission** / **Release Target** action (`main_window._on_continue_mission`); arming or disarming Manual Target publishes nothing, and a genuine origin click is nudged by `1e-3` (N2). Turning arrow control off publishes the boat's own position here (hold where released). |
-| `/blueboat/run_command` | `std_msgs/String` (JSON) | `{"cmd": "configure", "controller_type": "PID", "use_pinger": false, "note": "dock", "mission": "lawn_a", "seq": 7}` · `{"cmd": "start", "seq": 8}` · `{"cmd": "stop", "seq": 9}` | **Real-robot run session only** (`master_control`). `configure` sets the next run (refused during a run; MPC with the pinger refused; MPC built on a worker thread → `state: loading`), `start` starts following + logging (refused unless `state: idle`), `stop` ends the run. `configure` is re-sent until acknowledged; `start` / `stop` are sent once (RUN box, Turn Off Connection). |
+| `/blueboat/run_command` | `std_msgs/String` (JSON) | `{"cmd": "configure", "controller_type": "PID", "use_pinger": false, "pinger_mode": "log", "has_path": false, "path_source": "mission", "pinger_source": "filter", "pinger_filter": {"preset": "slow_rov", "params": {…every parameter…}}, "note": "dock", "mission": "pinger_log", "seq": 7}` · `{"cmd": "start", "seq": 8}` · `{"cmd": "stop", "seq": 9}` | **Real-robot run session only** (`master_control`; the pinger part also `pinger_estimator`). `configure` sets the next run (refused during a run; MPC with pinger mode follow, replanner with follow, replanner with `has_path: false` refused; MPC built on a worker thread → `state: loading`), `start` starts following + logging (refused unless `state: idle`), `stop` ends the run. Since 2026-11-24 it carries `pinger_mode` (`off` / `follow` / `log`), `use_pinger` (= follow, the alias an older stack reads), `has_path` (false for a run without a path, pinger mode off or log), `path_source: "mission"` (always: the station runs designer missions only), `pinger_source` and the full `pinger_filter` block (`preset` is the preset name, or `custom` when Advanced changed values). `configure` is re-sent until acknowledged by `master_control`, and — when the pinger mode is not off — until `pinger_estimator` echoes its `seq` (bounded by the same 5 tries, never during a run, after an MPC build); `start` / `stop` are sent once (RUN box, Turn Off Connection). |
 | `/blueboat/arrow_thrust` | `Float32MultiArray` | `[right, left]` N, or `[]` | ARROW CONTROL box, 20 Hz while on (`[0, 0]` with no key held); `[]` releases. `master_control` gives it priority over every branch, freezes `tau` (a run is paused) and keeps logging the last target; a gap longer than `arrow_timeout` (0.5 s) commands zero and stays in arrow control. Any manual target also releases it. Both graphs (simulation too). |
 | `/replay/command` | `std_msgs/String` (JSON) | `{"cmd": "pause"}` · `{"cmd": "resume"}` · `{"cmd": "rate", "rate": 2.0}` | **Bag replay only (v1.1).** The REPLAY box's Pause/Resume and rate combo; `bag_replay` freezes or re-paces its bag clock (the boat holds its pose while paused). |
 | `/sim/sea_state/command` | `std_msgs/String` (JSON) | `{"current": {"speed_mps": 0.3, "from_deg": 0, "variation": "natural"}, "waves": {"preset": "smooth", "from_deg": 45, "crest": "short", "wakes": "occasional"}, "ramp_s": 20}` (a disabled card sends `{"preset": "none"}` / `{"preset": "calm"}`; a custom height sends `hs_m` + `tp_s: "auto"`) or `{"schedule": <blueboat_sea_schedule/1>, "t0": "now"}` | **Simulation only.** "Change sea state…" in the floating SEA STATE box; the simulator resolves the plain-language keys and ramps to the new situation, never steps. |
@@ -64,7 +68,8 @@ begins). In simulation it is requested at launch (path_generation always runs).
 In a real-robot run session it previews the session file: a GPS-anchored mission
 as soon as it is deployed (at connection, or after Update Mission), a non-anchored
 one only once START RUN has placed it at the boat; between runs of a placed
-mission the preview is cleared, and nothing is previewed in pinger mode.
+mission the preview is cleared, and nothing is previewed when a run follows no path
+(pinger mode *Follow*, or *Off* / *Log* with "(no path)").
 
 The request is **held until the map frame is anchored**
 (`MainWindow._on_tick` keeps it in `_pending_preview_trajectory` until
@@ -85,9 +90,27 @@ so depending on it would break every real-robot run (`CLAUDE.md` §3 N7).
 ```
 ros2 launch blueboat_control BlueBoat_launch.py \
     enable_motors:=<bool> trajectory:=from_yaml:<session file> \
-    use_pinger:=<bool> controller_type:=<PID|LoS|MPC> [note:=<str>] \
+    use_pinger:=<bool> pinger_mode:=<off|follow|log> has_path:=<bool> \
+    pinger_source:=<filter|legacy> pinger_preset:=<preset> \
+    [pinger_filter_yaml:=<file>] controller_type:=<PID|LoS|MPC> [note:=<str>] \
     session_mode:=True [extra:=args]
 ```
+
+**The pinger (2026-11-24).** The launch dialog's **Pinger** row sets the first run's
+mode: *Off* (a path, or "(no path)"), *Follow pinger (no path)* (`use_pinger:=True`; MPC
+greyed out) or *Log pinger only* (the boat never steers to the pinger; with a path it follows
+the path, any controller). With "(no path)" (Off or Log) `has_path:=False` and the run only
+holds Manual Target / the arrow keys. **Pinger source** and **Pinger filter** (shown only when
+the pinger is not Off; a preset of Control's `config/pinger_filter.yaml`, and **Advanced…**:
+the Field tuning cards and every parameter) become
+`pinger_source:=` / `pinger_preset:=`; values changed in Advanced are written by
+`LaunchManager.start` (`write_pinger_filter_file`) to
+`~/.config/blueboat_mcs/pinger_filter/last_launch.yaml` (`{schema, preset: custom, params}`)
+and passed as `pinger_filter_yaml:=`. The same choice rides each run's `configure`
+(`pinger_mode`, `has_path`, `pinger_source`, the full `pinger_filter` block), so Update
+Mission changes it between runs. The station never sends `allow_live_retune:=`, so the
+estimator refuses a filter change during a run (and the station sends `configure` only
+between runs anyway). The pinger rows are hidden for Gazebo launches.
 
 **Every real-robot launch is a run session (2026-10-09).** The boat connects and
 goes into override (`robot_interface`'s handshake; since v1.1 it first **arms the
@@ -98,18 +121,26 @@ the pinger, `robot_interface` writes no CSV and `master_control` no `.npy`. The
 lifecycle, all on `/blueboat/run_command` / `/blueboat/run_state`:
 
 1. **Connect** — the first `run_state` heartbeat makes the station send `configure`
-   with the dialog's choices; START RUN waits for its acknowledgement.
+   with the dialog's choices; START RUN waits for its acknowledgement and, when the
+   pinger mode is not off, for `pinger_estimator`'s echo on
+   `/blueboat/pinger/filter_config` (same `seq`, `ok`, the sent parameters and source):
+   *pinger filter configuration not applied yet* (with the refusal's reason when it
+   said `ok: false`).
 2. **START RUN** — the station writes the run's path into the session file
    (`LaunchConfig.session_trajectory_file`, `~/.config/blueboat_mcs/trajectories/.session/run.yaml`,
    which `path_generation` watches): a GPS-anchored mission re-deployed with the
    current fit, any other mission **placed at the boat** (`io_yaml.place_mission`). Only
    then does it publish `start`; `master_control` resets τ and its controller state,
    reserves the run's `.npy` and starts following at once; `robot_interface` opens the
-   run's CSV on the `running` state and reports it on `/blueboat/run_log`.
+   run's CSV on the `running` state and reports it on `/blueboat/run_log`. A follow run,
+   and a log run without a path, write no session file and preview nothing. Every
+   pinger snapshot and trail of the station is reset at START RUN (and at every launch).
+   When `run_state.path_complete` turns true (a path with `loop: false` has ended), the
+   RUN box shows **Path complete — holding final pose** until STOP RUN.
 3. **STOP RUN** — `stop`: thrust zero, still in override; the `.npy` is written, the CSV
    closed and filed (report PNG, `Robot_data/<stem>/`) in a background process.
-4. **Update Mission** (between runs) — `configure` with the next path / pinger,
-   controller and log note. A controller change is loaded at once (MPC on a worker
+4. **Update Mission** (between runs) — `configure` with the next pinger mode, path,
+   pinger source / filter, controller and log note. A controller change is loaded at once (MPC on a worker
    thread, the loop keeps running); an anchored path is deployed and previewed at once,
    a non-anchored one is placed only when its run starts.
 5. **Turn Off Connection** — an active run is stopped first, then the safe-shutdown
@@ -157,8 +188,15 @@ launch disables it; the station never does. The RUN box's **Bag** row follows it
 
 ```
 ros2 launch blueboat_control Replay_launch.py bag:=<run folder or its bag> \
-    rate:=<x> [world_dir:=<personalized world>] [extra:=args]
+    rate:=<x> [world_dir:=<personalized world>] \
+    [pinger_estimator:=true pinger_source:=<filter|legacy> pinger_preset:=<preset> \
+     [pinger_filter_yaml:=<file>]] [extra:=args]
 ```
+
+**Re-estimate the pinger with the current filter** (2026-11-24, replay only) adds
+`pinger_estimator:=true` with the filter rows' choice: the estimator runs again on the
+recorded USBL fixes and the bag's own pinger outputs move to `/replay/*`. Unchecked, the
+map shows the pinger as the bag recorded it.
 
 `bag_replay` moves the boat along the recording with Gazebo's `set_pose` (the boat is
 spawned with `blueboat_description replay:=true`: no force can act on it, so no sea
@@ -302,8 +340,9 @@ under `~/.config/blueboat_mcs/sea_states/`.
 Started in its own process session; stopped with SIGINT to the group
 (graceful, propagated by `ros2 launch`), escalating to SIGTERM after
 `launch.sigint_timeout_s` and SIGKILL after `sigterm_timeout_s` more.
-Coupling rules encoded in the dialog: `trajectory` is disabled when
-`use_pinger` is checked (no `path_generation` node in that branch), and
+Coupling rules encoded in the dialog: `trajectory` is disabled in pinger mode
+*Follow*, *Off* and *Log* add a "(no path)" entry, source and filter rows show only when the
+pinger is not *Off*, MPC is greyed out in *Follow* only, and
 `enable_motors` always requires explicit re-confirmation.
 
 ## The three operator stop actions (2026-09-04)
@@ -402,16 +441,13 @@ Control-stack code lives in the `BlueBoat-Control` submodule and is built with
 nothing is copied from this repo (`CLAUDE.md` §6, §3 N9). Anchor on symbol
 names, not line numbers — they drift with that module.
 
-**Open — world-frame pinger is not published.** `robot_interface` computes
-`corrected_pinger` but only writes it to the CSV and the pinger-GPS
-conversion; `/blueboat/pinger_coordinates` carries the **body-frame** vector.
-The station derives the world position itself, once per pinger message, from
-`/blueboat/pinger_coordinates` + `/blueboat/odom` (§3 N4). To make it a single
-source of truth, publish it from `robot_interface` on a new topic and point `TopicsConfig`
-at it. Residual marker sluggishness is inherent to the source, not to that
-choice: with `fixed_pinger=False` the vector is seeded from the Waterlinked
-*filtered* acoustic position (seconds of smoothing) and dead-reckoned with odom
-twist between USBL updates.
+**Resolved for the filtered pinger (2026-11-24).** `pinger_estimator` publishes the
+filtered estimate in the **world frame** (`/blueboat/pinger/estimate`), and the station
+draws it as published. Only the **legacy** layer is still a body vector
+(`/blueboat/pinger/legacy_body`) that the station turns into world frame once per message
+(§3 N4); its sluggishness is inherent to the legacy algorithm (seeded from a USBL fix,
+dead-reckoned with the boat between fixes — "dragged by the boat"), which is why it is
+kept only as a comparison layer.
 
 **Carried deliberately — keep-position semantics.** YAML trajectories clamp at
 their final pose forever, so every controller station-keeps at the end of a
@@ -461,10 +497,16 @@ MAVROS sensor topics are subscribed BEST_EFFORT (matching the stack); all
 custom topics are subscribed default RELIABLE depth 10, matching their
 publishers.
 
-`/sim/sea_state` is the one **TRANSIENT_LOCAL** subscription (depth 1):
-the simulator latches its status so a late station gets the current
+`/sim/sea_state` and `/replay/state` are **TRANSIENT_LOCAL** subscriptions (depth 1):
+the publisher latches its status so a late station gets the current
 situation immediately; a volatile reader would also match, but would wait
 up to half a second for the next 2 Hz message.
+
+The pinger pipeline (2026-11-24): `/blueboat/pinger/filter_config` is subscribed
+**TRANSIENT_LOCAL depth 1 RELIABLE** like its latched publisher (a station started
+after the estimator still gets the applied set), `/blueboat/pinger/fix` **RELIABLE
+depth 50** like its publisher (a burst of fixes is not dropped); `legacy_body` and
+`estimate` the default profile.
 
 One asymmetry worth knowing before "fixing" it: `/blueboat/controller_ready`
 is published volatile depth 10 by `robot_interface.py` on the real robot, but

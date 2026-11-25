@@ -74,7 +74,9 @@ def sample_mission(model: MissionModel, ds: float = 0.25) -> SampledMission:
 
     mission_speed = max(float(model.speed), 1e-3)
     pairs = list(itertools.pairwise(wps))
-    if model.loop:
+    # "Return to start": the closing leg only. Whether the control stack
+    # repeats the path is the runtime loop flag (model.repeat, io_yaml).
+    if model.close_path:
         pairs.append((wps[-1], wps[0]))
 
     xy_pts: list[tuple[float, float]] = [(wps[0].x, wps[0].y)]

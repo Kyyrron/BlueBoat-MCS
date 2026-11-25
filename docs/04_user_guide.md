@@ -9,8 +9,8 @@ Manual Target or the arrow keys — and you start and stop as many **runs** as
 you like (each logged on its own) without ever handing the boat back to
 QGroundControl. A run session in four steps:
 
-1. **Launch Mission** → *Real robot* → choose the first run's path (or the
-   pinger), controller, motors, log note → **Launch**. The boat connects and
+1. **Launch Mission** → *Real robot* → choose the first run's pinger mode
+   and path, controller, motors, log note → **Launch**. The boat connects and
    goes into override but **does not move and nothing is logged**.
 2. Drive it wherever you want with **Manual Target** or **Control using
    arrows**. A GPS-anchored path is already drawn on the map, its start
@@ -46,8 +46,11 @@ guardian ON. The box shows a one-line state (ON / OFF / NOT READY / TAKEN OVER /
 LINK LOST), the link, the autopilot (armed · ArduPilot mode — the autopilot's
 own arming, not the motor gate), the guardian flag, the setup check (tooltip:
 every item), HOME (session start, or the current run's start) and the boat's
-last guardian / pre-arm messages. Buttons, each enabled only when it can act
-(the tooltip says why not):
+last guardian / pre-arm messages, and (2026-11-25) **Way back**: what a link
+loss would follow — *its own trail*, or the run's *safety way back (N pts)
+until STOP RUN* (red with the reason if it could not be loaded: the run still
+runs, and a link loss then uses the trail). Buttons, each enabled only when it
+can act (the tooltip says why not):
 
 * **Check** — re-run the readiness check (script, failsafe parameters, laptop
   identity).
@@ -74,12 +77,26 @@ controller, mission state (an aggregated readiness count over FCU connection,
 odometry flow and controller-ready), left/right motor commands in Newtons,
 total travelled distance and mission elapsed time.
 
-**Pinger** — world coordinates, robot-frame coordinates, live robot↔pinger
-distance, and the age of the last raw USBL packet (green < 3 s, orange < 10 s,
-red beyond).
+**Pinger** (2026-11-24) — two pingers are shown side by side: the **filtered**
+estimate of BlueBoat-Control's `pinger_estimator` and the **legacy** algorithm (the
+old vector, dragged by the boat between USBL fixes), kept for comparison. Rows:
+**Mode** (*off (path)*, *follow pinger*, *log only*; *n/a* in simulation, *replay*),
+**Source** (what a pinger-following run steers to: *filtered* or *legacy (dragged)*),
+**Filter** (the preset and parameter hash the estimator reports as applied — green once
+it confirmed the run's settings, amber *applying…*, red *refused — reason*), then the
+filtered estimate exactly as the estimator publishes it: **Status** (green *tracking*,
+amber *coasting*, red *stale*, grey *initialising* / *no_data*; red *no estimate for N s*
+when the estimator stops answering), **World (x, y)**, **Distance** to the boat,
+**Fix age**, measured **Fix rate**, **95 % radius**, estimated **Speed**,
+**Down-weighted** and **Set aside** (% of fixes over the estimator's statistics
+window); then **Legacy (x, y)**, **Legacy body** (robot frame) and **Legacy distance**,
+and **Last update**, the age of the last raw USBL packet (green < 3 s, orange < 10 s,
+red beyond). Every number comes from a topic; the station computes none.
 
 **Target** — the active steering mode (path following / pinger homing /
-MANUAL TARGET) and the live distance to that target. The value comes from the
+MANUAL TARGET; nothing during a *log only* run without a path) and the live distance
+to that target (in pinger homing: the filtered estimate, or the legacy position when
+the run's source is legacy). The value comes from the
 controller's own published target; nothing is recomputed.
 
 **ROS diagnostics** — one row per monitored topic with a colour LED
@@ -89,7 +106,8 @@ visible within one second.
 
 **RUN** (real-robot run session only; pinned under the panel, so it never
 scrolls away) — what the next run executes (**Next run**: the path, marked
-*GPS* or *placed at start*, or the USBL pinger), the **Controller** as
+*GPS* or *placed at start* — with *+ pinger log* in pinger mode Log —, the USBL
+pinger, or *pinger log only (no path)*), the **Controller** as
 `master_control` reports it (*loaded*, *loading…* while MPC builds its solver,
 *error* with the reason), the **State** (*Connected — no run yet*, *Run 3 —
 2:31*, *Connected — last run 3*, *E-STOP latched*), the **Log** (the run's
@@ -104,8 +122,14 @@ CSV but cannot be replayed). One big button:
   of it, along its heading; a GPS-anchored path is re-deployed with the current
   GPS fit and the boat drives to its **S** — then starts following and logging
   immediately. Greyed out, its tooltip says why (controller loading, no path
-  chosen, GPS not anchored yet, E-STOP latched, no odometry, …). It also ends
+  chosen, GPS not anchored yet, E-STOP latched, no odometry, *pinger filter
+  configuration not applied yet* while the estimator has not confirmed a pinger
+  run's filter settings — with its reason when it refused them, …). It also ends
   arrow control and clears a manual target: you asked for the run now.
+* **Path complete — holding final pose** (amber line under the rows) appears
+  when `master_control` reports that the run's path has ended: a path saved
+  without *Repeat forever* (`loop: false`) ends there and the boat holds its
+  final pose until you press STOP RUN.
 * **■ STOP RUN** (amber) ends the run: following stops, the boat holds zero
   thrust **and stays in override**, the run's CSV is closed and filed with its
   report, the controller log is written. The display freezes on that run
@@ -179,6 +203,17 @@ lets go of the target and holds zero thrust. When the boat arrives (≤ 1 m), a
 manual target **pauses** the run; Continue Original Mission resumes it where
 it stopped.
 
+**Pinger layers** (2026-11-24) — the **filtered** pinger is a purple dot with
+a purple track, and optionally its purple dashed **95 % uncertainty ellipse**,
+all placed exactly where the estimator says (world frame); the **legacy** pinger
+keeps the orange dot (labelled *legacy*) and dotted orange track; the **raw
+fixes** are small dots coloured by what the filter did with each one — green
+accepted, amber down-weighted, red set aside, grey invalid / duplicate /
+initialising / re-initialised. A small **PINGER** legend at the bottom-left of
+the map (above the scale bar) lists the pinger layers that are switched on; it
+appears once pinger data exists. Each layer, and the legend, has its own box in
+**Layers**; the ellipse and the raw fixes start off.
+
 **Start marker** — the mission path's first point is circled **S**: where a
 GPS-anchored run begins (the boat drives there first), or, for a placed path,
 the boat's position at START RUN.
@@ -216,7 +251,9 @@ measurement from the map.
 ## Right panel
 
 **Layers** — checkboxes toggling every map layer: satellite imagery, robot
-trajectory, published mission path, pinger position and trajectory, the thin
+trajectory, published mission path, the pinger (filtered position and track,
+95 % uncertainty ellipse, raw fixes by filter decision, legacy position and
+track, and the pinger legend — the ellipse and raw fixes off by default), the thin
 robot→target line and the metric grid (the robot heading arrow was removed in
 v1.1 — the boat glyph itself points along the heading). The satellite box
 unlocks as soon as the map frame is anchored — a second or so of GPS, no
@@ -225,7 +262,8 @@ driving needed; watch "georef" in the status bar.
 **Map tools** — **Zoom +**, **Zoom −** (view-center anchored), **Center
 Robot**, which recenters the view on the boat exactly once (the camera then
 stays completely free — it is never a follow mode), and **Clear Paths**, which
-wipes the robot and pinger trails from the map without touching recorded data.
+wipes the robot trail and the pinger trails and raw fixes from the map without touching
+recorded data.
 
 **Live distance** — robot↔current-target distance versus experiment time; the
 title states whether the target is the pinger, the path target or a manual
@@ -282,14 +320,40 @@ for a bracket run put `sonar_config:=<bracket file>` in **Extra args**. Both lis
 selector chooses between the *Real robot* launch and the *Gazebo simulation*
 (`Sim_launch.py`). Real robot — a **run session**: the controller of the
 first run (PID / LoS / MPC; MPC cannot follow the pinger and is greyed out
-with it), the first run's trajectory (designer paths only — built-in shapes
-are for simulation and the CLI), use-pinger, motor enable (always
+in pinger mode *Follow*), the **Pinger** mode — *Off* (follow a path), *Follow
+pinger (no path)* (the trajectory list is disabled) or *Log pinger only* (the boat
+never steers to the pinger and the pinger is logged) —; in *Off* and *Log* the
+trajectory list also offers "(no path)": the run follows nothing and the boat only
+holds Manual Target / the arrow keys, the first run's trajectory (designer paths only — built-in shapes
+are for simulation and the CLI) with, read-only, how it ends (**Path end**:
+*repeats forever (loop: true)* or *ends — holds the final pose*, and *returns to
+start* when its last point is its first; change it in the designer), the
+**Pinger source** (*Filtered (default)* or *Legacy: dragged by the boat between
+fixes* — what a pinger-following run steers to), the **Pinger filter** preset with
+**Advanced…** (these two rows only when the pinger is not *Off*), motor enable (always
 re-confirmed, with a second warning dialog), a log note and free-form extra
-launch arguments. On **Launch** the boat connects and goes into override but
+launch arguments. **Advanced…** opens the filter's tuning window, generated from
+BlueBoat-Control's `config/pinger_filter.yaml`. Its first tab, **Field tuning**, has
+one card per knob worth touching in the field (fix delay, receiver rotation,
+left/right mirror, trust in each fix, agility, top speed, outlier tolerance, jump to a
+new place, when to give up): a picture of its effect (the filter itself run at a low
+value, the default and a high value; click to enlarge), what it does, what lowering
+and raising it does, how to set it in the field, and a slider with the exact value
+beside it; a line under each value says live whether it is below or above the preset
+and what that does. The second tab, **All parameters (expert)**, has one box per
+group, a field per parameter with its unit and its description as tooltip. Both
+tabs edit the same values. **Reset to preset**,
+**Load YAML…** / **Save YAML…** (in `~/.config/blueboat_mcs/pinger_filter/`). An
+invalid set (a sign of 0, `gate_hard` below `gate_soft`, `stale_timeout_s` below
+`coast_after_s`, a file out of range) cannot be confirmed and says why; changed
+values make the filter *custom* and are passed to the launch as a parameter file. On **Launch** the boat connects and goes into override but
 does not move and logs nothing until START RUN. Gazebo
 simulation: robot file, trajectory, controller and the same **log note** —
 the simulation always runs a controller, and only the motor and pinger
-fields are hidden because they do not exist in that graph; mission-state
+fields are hidden because they do not exist in that graph (a *From a ros2bag*
+replay offers **Re-estimate the pinger with the current filter**, which shows the
+pinger source / filter rows and re-runs the estimator on the recorded fixes;
+unchecked, the pinger is shown as the bag recorded it); mission-state
 readiness shows "(sim)" and does not wait for a flight controller. The log
 note lands in the run's position-log file name just as in a real-robot run
 (`{date}-{note}-poslog.csv`), with a simulated run always tagged `sim`
@@ -386,10 +450,14 @@ the dialog — they live in the simulator's `docs/sea_state_model.md`.
 
 **Update Mission** (the Launch button, while a real-robot session is
 connected, between runs) opens a small window choosing what the **next run**
-executes: **Follow** a path or the USBL pinger, the **Path** (every saved
-designer path, re-read each time the window opens — a path you just drew in
-the Survey Pattern Designer is there), the **Controller** and the **Log
-note**. **Apply to next run** sends it at once: a controller change is loaded
+executes: the **Pinger** mode (*Off*, *Follow pinger (no path)*, *Log pinger
+only*), the **Path** (every saved designer path, re-read each time the window
+opens — a path you just drew in the Survey Pattern Designer is there; disabled
+for *Follow*, with a "(no path)" entry for *Off* and *Log*) and its read-only **Path end**,
+the **Pinger source** and **Pinger filter** (with **Advanced…**; only when the pinger is
+not *Off*), the
+**Controller** (MPC greyed out for *Follow* only) and the **Log note** — the same
+pinger rows as the launch dialog. **Apply to next run** sends it at once: a controller change is loaded
 right away (MPC can take up to a minute after an MPC tuning change; the RUN
 box shows *loading…* and START RUN waits), a GPS-anchored path is drawn at its
 real position with its **S** as soon as the GPS frame is anchored, a
@@ -552,6 +620,18 @@ Distribute (equal spacing between the first and last selected), Group /
 Explode, Lock/Unlock, rename (edit in the tree), reorder (▲/▼) and
 snapshot Undo/Redo (`Ctrl+Z/Y`) are all in the toolbar and tree panel.
 
+**Safety way back** (2026-11-25, GPS-anchored missions only). *✚ Safety way
+back* (or `B`) arms click-to-add for a second, dashed orange line: click its
+points in the order the boat should follow them; the **last point** (marked
+LOITER) is where the boat will hold. Shift constrains from the previous point,
+right-click leaves the mode; drag its square handles to move them, select them
+and Delete to remove them, *Clear way back* removes it all (all undoable). It
+is greyed until the mission has a GPS origin. If the link to the laptop is lost
+during a run of this mission (START RUN to STOP RUN), the link guardian drives
+the boat straight to the closest point of this line, follows it to its end and
+holds there, instead of retracing the boat's trail. Saved with the mission; the
+station's map shows it (dashed orange, LOITER at its end) during such a run.
+
 **Segments.** Select a waypoint to edit the segment *leaving* it: straight,
 sinusoidal, circular arc, Catmull-Rom spline or cubic Bézier, each with its
 own parameters, plus a **per-segment speed** (leave at “mission speed” to
@@ -568,8 +648,14 @@ Groups move, duplicate, reorder and lock as one object; "Edit pattern
 parameters…" regenerates in place, "Explode" turns a group into individual
 waypoints.
 
-**Mission settings & files.** Cruise speed (time-parameterization), loop
-and a comment live in the right column; the status bar shows waypoint
+**Mission settings & files.** Cruise speed (time-parameterization), two
+independent options (since 2026-11-24) — **Return to start (close last →
+first)** adds the closing leg from the last waypoint back to the first, and
+**Repeat forever** writes `loop: true` into the runtime file so the control
+stack restarts the path forever (off by default: the boat holds the final pose
+when the path ends and the RUN box says *Path complete*) — and a comment live in
+the right column. A mission saved before the split with its single "Loop" box
+on opens with both on, so it behaves as before until you change it; the status bar shows waypoint
 count, length and duration. Save / Save As (with overwrite confirmation),
 and the library dialog's Duplicate / Rename / Delete manage the mission
 files (`~/.config/blueboat_mcs/trajectories/`). Saved missions immediately

@@ -46,8 +46,15 @@ _LAYERS: list[tuple[str, str, bool]] = [
     ("satellite", "Satellite map layer", False),
     ("robot_track", "Robot trajectory", True),
     ("mission_path", "Published mission path", True),
-    ("pinger", "USBL pinger position", True),
-    ("pinger_track", "USBL pinger trajectory", True),
+    # The pinger (2026-11-24): filtered estimate (purple) and legacy (orange)
+    # on by default; the uncertainty ellipse and the raw fixes off.
+    ("pinger_filtered", "Pinger position — filtered", True),
+    ("pinger_filtered_track", "Pinger track — filtered", True),
+    ("pinger_ellipse", "Pinger 95 % uncertainty ellipse", False),
+    ("pinger_fixes", "Pinger raw fixes (by filter decision)", False),
+    ("pinger", "Pinger position — legacy", True),
+    ("pinger_track", "Pinger track — legacy", True),
+    ("pinger_legend", "Pinger legend", True),
     ("target_line", "Robot → target line", True),
     ("grid", "World grid", True),
 ]
@@ -115,8 +122,8 @@ class RightPanel(QWidget):
             "completely free (this is not a follow mode).")
         center.clicked.connect(self.center_robot_requested.emit)
         clear_paths = QPushButton("Clear Paths")
-        clear_paths.setToolTip("Clear the robot and pinger trails drawn on "
-                               "the map (live states are kept).")
+        clear_paths.setToolTip("Clear the robot trail and the pinger trails and "
+                               "raw fixes drawn on the map (live states are kept).")
         clear_paths.clicked.connect(self.clear_paths_requested.emit)
         for b in (zoom_in, zoom_out, center, clear_paths):
             tools_row.addWidget(b)

@@ -31,6 +31,13 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QTimer
 
 from mcs.config.settings import DEFAULT_CONFIG_DIR, AppConfig
+from mcs.core.pinger_filter import (
+    CUSTOM,
+    DEFAULT_PRESET,
+    SOURCE_FILTER,
+    effective_mode,
+    write_param_file,
+)
 from mcs.core.sea import SeaChoice
 from mcs.core.signals import SignalBus
 
@@ -73,7 +80,9 @@ class LaunchParameters:
     Four launch targets exist, with different declared arguments:
 
     * ``BlueBoat_launch.py`` (real robot): ``enable_motors``, ``note``,
-      ``controller_type``, ``trajectory``, ``use_pinger``, ``session_mode``.
+      ``controller_type``, ``trajectory``, ``use_pinger``, ``session_mode``,
+      and since 2026-11-24 ``pinger_mode``, ``has_path``, ``pinger_source``,
+      ``pinger_preset``, ``pinger_filter_yaml``.
       Every station launch of it is a **run session** (``session=True``):
       ``session_mode:=True`` and ``trajectory:=from_yaml:<session file>`` --
       the one file path_generation watches, which the station fills for each
@@ -94,7 +103,9 @@ class LaunchParameters:
     * ``Replay_launch.py`` ("From a ros2bag", selected when ``replay_bag``
       is set): ``bag``, ``rate``, ``world_dir`` (optional, a personalized
       world), and, only when set, ``placement:=origin`` (the run on the
-      world's origin instead of its GPS position).
+      world's origin instead of its GPS position), and with
+      ``replay_pinger_estimator`` ``pinger_estimator:=true`` plus the filter
+      arguments (the pinger re-estimated with the current filter).
       The boat moves kinematically along a recorded real-robot run; no
       controller, no sea state, no note, no companion -- and no sonar: the
       replay publishes the boat pose a simulated sonar renders from, and the
@@ -134,6 +145,19 @@ class LaunchParameters:
     emits ``thrust_gain:=``, after the sonar arguments and before
     ``extra_args``; "" (the description's gains) emits nothing, and an
     empty-world launch drops it (:func:`drop_thrust_gain_without_world`).
+
+    The pinger (2026-11-24): ``pinger_mode`` (``off`` | ``follow`` | ``log``;
+    "" = from ``use_pinger``, which stays the follow alias), ``has_path``
+    (False only for log mode without a path), ``pinger_source`` (``filter`` |
+    ``legacy``: what ``/blueboat/pinger_coordinates`` carries),
+    ``pinger_preset`` (the filter preset) and ``pinger_filter_yaml`` (a saved
+    parameter file, set by :func:`write_pinger_filter_file` when the dialog's
+    values differ from the preset). The real-robot branch emits them when
+    ``pinger_mode`` is set; the replay branch emits ``pinger_estimator:=true``
+    with the last three only when ``replay_pinger_estimator`` is set (re-estimate
+    the pinger with the current filter); the simulation branches never (no
+    pinger in Gazebo). ``pinger_filter`` (``{"preset", "params"}``, the full
+    set) is no launch argument: it rides the session's ``configure``.
 
     ``perception_mode`` is no launch argument of any of the
     four files -- ``to_cli`` ignores it. It is the BlueBoat-Perception
@@ -192,6 +216,27 @@ class LaunchParameters:
     sonar_profile: str = ""
     # The plant's [right, left] thrust gains, "[r,l]" or "" (see the docstring).
     thrust_gain: str = ""
+    # The pinger (real robot; replay with replay_pinger_estimator), see the
+    # docstring.
+    pinger_mode: str = ""
+    has_path: bool = True
+    pinger_source: str = SOURCE_FILTER
+    pinger_preset: str = DEFAULT_PRESET
+    pinger_filter: dict | None = None
+    pinger_filter_yaml: str = ""
+    replay_pinger_estimator: bool = False
+
+    def effective_pinger_mode(self) -> str:
+        """off | follow | log: ``pinger_mode``, else from ``use_pinger``."""
+        return effective_mode(self.pinger_mode, self.use_pinger)
+
+    def pinger_filter_args(self) -> list[str]:
+        """``pinger_source:= pinger_preset:= [pinger_filter_yaml:=]``."""
+        args = [f"pinger_source:={self.pinger_source}",
+                f"pinger_preset:={self.pinger_preset}"]
+        if self.pinger_filter_yaml:
+            args.append(f"pinger_filter_yaml:={self.pinger_filter_yaml}")
+        return args
 
     def slowed(self) -> bool:
         """A personalized-world run with the ray-cast sonar, slowed down."""
@@ -235,6 +280,8 @@ class LaunchParameters:
                 args.append(f"world_dir:={self.world_dir}")
             if self.replay_placement == "origin":
                 args.append("placement:=origin")
+            if self.replay_pinger_estimator:
+                args += ["pinger_estimator:=true", *self.pinger_filter_args()]
         elif self.simulation and self.world_dir:
             args = [
                 f"world_dir:={self.world_dir}",
@@ -262,6 +309,10 @@ class LaunchParameters:
                 f"trajectory:={self.trajectory}",
                 f"use_pinger:={b(self.use_pinger)}",
             ]
+            if self.pinger_mode:
+                args += [f"pinger_mode:={self.effective_pinger_mode()}",
+                         f"has_path:={b(self.has_path)}",
+                         *self.pinger_filter_args()]
             if self.controller_type != "":
                 args += [f"controller_type:={self.controller_type}"]
             if self.wire_note() != "":
@@ -270,6 +321,29 @@ class LaunchParameters:
                 args += ["session_mode:=True"]
         args += [f"{k}:={v}" for k, v in self.extra_args.items()]
         return args
+
+
+def write_pinger_filter_file(cfg, params: LaunchParameters) -> str:
+    """A customised pinger filter for this launch, as a parameter file.
+
+    When the dialog's filter block is ``custom`` (Advanced changed values) and
+    the launch runs a pinger estimator (real robot, or a replay with
+    ``replay_pinger_estimator``), the full set is written to
+    ``<pinger.filter_dir>/last_launch.yaml`` (the format Control reads) and
+    ``params.pinger_filter_yaml`` points at it; otherwise the field is
+    cleared. Returns the path or "". Called by :meth:`LaunchManager.start`,
+    so the dialog's ``parameters()`` stays free of side effects. ``cfg`` is
+    the ``AppConfig``; module scope and Qt-free for the smoke test."""
+    block = params.pinger_filter or {}
+    runs_estimator = ((not params.simulation and not params.replay_bag)
+                      or (bool(params.replay_bag) and params.replay_pinger_estimator))
+    if not runs_estimator or block.get("preset") != CUSTOM or not block.get("params"):
+        params.pinger_filter_yaml = ""
+        return ""
+    path = Path(cfg.pinger.filter_dir).expanduser() / "last_launch.yaml"
+    write_param_file(path, CUSTOM, dict(block["params"]))
+    params.pinger_filter_yaml = str(path)
+    return str(path)
 
 
 def drop_sonar_choice_without_world(params: LaunchParameters) -> bool:
@@ -467,6 +541,14 @@ class LaunchManager(QObject):
             self._bus.launch_output.emit("A mission is already running.")
             return False
         package, launch_file = launch_target(self._cfg.launch, params)
+        try:
+            write_pinger_filter_file(self._cfg, params)
+        except OSError as exc:
+            params.pinger_filter_yaml = ""
+            self._bus.launch_output.emit(
+                f"[station] pinger filter file not written ({exc}): the launch uses "
+                f"the preset '{params.pinger_preset}'; a run session re-sends the "
+                "custom values with its first configure.")
         cmd = [
             "ros2", "launch",
             package, launch_file,

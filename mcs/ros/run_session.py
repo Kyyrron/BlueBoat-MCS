@@ -23,6 +23,17 @@ along its heading). Written before ``start`` goes out, so master_control's
 first window request after the start already reads the new file; nothing
 waits, which is what makes the boat move the moment the button is pressed.
 
+The pinger (2026-11-24): ``configure`` carries ``pinger_mode`` (off |
+follow | log), ``use_pinger`` (its alias for an older control stack, = follow),
+``has_path`` (False for a run without a path, pinger mode off or log), ``path_source``
+("mission", always), ``pinger_source`` and the full ``pinger_filter`` block
+``{preset, params}``. ``master_control`` answers on ``run_state``; the
+``pinger_estimator`` node answers the pinger part on
+``/blueboat/pinger/filter_config`` with the same ``seq`` -- START RUN waits for
+that echo (``ok``, the sent parameters) whenever the pinger mode is not off.
+A log run without a path writes no session file and previews nothing, like a
+pinger-following run.
+
 Commands carry a ``seq``; ``run_state`` echoes the last one handled with
 ``ok`` / ``detail``. ``configure`` is idempotent and re-sent until
 acknowledged (a first publish can race DDS discovery); ``start`` / ``stop``
@@ -43,8 +54,17 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from mcs.config.settings import AppConfig
 from mcs.core.clock import format_clock
+from mcs.core.pinger_filter import MODE_FOLLOW, MODE_LOG, MODE_OFF, filter_block
 from mcs.core.signals import SignalBus
-from mcs.models.store import DataStore, NextMission, now_mono
+from mcs.models.store import (
+    RUN_NO_PATH,
+    RUN_PATH,
+    RUN_PINGER,
+    RUN_PINGER_LOG,
+    DataStore,
+    NextMission,
+    now_mono,
+)
 from mcs.ros.command_center import CommandCenter
 from mcs.ros.launch_manager import LaunchParameters, sanitize_note
 
@@ -68,6 +88,7 @@ class RunStatus:
     bag_color: str
     running: bool            # the button reads STOP RUN
     pending: str             # "start" | "stop" | ""
+    path_complete: bool = False   # run_state: the run's non-loop path has ended
 
 
 class RunSession(QObject):
@@ -99,6 +120,8 @@ class RunSession(QObject):
         self._configure_tries = 0
         self._pending_seq: int | None = None
         self._deployed_from = ""        # source currently deployed in the file
+        self._path_complete_seen = False
+        self._filter_refusal_seq: int | None = None
 
         self._ack_timer = QTimer(self)
         self._ack_timer.setSingleShot(True)
@@ -109,9 +132,16 @@ class RunSession(QObject):
         self._log_timer = QTimer(self)
         self._log_timer.setSingleShot(True)
         self._log_timer.timeout.connect(self._on_log_timeout)
+        # The pinger estimator answers a configure's pinger block on
+        # /blueboat/pinger/filter_config; a node started after the configure
+        # went out never saw it, so the configure is re-sent (bounded).
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self._on_filter_timeout)
 
         bus.run_state_received.connect(self._on_run_state)
         bus.run_log_received.connect(self._on_run_log)
+        bus.pinger_filter_config_received.connect(self._on_filter_config)
         commands.set_before_terminate(self._stop_before_terminate)
 
     # ================================================================ lifecycle
@@ -132,12 +162,17 @@ class RunSession(QObject):
             use_pinger=bool(params.use_pinger),
             controller_type=params.controller_type or "PID",
             note=params.note,
+            pinger_mode=params.effective_pinger_mode(),
+            pinger_source=params.pinger_source,
+            pinger_preset=params.pinger_preset,
+            pinger_filter=params.pinger_filter,
         )
         self._reset_run_state()
         self._configure_seq = None
         self._configure_acked = False
         self._configure_tries = 0
         self._deployed_from = ""
+        self._store.reset_pinger_filter()
         self._store.mission.following = False
         # Never let a previous session's path be served (or drawn by the GCS)
         # before this session decides what its first run executes. The GPS
@@ -150,7 +185,8 @@ class RunSession(QObject):
         ss.active = False
         self._reset_run_state()
         self._store.mission.following = True
-        for timer in (self._ack_timer, self._configure_timer, self._log_timer):
+        for timer in (self._ack_timer, self._configure_timer, self._log_timer,
+                      self._filter_timer):
             timer.stop()
 
     def _reset_run_state(self) -> None:
@@ -165,6 +201,8 @@ class RunSession(QObject):
         ss.arrow_active = False
         ss.arrow_cmd = (0.0, 0.0)
         self._pending_seq = None
+        self._path_complete_seen = False
+        self._store.mission.path_complete = False
 
     def mark_deployed(self, source: str) -> None:
         """MainWindow's GPS watcher wrote *source* into the session file."""
@@ -181,16 +219,33 @@ class RunSession(QObject):
         self._configure_seq = seq
         self._configure_acked = False
         self._configure_tries += 1
+        kind = nxt.kind()
+        mission = nxt.name if kind == RUN_PATH else kind
+        block = nxt.pinger_filter or filter_block(
+            None, nxt.pinger_preset or self._cfg.pinger.default_preset)
         payload = {
             "cmd": "configure",
             "controller_type": nxt.controller_type,
-            "use_pinger": bool(nxt.use_pinger),
+            "use_pinger": nxt.pinger_mode == MODE_FOLLOW,   # alias, older Control
+            "pinger_mode": nxt.pinger_mode,
+            "has_path": nxt.has_path,
+            # The station only ever runs designer missions; master_control
+            # keeps its launch value when this is absent (a replanner launch
+            # would otherwise stay replanner-owned under a station session).
+            "path_source": "mission",
+            "pinger_source": nxt.pinger_source,
+            "pinger_filter": {"preset": str(block.get("preset") or ""),
+                              "params": dict(block.get("params") or {})},
             "note": sanitize_note(nxt.note),
-            "mission": "pinger" if nxt.use_pinger else nxt.name,
+            "mission": mission,
             "seq": seq,
         }
+        self._store.pinger_filter.mark_sent(seq, payload["pinger_filter"],
+                                            nxt.pinger_source)
         self._commands.send_run_command(payload)
         self._configure_timer.start(int(self._cfg.run.ack_timeout_s * 1000))
+        if nxt.pinger_mode != MODE_OFF:
+            self._filter_timer.start(int(self._cfg.run.ack_timeout_s * 1000))
 
     def update_mission(self, nxt: NextMission) -> None:
         """Update Mission confirmed: what the next run executes."""
@@ -206,11 +261,20 @@ class RunSession(QObject):
         self.preview_cleared.emit()
         self._deployed_from = ""
         self.session_file.unlink(missing_ok=True)
-        if not nxt.use_pinger and nxt.source and nxt.anchored:
+        if nxt.uses_path and nxt.anchored:
             self.deploy_requested.emit(nxt.source)
-        what = ("the USBL pinger" if nxt.use_pinger
-                else f"'{nxt.name}'" + (" (GPS)" if nxt.anchored
-                                        else " (placed at the boat at START RUN)"))
+        kind = nxt.kind()
+        if kind == RUN_PINGER:
+            what = "the USBL pinger"
+        elif kind == RUN_PINGER_LOG:
+            what = "no path, pinger logged only"
+        elif kind == RUN_NO_PATH:
+            what = "no path (Manual Target / arrow keys only)"
+        else:
+            what = f"'{nxt.name}'" + (" (GPS)" if nxt.anchored
+                                      else " (placed at the boat at START RUN)")
+            if nxt.logs_pinger:
+                what += ", pinger logged"
         self.message.emit(f"Next run: {what} with {nxt.controller_type}.", 8000)
 
     # ---------------------------------------------------------------- gating
@@ -235,27 +299,42 @@ class RunSession(QObject):
         reasons = []
         if not self._config_applied():
             reasons.append("mission settings not applied yet")
+        if nxt.pinger_mode != MODE_OFF and not s.pinger_filter.applied():
+            refusal = s.pinger_filter.refusal()
+            reasons.append("pinger filter configuration not applied yet"
+                           + (f" — refused: {refusal}" if refusal else ""))
         if self._commands.estop_latched:
             reasons.append("E-STOP latched — Release E-STOP first")
         elif not s.robot.controller_ready:
             reasons.append("robot not ready (override not confirmed)")
         if not s.robot.has_odom:
             reasons.append("no odometry")
-        if not nxt.use_pinger:
-            if not nxt.source:
-                reasons.append("no path chosen — Update Mission")
-            elif nxt.anchored and not (s.geo.is_valid
-                                       or self._deployed_from == nxt.source):
-                reasons.append("waiting for GPS to anchor the path")
+        # uses_path implies a source (NextMission.has_path).
+        if nxt.uses_path and nxt.anchored and not (s.geo.is_valid
+                                                   or self._deployed_from == nxt.source):
+            reasons.append("waiting for GPS to anchor the path")
         return reasons
 
     def _config_applied(self) -> bool:
+        """master_control echoes this configure's settings. Its pinger mode
+        must match (an older control stack without ``pinger_mode`` in its
+        run state can only run off / follow), and ``has_path`` /
+        ``path_source`` when it reports them."""
         st = self._store.session.state
         nxt = self._store.session.next
-        return (self._configure_acked
+        if not (self._configure_acked
                 and st.get("controller_type") == nxt.controller_type
-                and bool(st.get("use_pinger")) == bool(nxt.use_pinger)
-                and st.get("note", "") == sanitize_note(nxt.note))
+                and bool(st.get("use_pinger")) == (nxt.pinger_mode == MODE_FOLLOW)
+                and st.get("note", "") == sanitize_note(nxt.note)):
+            return False
+        if "pinger_mode" in st:
+            if st.get("pinger_mode") != nxt.pinger_mode:
+                return False
+        elif nxt.pinger_mode == MODE_LOG:
+            return False
+        if "has_path" in st and bool(st.get("has_path")) != nxt.has_path:
+            return False
+        return "path_source" not in st or st.get("path_source") == "mission"
 
     def can_update(self) -> bool:
         ss = self._store.session
@@ -278,7 +357,7 @@ class RunSession(QObject):
         s = self._store
         nxt = s.session.next
         dst = self.session_file
-        if not nxt.use_pinger:
+        if nxt.uses_path:
             from mcs.designer import io_yaml  # lazy: PyYAML machinery
             src = Path(nxt.source)
             try:
@@ -316,9 +395,12 @@ class RunSession(QObject):
         s.mission.following = True
         s.reset_experiment()           # the display now describes this run
         self.manual_target_cleared.emit()
+        self._send_safety_way_back(nxt)
         self._ack_timer.start(int(self._cfg.run.ack_timeout_s * 1000))
         self._log_timer.start(int(self._cfg.run.log_confirm_timeout_s * 1000))
-        if not nxt.use_pinger:
+        self._path_complete_seen = False
+        s.mission.path_complete = False
+        if nxt.uses_path:
             self.preview_requested.emit(f"from_yaml:{dst}")
         _LOG.info("START RUN sent (seq %d): %s", seq, nxt.summary())
         return True
@@ -341,7 +423,9 @@ class RunSession(QObject):
         self.manual_target_cleared.emit()
         self._log_timer.stop()
         self._ack_timer.start(int(self._cfg.run.ack_timeout_s * 1000))
-        if not ss.next.use_pinger and not ss.next.anchored:
+        self._store.mission.path_complete = False
+        self._clear_safety_way_back()     # a link loss retraces the trail again
+        if ss.next.uses_path and not ss.next.anchored:
             # A placed path belongs to the run that just ended: the next run
             # is placed afresh wherever the boat then is.
             self.preview_cleared.emit()
@@ -349,6 +433,32 @@ class RunSession(QObject):
             self.session_file.unlink(missing_ok=True)
         _LOG.info("STOP RUN sent (seq %d)", seq)
         return True
+
+    def _send_safety_way_back(self, nxt) -> None:
+        """(2026-11-25) Hand the run's safety way back to the link guardian.
+
+        Only a GPS-anchored path can carry one (lat/lon in its designer file). The
+        run is started WITHOUT waiting for it (owner: warn, start anyway): the
+        GUARDIAN box shows whether it is loaded, else a link loss retraces the
+        trail as before."""
+        points: list = []
+        if nxt.uses_path and nxt.anchored:
+            from mcs.designer import io_yaml  # lazy: PyYAML machinery
+            points = io_yaml.read_safety_way_back(Path(nxt.source)) or []
+        ss = self._store.session
+        if points:
+            ss.safety_way_back = list(points)
+            self._commands.send_guardian_command(
+                "safety_load", points=[[lat, lon] for lat, lon in points], run=nxt.name)
+            _LOG.info("Safety way back sent to the guardian: %d points", len(points))
+        else:
+            self._clear_safety_way_back()
+
+    def _clear_safety_way_back(self) -> None:
+        ss = self._store.session
+        if ss.safety_way_back:
+            ss.safety_way_back = []
+            self._commands.send_guardian_command("safety_clear")
 
     def _stop_before_terminate(self) -> None:
         """Turn Off Connection / app exit: a run still active is stopped first,
@@ -417,6 +527,17 @@ class RunSession(QObject):
         m = self._store.mission
         m.controller_type = str(payload.get("controller_type") or m.controller_type)
         m.use_pinger = bool(payload.get("use_pinger", m.use_pinger))
+        m.pinger_mode = str(payload.get("pinger_mode")
+                            or (MODE_FOLLOW if m.use_pinger else MODE_OFF))
+        m.has_path = bool(payload.get("has_path", True))
+        # A non-loop path has ended: the boat holds its final pose until STOP
+        # RUN (master_control's path_complete; said once per run).
+        complete = bool(payload.get("path_complete")) and ss.run_active
+        m.path_complete = complete
+        if complete and not self._path_complete_seen:
+            self._path_complete_seen = True
+            self.message.emit("Path complete — holding final pose (STOP RUN ends "
+                              "the run).", 10000)
 
     def _on_run_log(self, t: float, payload: dict) -> None:
         ss = self._store.session
@@ -451,6 +572,38 @@ class RunSession(QObject):
         else:
             self.message.emit("master_control does not acknowledge the mission "
                               "settings — check the launch console.", 10000)
+
+    def _on_filter_config(self, _t: float, payload: dict) -> None:
+        """The estimator refused this configure's pinger block: say so once
+        (the start blocker carries the reason too)."""
+        if not self._store.session.active:
+            return
+        seq = payload.get("seq")
+        if (seq is not None and seq == self._store.pinger_filter.sent_seq
+                and not payload.get("ok") and seq != self._filter_refusal_seq):
+            self._filter_refusal_seq = seq
+            self.message.emit("Pinger filter settings refused: "
+                              f"{payload.get('detail', '')}", 10000)
+
+    def _on_filter_timeout(self) -> None:
+        """No filter_config echo for the configure in force: re-send it while
+        between runs (bounded, shared with the configure retries)."""
+        ss = self._store.session
+        if (not ss.active or ss.next.pinger_mode == MODE_OFF
+                or self._store.pinger_filter.answered() or ss.run_in_progress):
+            return
+        if not self._configure_acked or ss.state.get("state") == "loading":
+            # master_control first (an MPC build refuses a configure); its own
+            # retries report a silent master_control.
+            if self._configure_tries < _CONFIGURE_RETRIES:
+                self._filter_timer.start(int(self._cfg.run.ack_timeout_s * 1000))
+            return
+        if self._configure_tries >= _CONFIGURE_RETRIES:
+            self.message.emit("pinger_estimator does not answer the pinger filter "
+                              "settings — check the launch console (is the control "
+                              "stack rebuilt?).", 10000)
+            return
+        self._send_configure()
 
     def _on_log_timeout(self) -> None:
         ss = self._store.session
@@ -534,4 +687,6 @@ class RunSession(QObject):
                          log=log_text, log_color=l_color,
                          bag=bag_text, bag_color=b_color,
                          running=ss.run_in_progress,
-                         pending=ss.run_pending)
+                         pending=ss.run_pending,
+                         path_complete=(fresh and ss.run_active
+                                        and bool(st.get("path_complete"))))

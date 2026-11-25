@@ -11,11 +11,19 @@ keeps segment settings attached to their origin.
 Undo/redo is snapshot-based: the window captures :meth:`to_dict` before each
 mutation; :meth:`from_dict` restores. Cheap, uniform, and immune to
 forgotten inverse operations.
+
+Two independent mission options (split 2026-11-24; one "loop" box used to
+drive both): ``close_path`` adds the closing leg last -> first to the sampled
+path (sampling only), ``repeat`` writes the runtime file's ``loop: true``
+(the control stack restarts the path forever). A model dict without either
+key (a ``.meta.yaml`` written before the split) migrates its single ``loop``
+to BOTH, so an old mission keeps its behaviour until it is re-saved.
 """
 
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -105,8 +113,14 @@ class MissionModel(QObject):
         self.name: str = ""
         self.comment: str = ""
         self.speed: float = 0.5
-        self.loop: bool = False
+        self.close_path: bool = False   # closing leg last -> first (sampling)
+        self.repeat: bool = False       # runtime loop: true (repeat forever)
         self.items: list[MissionItem] = []
+        # Safety way back (2026-11-25, GPS-anchored missions only): a second, hand-drawn
+        # polyline in the design frame. If the link to the boat is lost during a run of
+        # this mission, the link guardian follows it from the point closest to the boat
+        # to its LAST point, and holds there. Not part of the survey path or its samples.
+        self.safety_way_back: list[list[float]] = []
         self._uid = itertools.count(1)
 
     # ------------------------------------------------------------- queries
@@ -349,6 +363,33 @@ class MissionModel(QObject):
             w.y = a.y + u * (b.y - a.y)
         self.changed.emit()
 
+    # -------------------------------------------------- safety way back
+    def safety_length_m(self) -> float:
+        pts = self.safety_way_back
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in itertools.pairwise(pts))
+
+    def add_safety_point(self, x: float, y: float) -> int:
+        """Append a point to the safety way back; returns its index."""
+        self.safety_way_back.append([float(x), float(y)])
+        self.structure_changed.emit()
+        self.changed.emit()
+        return len(self.safety_way_back) - 1
+
+    def move_safety_point(self, i: int, x: float, y: float) -> None:
+        self.safety_way_back[i] = [float(x), float(y)]
+        self.changed.emit()
+
+    def remove_safety_points(self, indices) -> None:
+        drop = set(indices)
+        self.safety_way_back = [p for i, p in enumerate(self.safety_way_back) if i not in drop]
+        self.structure_changed.emit()
+        self.changed.emit()
+
+    def clear_safety_way_back(self) -> None:
+        self.safety_way_back = []
+        self.structure_changed.emit()
+        self.changed.emit()
+
     def align_to_start(self, origin: tuple[float, float],
                        angle: float) -> None:
         """Rigid-transform the WHOLE mission so that *origin* (the first
@@ -369,25 +410,41 @@ class MissionModel(QObject):
             dx, dy = wp.x - ox, wp.y - oy
             wp.x = c * dx - s * dy
             wp.y = s * dx + c * dy
+        for p in self.safety_way_back:       # moves with the mission (rigid transform)
+            dx, dy = p[0] - ox, p[1] - oy
+            p[0], p[1] = c * dx - s * dy, s * dx + c * dy
         self.changed.emit()
 
     # --------------------------------------------------------- serialization
     def to_dict(self) -> dict:
         return {"name": self.name, "comment": self.comment,
-                "speed": self.speed, "loop": self.loop,
-                "items": [it.to_dict() for it in self.items]}
+                "speed": self.speed, "close_path": self.close_path,
+                "repeat": self.repeat,
+                "items": [it.to_dict() for it in self.items],
+                "safety_way_back": [[round(x, 4), round(y, 4)]
+                                    for x, y in self.safety_way_back]}
 
     def from_dict(self, d: dict) -> None:
         self.name = d.get("name", "")
         self.comment = d.get("comment", "")
         self.speed = float(d.get("speed", 0.5))
-        self.loop = bool(d.get("loop", False))
+        if "close_path" in d or "repeat" in d:
+            self.close_path = bool(d.get("close_path", False))
+            self.repeat = bool(d.get("repeat", False))
+        else:
+            # Before 2026-11-24 one ``loop`` drove both the closing leg and
+            # the runtime repeat: an old file keeps exactly that behaviour.
+            legacy = bool(d.get("loop", False))
+            self.close_path = legacy
+            self.repeat = legacy
         self.items = []
         for it in d.get("items", []):
             if it.get("type") == "group":
                 self.items.append(PatternGroup.from_dict(it))
             else:
                 self.items.append(Waypoint.from_dict(it))
+        self.safety_way_back = [[float(p[0]), float(p[1])]
+                                for p in d.get("safety_way_back", []) or []]
         max_uid = max((it.uid for it in self.iter_all()), default=0)
         self._uid = itertools.count(max_uid + 1)
         self.structure_changed.emit()

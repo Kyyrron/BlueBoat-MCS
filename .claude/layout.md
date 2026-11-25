@@ -9,9 +9,9 @@
 | Package | Role |
 |---|---|
 | `config/settings.py` | **All** topics, thresholds, gains and paths (dataclasses; JSON overrides from `~/.config/blueboat_mcs/config.json`). |
-| `core/`, `models/` | No widgets, no rclpy (only `QObject` signals) — what makes the offline smoke test possible. `core/signals.py` (SignalBus), `geo.py` (GeoReferencer), `series.py` (TimeSeries), `clock.py` (the one elapsed-time format), `arrows.py` (arrow-key thrust law), `guardian.py` (GUARDIAN box rules), `replay.py` (bag folders, `/replay/state`), `sea.py` (sea-state model), `worlds.py` (SSS-Sim world-folder contract, reimplemented locally — never imported, CM-3), `sim_gps.py`, `los_predictor.py`. `models/store.py` is the DataStore. |
+| `core/`, `models/` | No widgets, no rclpy (only `QObject` signals) — what makes the offline smoke test possible. `core/signals.py` (SignalBus), `geo.py` (GeoReferencer), `series.py` (TimeSeries), `clock.py` (the one elapsed-time format), `arrows.py` (arrow-key thrust law), `guardian.py` (GUARDIAN box rules), `replay.py` (bag folders, `/replay/state`), `sea.py` (sea-state model), `worlds.py` (SSS-Sim world-folder contract, reimplemented locally — never imported, CM-3), `sim_gps.py`, `los_predictor.py`, `pinger_filter.py` ((2026-11-24) BlueBoat-Control's pinger filter schema `config/pinger_filter.yaml` read as DATA — never an import, N9 —, its validation rules, the parameter-file format, the pinger modes / sources / fix decisions). `models/store.py` is the DataStore (since 2026-11-24 also `PingerEstimate` = the filtered pinger verbatim, `PingerFilterState` = sent vs applied filter, legacy `PingerState`). |
 | `ros/` | `ros_manager` (the rclpy thread), `bridge_node` (**the only file that knows message types**), `launch_manager`, `command_center` (commands, E-STOP, safe shutdown), `run_session` (the station's half of a real-robot run session). |
-| `gui/` | `main_window` (composition root), panels, `map/`, `plot/`, `dialogs/`, and the boxes: `run_panel` (RUN), `guardian_box` (GUARDIAN), `arrow_box`, `replay_box`, `sea_state_box`, `mission_stats`. Shared widgets/helpers in `widgets.py` (incl. `elide_middle`) and `theme.py` (incl. `floating_box_style`). |
+| `gui/` | `main_window` (composition root), panels, `map/` (incl. `legend.py`, the pinger legend, 2026-11-24), `plot/`, `dialogs/` (incl. `pinger_filter_dialog.py`: `PingerForm`, the pinger rows shared by the Launch and Update Mission dialogs, and `PingerFilterDialog`, the schema-generated Advanced panel: a "Field tuning" tab of `TuningCard`s from the schema's `field_tuning` block, pictures beside the schema, and the "All parameters (expert)" tab), and the boxes: `run_panel` (RUN), `guardian_box` (GUARDIAN), `arrow_box`, `replay_box`, `sea_state_box`, `mission_stats`. Shared widgets/helpers in `widgets.py` (incl. `elide_middle`) and `theme.py` (incl. `floating_box_style`). |
 | `designer/` | Survey Pattern Designer — its own `CLAUDE.md`. |
 
 `ruff.toml` and `requirements-dev.txt` are gitignored. Control-stack code lives in the
@@ -64,8 +64,9 @@ intents (`target_clicked`, `point_inspected`) and never publishes.
   (`_publish_text` for String topics; keep the `_pub_lock` pattern and the `command_sent`
   emission), a semantic method on `CommandCenter`, called from the GUI.
 - **A map layer:** an item in `gui/map/map_items.py`, added in `MapView.__init__`, updated in
-  `MapView.refresh()`, a key in `MapView.set_layer_visible`, one `_LAYERS` entry in
-  `right_panel.py`.
+  `MapView.refresh()` (and hidden in its pre-anchor branch), a key in
+  `MapView.set_layer_visible`, one `_LAYERS` entry in `right_panel.py`. A pinger layer also
+  gets a line in `gui/map/legend.py` (`_LINES`) and a key in `MapView.pinger_layers()`.
 - **A plot:** follow `DistancePlot` (a `QWidget` over one `TimeSeries`, honouring
   `set_time_window`), in a `CollapsibleSection` of the right panel, refreshed from
   `RightPanel.refresh()`.
@@ -75,6 +76,10 @@ intents (`target_clicked`, `point_inspected`) and never publishes.
   `guardian_command` = real-robot link guardian, `perception_command`; held in
   `LaunchManager._companions`, signalled together by `stop()` / `_finalise()`), and
   `gui/dialogs/launch_dialog.py`. A per-run dialog setting that is not a launch argument
-  (like `perception_mode`) is its own row and its own field, ignored by `to_cli()`.
+  (like `perception_mode`, or the `pinger_filter` block that rides the session's
+  `configure`) is its own row and its own field, ignored by `to_cli()`. A launch-time file
+  (the custom pinger filter's `last_launch.yaml`) is written by `LaunchManager.start`
+  (`write_pinger_filter_file`), never by the dialog's `parameters()`, which stays free of
+  side effects for the smoke test.
 
 ---

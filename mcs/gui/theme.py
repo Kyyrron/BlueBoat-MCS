@@ -26,8 +26,20 @@ ESTOP = "#c93030"
 C_ROBOT = QColor("#2f81f7")
 C_ROBOT_TRACK = QColor("#2f81f7")
 C_MISSION_PATH = QColor("#3fb950")
-C_PINGER = QColor("#f0883e")
-C_PINGER_TRACK = QColor("#f0883e")
+# The pinger (2026-11-24): the LEGACY algorithm keeps the orange family it
+# always had; the FILTERED estimate is purple; raw fixes are coloured by the
+# filter's decision (pinger_filter.DECISIONS).
+C_PINGER = QColor("#f0883e")              # legacy pinger marker
+C_PINGER_TRACK = QColor("#f0883e")        # legacy pinger trail
+C_PINGER_FILTERED = QColor("#a371f7")     # filtered estimate marker
+C_PINGER_FILTERED_TRACK = QColor("#a371f7")
+C_PINGER_ELLIPSE = QColor("#a371f7")      # its 95 % uncertainty ellipse
+C_FIX_ACCEPTED = QColor(OK)
+C_FIX_DOWNWEIGHTED = QColor(WARN)
+C_FIX_SET_ASIDE = QColor(ERR)
+C_FIX_OTHER = QColor(TEXT_DIM)           # invalid, duplicate, initialising, reinit
+# The run's safety way back (designer and station map; 2026-11-25).
+C_SAFETY = QColor("#f0883e")
 C_TARGET_LINE = QColor("#e3b341")
 C_PREDICTED = QColor("#bc8cff")
 C_MANUAL_TARGET = QColor("#ff6b9d")
@@ -35,6 +47,13 @@ C_GRID = QColor(255, 255, 255, 22)
 C_GRID_MAJOR = QColor(255, 255, 255, 45)
 C_MEASURE = QColor("#56d4dd")
 
+
+
+def fix_color(code: int) -> QColor:
+    """Colour of a raw fix by its decision code (pinger_filter.decision_code:
+    0 accepted, 1 downweighted, 2 set_aside, anything else grey)."""
+    return {0: C_FIX_ACCEPTED, 1: C_FIX_DOWNWEIGHTED,
+            2: C_FIX_SET_ASIDE}.get(int(code), C_FIX_OTHER)
 
 
 def floating_box_style(object_name: str, border: str = "1px solid #555") -> str:

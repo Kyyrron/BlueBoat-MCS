@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mcs.core import pinger_filter as pf
+
 _LOG = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "blueboat_mcs"
@@ -35,6 +37,17 @@ class TopicsConfig:
     battery: str = "/mavros/battery"
     pinger_body: str = "/blueboat/pinger_coordinates"
     uw_gps_raw: str = "/uw_gps_data"
+    # The pinger pipeline (2026-11-24, BlueBoat-Control pinger_estimator):
+    # the legacy algorithm's body vector (always published, the LEGACY map
+    # layer), the filter's estimate (String JSON blueboat_pinger_estimate/1,
+    # WORLD frame, per fix + ~1 Hz heartbeat), every processed fix with the
+    # filter's decision (String JSON blueboat_pinger_fix/1, reliable depth 50)
+    # and the applied parameter set (String JSON, latched TRANSIENT_LOCAL
+    # depth 1, echoing the configure seq it answers).
+    pinger_legacy_body: str = "/blueboat/pinger/legacy_body"
+    pinger_estimate: str = "/blueboat/pinger/estimate"
+    pinger_fix: str = "/blueboat/pinger/fix"
+    pinger_filter_config: str = "/blueboat/pinger/filter_config"
     monitoring: str = "/monitoring_data"
     thruster_input: str = "/thruster_input"
     controller_ready: str = "/blueboat/controller_ready"
@@ -91,6 +104,14 @@ class DiagnosticsConfig:
         "/mavros/battery": 5.0,
         "/blueboat/pinger_coordinates": 1.0,
         "/uw_gps_data": 3.0,
+        "/blueboat/pinger/legacy_body": 1.0,
+        # The estimate is re-published at the filter's heartbeat_hz (1 Hz by
+        # default) between fixes: older than 3 s = the estimator is not
+        # answering (the PINGER panel says so too).
+        "/blueboat/pinger/estimate": 3.0,
+        "/blueboat/pinger/fix": 3.0,
+        # Latched, published once per change: a large age is normal.
+        "/blueboat/pinger/filter_config": 1.0e6,
         "/monitoring_data": 0.5,
         "/thruster_input": 0.5,
         "/blueboat/controller_ready": 30.0,
@@ -109,6 +130,9 @@ class DiagnosticsConfig:
         "/mavros/battery": 1.0,
         "/blueboat/pinger_coordinates": 20.0,
         "/uw_gps_data": 2.0,
+        "/blueboat/pinger/legacy_body": 20.0,
+        "/blueboat/pinger/estimate": 1.0,
+        "/blueboat/pinger/fix": 2.0,
         "/monitoring_data": 20.0,
         "/thruster_input": 20.0,
         "/sim/sea_state": 2.0,
@@ -201,6 +225,35 @@ class RunConfig:
     # A started run whose position log robot_interface has not confirmed by
     # then is flagged in the RUN box (field data would be missing).
     log_confirm_timeout_s: float = 3.0
+
+
+def _default_pinger_schema_checkout() -> str:
+    # BlueBoat-Control beside this repository in the superproject
+    # (<superproject>/BlueBoat-MCS/mcs/config/settings.py).
+    return str(Path(__file__).resolve().parents[3] / "BlueBoat-Control"
+               / "blueboat_control" / "config" / "pinger_filter.yaml")
+
+
+@dataclass
+class PingerConfig:
+    """USBL pinger (2026-11-24): the filter's parameter schema, saved
+    parameter sets and the dialogs' defaults.
+
+    The schema is DATA published by BlueBoat-Control
+    (``config/pinger_filter.yaml``, ``blueboat_pinger_filter/1``); the station
+    reads it with PyYAML and imports nothing from Control (N9). Located in
+    order: ``schema_file`` when set, the installed share of
+    ``blueboat_control`` (ament index), then ``schema_checkout`` (the
+    superproject's source tree)."""
+
+    schema_file: str = ""
+    schema_checkout: str = field(default_factory=_default_pinger_schema_checkout)
+    # Save / load directory of the Advanced panel's parameter files (created
+    # on demand); the launch writes a customised set here as last_launch.yaml
+    # for pinger_filter_yaml:=.
+    filter_dir: str = str(DEFAULT_CONFIG_DIR / "pinger_filter")
+    default_preset: str = pf.DEFAULT_PRESET
+    default_source: str = pf.SOURCE_FILTER
 
 
 @dataclass
@@ -456,6 +509,7 @@ class AppConfig:
     guardian: GuardianConfig = field(default_factory=GuardianConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     sim_speed: SimSpeedConfig = field(default_factory=SimSpeedConfig)
+    pinger: PingerConfig = field(default_factory=PingerConfig)
     estop_confirm_timeout_s: float = 2.0
     estop_flush_delay_s: float = 0.3
     # Safe shutdown: how long to wait for param_set's 'default' echo. Its

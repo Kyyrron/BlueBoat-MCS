@@ -5,8 +5,8 @@ A small application inside the Mission Control Station: file toolbar
 (add-waypoints mode, align / distribute, copy / paste / duplicate-offset,
 undo / redo), the interactive :class:`~mcs.designer.designer_map.
 DesignerMapView`, and a right column with the mission tree, the properties
-panel, the pattern library and the mission settings (speed / loop /
-comment).
+panel, the pattern library and the mission settings (speed, "Return to
+start", "Repeat forever", comment).
 
 Georeferencing is **always explicit**: **Set GPS Origin** takes typed
 coordinates, a Gazebo world's anchor, or a one-off snapshot of the robot's
@@ -25,7 +25,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -129,6 +129,7 @@ class DesignerWindow(QMainWindow):
         self.map.selection_changed.connect(self._on_map_selection)
         self.map.edit_started.connect(self._push_undo)
         self.map.point_added.connect(self._on_point_added)
+        self.map.safety_point_added.connect(self._on_safety_point_added)
         self.tree.selection_changed.connect(self._on_tree_selection)
         self.tree.action.connect(self._on_action)
         self.props.action.connect(self._on_action)
@@ -183,9 +184,24 @@ class DesignerWindow(QMainWindow):
         self._speed.setValue(self.model.speed)
         self._speed.valueChanged.connect(self._on_speed)
         form.addRow("Cruise speed (m/s)", self._speed)
-        self._loop = QCheckBox("Loop mission (close last → first)")
-        self._loop.toggled.connect(self._on_loop)
-        form.addRow("", self._loop)
+        # Two independent options (2026-11-24): one box used to add the
+        # closing leg AND make the control stack repeat the path forever.
+        self._close_path = QCheckBox("Return to start (close last → first)")
+        self._close_path.setToolTip(
+            "Adds a closing leg from the last waypoint back to the first one.\n"
+            "The mission still ENDS there (the boat holds that pose until STOP\n"
+            "RUN) unless 'Repeat forever' is also on.")
+        self._close_path.toggled.connect(self._on_close_path)
+        form.addRow("", self._close_path)
+        self._repeat = QCheckBox("Repeat forever")
+        self._repeat.setToolTip(
+            "Writes loop: true into the runtime file: when the path ends the\n"
+            "control stack restarts it from its first point, forever, until STOP\n"
+            "RUN. Off: the boat holds the final pose when the path ends.\n"
+            "Without 'Return to start' the restart jumps from the last point\n"
+            "back to the first. Off by default.")
+        self._repeat.toggled.connect(self._on_repeat)
+        form.addRow("", self._repeat)
         self._comment = QLineEdit()
         self._comment.setPlaceholderText("comment (stored in metadata)")
         self._comment.editingFinished.connect(self._on_comment)
@@ -238,7 +254,17 @@ class DesignerWindow(QMainWindow):
         edit = QToolBar("Edit")
         edit.setMovable(False)
         self.addToolBar(edit)
-        act(edit, "✚ Add Waypoints", self._toggle_add, "A", checkable=True)
+        self._add_act = act(edit, "✚ Add Waypoints", self._toggle_add, "A",
+                            checkable=True)
+        # Safety way back (2026-11-25): GPS-anchored missions only.
+        self._safety_act = act(edit, "✚ Safety way back", self._toggle_add_safety, "B",
+                               checkable=True)
+        self._safety_clear_act = act(edit, "Clear way back", self._clear_safety)
+        # The two click-to-add modes exclude each other (both may be off).
+        adding = QActionGroup(self)
+        adding.setExclusionPolicy(QActionGroup.ExclusionPolicy.ExclusiveOptional)
+        adding.addAction(self._add_act)
+        adding.addAction(self._safety_act)
         edit.addSeparator()
         act(edit, "Align ─", lambda: self._simple_edit(
             lambda: self.model.align(self._selection(), "y")), "Ctrl+Shift+H")
@@ -379,9 +405,13 @@ class DesignerWindow(QMainWindow):
             self._push_undo()
             new = self.model.duplicate(selection, offset=2.0)
             self.map.select_uids(set(new))
-        elif verb == "delete" and selection:
+        elif verb == "delete" and (selection or self.map.selected_safety_indices()):
             self._push_undo()
-            self.model.remove(selection)
+            safety = self.map.selected_safety_indices()
+            if safety:
+                self.model.remove_safety_points(safety)
+            if selection:
+                self.model.remove(selection)
         elif verb == "group" and selection:
             self._push_undo()
             self.model.group_selection(selection)
@@ -465,6 +495,49 @@ class DesignerWindow(QMainWindow):
         self._push_undo()
         self.model.add_waypoint(x, y)
 
+    # ---------------------------------------------------- safety way back
+    def _toggle_add_safety(self, checked: bool) -> None:
+        if checked and self._active_fit() is None:
+            self._safety_act.setChecked(False)
+            return
+        self.map.set_mode(EditMode.ADD_SAFETY if checked else EditMode.SELECT)
+        if checked:
+            self.statusBar().showMessage(
+                "Safety way back: click to add points in order, the LAST one is where "
+                "the boat holds · Shift = axis from previous · right-click to finish. "
+                "If the link is lost during a run of this mission, the boat joins this "
+                "line at its closest point and follows it to the end.", 12000)
+
+    def _on_safety_point_added(self, x: float, y: float) -> None:
+        if len(self.model.safety_way_back) >= io_yaml.SAFETY_MAX_POINTS:
+            self.statusBar().showMessage(
+                f"The safety way back is limited to {io_yaml.SAFETY_MAX_POINTS} points.",
+                6000)
+            return
+        self._push_undo()
+        self.model.add_safety_point(x, y)
+
+    def _clear_safety(self) -> None:
+        if not self.model.safety_way_back:
+            return
+        self._push_undo()
+        self.model.clear_safety_way_back()
+
+    def _update_safety_actions(self) -> None:
+        anchored = self._active_fit() is not None
+        self._safety_act.setEnabled(anchored)
+        self._safety_clear_act.setEnabled(bool(self.model.safety_way_back))
+        tip = ("Draw the safety way back: the route the boat follows by itself if the "
+               "link to the laptop is lost during a run of this mission (from its "
+               "point closest to the boat to its last point, where it holds).")
+        if not anchored:
+            tip += "\nOnly for GPS-anchored missions: set a GPS origin first."
+            if self._safety_act.isChecked():
+                # setChecked emits no `triggered`: leave the mode here too.
+                self._safety_act.setChecked(False)
+                self.map.set_mode(EditMode.SELECT)
+        self._safety_act.setToolTip(tip)
+
     def _on_pattern_requested(self, key: str) -> None:
         pattern = patterns.REGISTRY[key]
         center = self.map.mapToScene(self.map.viewport().rect().center())
@@ -500,11 +573,14 @@ class DesignerWindow(QMainWindow):
         self._speed.blockSignals(True)
         self._speed.setValue(self.model.speed)
         self._speed.blockSignals(False)
-        self._loop.blockSignals(True)
-        self._loop.setChecked(self.model.loop)
-        self._loop.blockSignals(False)
+        for box, value in ((self._close_path, self.model.close_path),
+                           (self._repeat, self.model.repeat)):
+            box.blockSignals(True)
+            box.setChecked(value)
+            box.blockSignals(False)
         if self._comment.text() != self.model.comment:
             self._comment.setText(self.model.comment)
+        self._update_safety_actions()
         self._schedule_resample()
         self._update_title()
 
@@ -516,9 +592,13 @@ class DesignerWindow(QMainWindow):
         self.map.update_preview(samples)
         self.map.refresh_labels()
         n = len(self.model.flatten())
+        safety = ""
+        if len(self.model.safety_way_back) >= 2:
+            safety = (f" · safety way back {len(self.model.safety_way_back)} pts, "
+                      f"{self.model.safety_length_m():.0f} m")
         self._stats.setText(
             f"{n} waypoints · {samples.length_m:.1f} m · "
-            f"{samples.duration_s:.0f} s @ {self.model.speed:.2f} m/s")
+            f"{samples.duration_s:.0f} s @ {self.model.speed:.2f} m/s{safety}")
 
     def _on_speed(self, value: float) -> None:
         self.model.speed = float(value)
@@ -526,9 +606,14 @@ class DesignerWindow(QMainWindow):
         self._schedule_resample()
         self._update_title()
 
-    def _on_loop(self, on: bool) -> None:
+    def _on_close_path(self, on: bool) -> None:
         self._push_undo()
-        self.model.loop = on
+        self.model.close_path = on
+        self.model.changed.emit()
+
+    def _on_repeat(self, on: bool) -> None:
+        self._push_undo()
+        self.model.repeat = on
         self.model.changed.emit()
 
     def _on_comment(self) -> None:
@@ -576,6 +661,7 @@ class DesignerWindow(QMainWindow):
         if fit is None:
             self._sat_box.setChecked(False)
         self._update_anchor_label(fit)
+        self._update_safety_actions()
         if center:
             self.map.centerOn(0.0, 0.0)
 
@@ -781,6 +867,9 @@ class DesignerWindow(QMainWindow):
         self._dirty = False
         self._update_title()
         anchored = " · GPS-anchored" if anchor is not None else ""
+        if len(self.model.safety_way_back) >= 2:
+            anchored += (" · safety way back saved" if anchor is not None else
+                         " · safety way back NOT used (mission not GPS-anchored)")
         self.statusBar().showMessage(
             f"Saved {path} ({len(samples.t)} samples, "
             f"{samples.length_m:.1f} m{anchored}) — available in Launch "

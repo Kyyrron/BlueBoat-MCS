@@ -12,9 +12,12 @@ Design notes
   under ``/clock`` in a simulation launch), giving one consistent clock
   across every source topic.
 * Derived quantities that already exist on a ROS topic are *not* recomputed
-  here (e.g. the current path target comes from ``/monitoring_data``).  The
-  only computations performed are pure display transforms: pinger body ->
-  world frame, distances, travelled-distance integration, speed statistics.
+  here (e.g. the current path target comes from ``/monitoring_data``, the
+  filtered pinger -- position, uncertainty, status, statistics -- from
+  ``/blueboat/pinger/estimate``, taken verbatim in its world frame).  The only
+  computations performed are pure display transforms: the LEGACY pinger body
+  vector -> world frame (N4), distances, travelled-distance integration,
+  speed statistics.
 * **Run sessions** (real-robot launches): histories record only
   while a RUN is active (:meth:`DataStore.recording`). Between runs the live
   state (boat glyph, pinger, target) keeps updating, but nothing is appended,
@@ -34,6 +37,16 @@ import numpy as np
 from mcs.config.settings import AppConfig
 from mcs.core.clock import station_clock
 from mcs.core.geo import GeoReferencer
+from mcs.core.pinger_filter import (
+    MODE_FOLLOW,
+    MODE_LOG,
+    MODE_OFF,
+    SOURCE_FILTER,
+    SOURCE_LEGACY,
+    decision_code,
+    effective_mode,
+    same_params,
+)
 from mcs.core.series import TimeSeries
 
 
@@ -47,8 +60,8 @@ class TargetMode(Enum):
     """What the boat is currently steering towards (drives the target panel/plot)."""
 
     NONE = "none"
-    PATH = "path"          # trajectory following (use_pinger = False)
-    PINGER = "pinger"      # pinger homing (use_pinger = True)
+    PATH = "path"          # trajectory following (pinger mode off, or log with a path)
+    PINGER = "pinger"      # pinger homing (pinger mode follow = use_pinger)
     MANUAL = "manual"      # operator manual target (overrides everything)
 
 
@@ -78,9 +91,25 @@ class RobotState:
     has_odom: bool = False
 
 
+#: NextMission.kind() values (also the configure's ``mission`` tag, but for a path).
+RUN_PINGER, RUN_PINGER_LOG, RUN_NO_PATH, RUN_PATH = "pinger", "pinger_log", "no_path", "path"
+
+
+def finite_float(value) -> float | None:
+    """A finite float, or None (JSON null / garbage / NaN)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 @dataclass
 class PingerState:
-    """Latest pinger snapshot (body frame from topic, world frame derived)."""
+    """The LEGACY pinger: the old algorithm's body vector
+    (``/blueboat/pinger/legacy_body``, "dragged by the boat between fixes"),
+    turned into world frame once per message (N4). Reset at every launch and
+    every run start."""
 
     t: float = 0.0
     body: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -91,12 +120,85 @@ class PingerState:
 
 
 @dataclass
+class PingerEstimate:
+    """The FILTERED pinger (2026-11-24): the latest
+    ``/blueboat/pinger/estimate`` (``blueboat_pinger_estimate/1``) and the
+    vector ``master_control`` steers to (``/blueboat/pinger_coordinates``).
+
+    ``world`` and ``ellipse`` are the estimate's own ``x, y`` and 95 %
+    ``ellipse`` -- WORLD frame (``/blueboat/odom`` local ENU) at the source,
+    taken verbatim: nothing here re-transforms them (N3/N4 spirit). Every
+    other number the panel shows (status, fix age and rate, r95, velocity,
+    decision statistics, range) is read from ``payload``. Reset at every
+    launch and every run start; the estimator's ~1 Hz heartbeat restores it."""
+
+    t: float | None = None                  # reception time of the last estimate
+    payload: dict = field(default_factory=dict)
+    world: tuple[float, float] | None = None
+    ellipse: tuple[float, float, float] | None = None   # a, b (m), theta (rad CCW from east)
+    body: tuple[float, float, float] | None = None      # /blueboat/pinger_coordinates
+    body_t: float | None = None
+
+    @property
+    def status(self) -> str:
+        return str(self.payload.get("status") or "no_data")
+
+    @property
+    def source(self) -> str:
+        """What /blueboat/pinger_coordinates carries: filter | legacy."""
+        return str(self.payload.get("source") or SOURCE_FILTER)
+
+
+@dataclass
+class PingerFilterState:
+    """The filter's applied parameter set (``/blueboat/pinger/filter_config``,
+    latched) against what the station last sent in a ``configure``.
+
+    *Applied* means the echo answers the sent ``seq``, says ``ok`` and holds
+    the sent parameters (and source). A refusal (``ok: false``) leaves the
+    previous set in force; its ``detail`` is the reason."""
+
+    echo: dict = field(default_factory=dict)
+    echo_t: float | None = None
+    sent_seq: int | None = None
+    sent_preset: str = ""
+    sent_params: dict = field(default_factory=dict)
+    sent_source: str = ""
+
+    def mark_sent(self, seq: int, block: dict | None, source: str) -> None:
+        self.sent_seq = seq
+        self.sent_preset = str((block or {}).get("preset") or "")
+        self.sent_params = dict((block or {}).get("params") or {})
+        self.sent_source = str(source or "")
+
+    def answered(self) -> bool:
+        return self.sent_seq is not None and self.echo.get("seq") == self.sent_seq
+
+    def refusal(self) -> str | None:
+        """The refusal reason when the echo of the sent seq says not ok."""
+        if self.answered() and not self.echo.get("ok"):
+            return str(self.echo.get("detail") or "refused")
+        return None
+
+    def applied(self) -> bool:
+        if not self.answered() or not self.echo.get("ok"):
+            return False
+        if self.sent_source and self.echo.get("pinger_source") != self.sent_source:
+            return False
+        return not self.sent_params or same_params(self.echo.get("params"),
+                                                   self.sent_params)
+
+
+@dataclass
 class MissionState:
     """Mission-level status assembled from launch config + telemetry."""
 
     launch_running: bool = False
     controller_type: str = ""
-    use_pinger: bool = False
+    use_pinger: bool = False                # pinger mode follow (Control's alias)
+    pinger_mode: str = MODE_OFF             # off | follow | log (run_state in a session)
+    has_path: bool = True                   # False: a run without a path (off / log)
+    path_complete: bool = False             # run_state: a non-loop path ended
     simulation: bool = False                # Sim_launch.py graph (no MAVROS/pinger)
     gps_simulated: bool = False             # sim run with a synthesised NavSatFix
                                             # feed (GPS-anchored mission): the full
@@ -122,7 +224,11 @@ class MissionState:
         if (not self.launch_running or self.controller_type == ""
                 or not self.following):
             return TargetMode.NONE
-        return TargetMode.PINGER if self.use_pinger else TargetMode.PATH
+        if self.use_pinger:
+            return TargetMode.PINGER
+        if not self.has_path:
+            return TargetMode.NONE          # no path: Manual Target / arrows only
+        return TargetMode.PATH
 
     def elapsed_s(self) -> float | None:
         if self.started_t is None:
@@ -133,17 +239,69 @@ class MissionState:
 
 @dataclass
 class NextMission:
-    """What the next run of a session executes (launch dialog / Update Mission)."""
+    """What the next run of a session executes (launch dialog / Update Mission).
 
-    source: str = ""                        # designer runtime YAML ("" = pinger)
+    ``pinger_mode`` (2026-11-24): ``off`` (no pinger following), ``follow``
+    (steer to the pinger, no path), ``log`` (log the pinger only). In ``off``
+    and ``log`` the run follows its path, or with no path -- ``source`` "",
+    the dialogs' "(no path)" -- it only holds manual targets and arrow keys. ``use_pinger`` is its alias for an older control stack
+    (= mode follow); a mission built with ``use_pinger`` alone gets the mode
+    from it. ``pinger_filter`` is the ``configure``'s ``{"preset", "params"}``
+    block, ``pinger_preset`` the preset it was built from."""
+
+    source: str = ""                        # designer runtime YAML ("" = no path)
     name: str = ""
     anchored: bool = False                  # source carries a geo_anchor
     use_pinger: bool = False
     controller_type: str = "PID"
     note: str = ""
+    pinger_mode: str = ""                   # "" = from use_pinger
+    pinger_source: str = SOURCE_FILTER
+    pinger_preset: str = ""
+    pinger_filter: dict | None = None
+
+    def __post_init__(self) -> None:
+        self.pinger_mode = effective_mode(self.pinger_mode, self.use_pinger)
+        self.use_pinger = self.pinger_mode == MODE_FOLLOW
+        if self.pinger_source not in (SOURCE_FILTER, SOURCE_LEGACY):
+            self.pinger_source = SOURCE_FILTER
+
+    @property
+    def has_path(self) -> bool:
+        """The configure's ``has_path``: False for off / log with no path
+        (following the pinger, the path means nothing: True, as Control's default)."""
+        return self.pinger_mode == MODE_FOLLOW or bool(self.source)
+
+    @property
+    def uses_path(self) -> bool:
+        """The run follows a designer path (its file is written at START RUN)."""
+        return self.pinger_mode != MODE_FOLLOW and self.has_path
+
+    def kind(self) -> str:
+        """What the run does, the one classification every description and
+        the configure's ``mission`` tag branch on: ``pinger`` (follow),
+        ``pinger_log`` / ``no_path`` (no path, pinger logged or not), or
+        ``path`` (a designer path; then :attr:`logs_pinger` may add the log)."""
+        if self.pinger_mode == MODE_FOLLOW:
+            return RUN_PINGER
+        if not self.source:
+            return RUN_PINGER_LOG if self.pinger_mode == MODE_LOG else RUN_NO_PATH
+        return RUN_PATH
+
+    @property
+    def logs_pinger(self) -> bool:
+        return self.pinger_mode == MODE_LOG
 
     def summary(self) -> str:
-        what = "USBL pinger" if self.use_pinger else (self.name or "no path")
+        kind = self.kind()
+        if kind == RUN_PINGER:
+            what = "USBL pinger"
+        elif kind == RUN_PINGER_LOG:
+            what = "pinger log only (no path)"
+        elif kind == RUN_NO_PATH:
+            what = "no path (Manual Target / arrows)"
+        else:
+            what = (self.name or "no path") + (" + pinger log" if self.logs_pinger else "")
         return f"{what} · {self.controller_type}"
 
 
@@ -168,6 +326,10 @@ class SessionState:
     log_t: float | None = None
     arrow_active: bool = False
     arrow_cmd: tuple[float, float] = (0.0, 0.0)   # (right, left) N
+    # (2026-11-25) The current run's safety way back, [(lat, lon), ...], as sent to the
+    # link guardian at START RUN ([] = none: a link loss retraces the trail). Drawn on
+    # the map while the guardian reports it loaded.
+    safety_way_back: list = field(default_factory=list)
 
     @property
     def run_in_progress(self) -> bool:
@@ -192,7 +354,9 @@ class DataStore:
 
     cfg: AppConfig
     robot: RobotState = field(default_factory=RobotState)
-    pinger: PingerState = field(default_factory=PingerState)
+    pinger: PingerState = field(default_factory=PingerState)          # legacy
+    pinger_est: PingerEstimate = field(default_factory=PingerEstimate)  # filtered
+    pinger_filter: PingerFilterState = field(default_factory=PingerFilterState)
     mission: MissionState = field(default_factory=MissionState)
     session: SessionState = field(default_factory=SessionState)
 
@@ -200,7 +364,9 @@ class DataStore:
         self.geo = GeoReferencer(self.cfg.geo)
         # Histories (t is monotonic reception time)
         self.robot_track = TimeSeries(dim=3)      # x, y, yaw
-        self.pinger_track = TimeSeries(dim=2)     # world x, y
+        self.pinger_track = TimeSeries(dim=2)     # legacy world x, y
+        self.pinger_est_track = TimeSeries(dim=2)  # filtered estimate x, y
+        self.pinger_fixes = TimeSeries(dim=3)      # world fix x, y, decision code
         self.speed_hist = TimeSeries(dim=1)
         self.thrust_hist = TimeSeries(dim=2)      # right, left
         self.target_dist_hist = TimeSeries(dim=1)  # robot<->active-target distance
@@ -296,13 +462,14 @@ class DataStore:
             self.robot.battery_pct = pct
 
     def on_pinger_body(self, t: float, xyz) -> None:
-        """Pinger message received: THIS is the only place the pinger's world
-        position is computed, using the robot pose concurrent with the
-        message (N4). Between messages the marker stays fixed in the world —
-        composing an older body-frame vector with newer robot poses would
-        drag the pinger along with the robot. Residual lag comes only from
-        the source (robot_interface: Waterlinked 'filaco' filtering +
-        dead-reckoning drift, see 03_ros_integration)."""
+        """LEGACY pinger vector received (``/blueboat/pinger/legacy_body``):
+        THIS is the only place a pinger world position is computed, using
+        the robot pose concurrent with the message (N4). Between messages
+        the marker stays fixed in the world — composing an older body-frame
+        vector with newer robot poses would drag the pinger along with the
+        robot. The legacy algorithm itself dead-reckons the vector between
+        fixes ("dragged by the boat"); that lag comes from the source. The
+        FILTERED pinger is never transformed here (on_pinger_estimate)."""
         p = self.pinger
         p.t = t
         p.body = (float(xyz[0]), float(xyz[1]), float(xyz[2]) if len(xyz) > 2 else 0.0)
@@ -324,6 +491,53 @@ class DataStore:
 
     def on_uw_gps_raw(self, t: float) -> None:
         self.pinger.last_raw_update_t = t
+
+    def on_pinger_coordinates(self, t: float, xyz) -> None:
+        """``/blueboat/pinger_coordinates``: the body vector master_control
+        steers to (filtered, zeros until the filter initialises; or legacy).
+        Stored for the read-out only."""
+        e = self.pinger_est
+        e.body = (float(xyz[0]), float(xyz[1]), float(xyz[2]) if len(xyz) > 2 else 0.0)
+        e.body_t = t
+
+    def on_pinger_estimate(self, t: float, payload: dict) -> None:
+        """``/blueboat/pinger/estimate``: position and 95 % ellipse taken
+        VERBATIM (world frame at the source -- no transform here); the
+        filtered track grows by one point at each new position."""
+        e = self.pinger_est
+        e.t = t
+        e.payload = payload
+        x, y = finite_float(payload.get("x")), finite_float(payload.get("y"))
+        if x is None or y is None:
+            e.world = None
+            e.ellipse = None
+            return
+        moved = e.world != (x, y)
+        e.world = (x, y)
+        e.ellipse = None
+        ell = payload.get("ellipse")
+        if isinstance(ell, dict):
+            a, b, th = finite_float(ell.get("a")), finite_float(ell.get("b")), finite_float(ell.get("theta"))
+            if a is not None and b is not None and th is not None:
+                e.ellipse = (a, b, th)
+        if moved and self.recording():
+            self.pinger_est_track.append(t, (x, y))
+
+    def on_pinger_fix(self, t: float, payload: dict) -> None:
+        """``/blueboat/pinger/fix``: one processed fix; its WORLD position (as
+        the estimator computed it) and its decision feed the raw-fix layer."""
+        w = payload.get("world")
+        if not isinstance(w, list | tuple) or len(w) < 2:
+            return
+        x, y = finite_float(w[0]), finite_float(w[1])
+        if x is None or y is None or not self.recording():
+            return
+        self.pinger_fixes.append(t, (x, y, float(decision_code(payload.get("decision")))))
+
+    def on_pinger_filter_config(self, t: float, payload: dict) -> None:
+        """``/blueboat/pinger/filter_config`` (latched): the applied set."""
+        self.pinger_filter.echo = payload
+        self.pinger_filter.echo_t = t
 
     def on_monitoring(self, t: float, data) -> None:
         # [t_ctrl, x, y, psi, x_d, y_d, psi_d, u1, u2]
@@ -367,17 +581,40 @@ class DataStore:
         if mode is TargetMode.MANUAL:
             return self.mission.manual_target
         if mode is TargetMode.PINGER:
-            return self.pinger.world
+            return self.pinger_target_world()
         if mode is TargetMode.PATH:
             return self.mission.path_target
         return None
 
+    def pinger_target_world(self) -> tuple[float, float] | None:
+        """Where a pinger-following run steers: the FILTERED estimate -- or
+        the legacy position when the estimator reports that
+        /blueboat/pinger_coordinates carries the legacy vector
+        (``pinger_source: legacy``)."""
+        if self.pinger_est.payload and self.pinger_est.source == SOURCE_LEGACY:
+            return self.pinger.world
+        return self.pinger_est.world
+
     def clear_tracks(self) -> None:
-        """Operator 'Clear Paths': wipe the robot and pinger trails drawn on
-        the map. Live states (poses, targets, stats, histories used by the
-        plots) are untouched."""
+        """Operator 'Clear Paths': wipe the robot and pinger trails (legacy,
+        filtered, raw fixes) drawn on the map. Live states (poses, targets,
+        stats, histories used by the plots) are untouched."""
         self.robot_track.clear()
         self.pinger_track.clear()
+        self.pinger_est_track.clear()
+        self.pinger_fixes.clear()
+
+    def reset_pinger(self) -> None:
+        """Forget every pinger snapshot and trail (each launch and each run
+        start): a previous launch's or run's pinger is never shown as live."""
+        self.pinger = PingerState()
+        self.pinger_est = PingerEstimate()
+        for series in (self.pinger_track, self.pinger_est_track, self.pinger_fixes):
+            series.clear()
+
+    def reset_pinger_filter(self) -> None:
+        """A new launch: no parameter set sent or applied yet."""
+        self.pinger_filter = PingerFilterState()
 
     def robot_true_heading(self) -> float | None:
         """Robot heading referenced to true north/east (CCW from east), or
@@ -457,10 +694,12 @@ class DataStore:
         return st
 
     def reset_experiment(self) -> None:
-        """Clear histories (called on new mission launch, on request)."""
-        for s in (self.robot_track, self.pinger_track, self.speed_hist,
+        """Clear histories (called on new mission launch and at START RUN).
+        The pinger snapshots go too (reset_pinger)."""
+        for s in (self.robot_track, self.speed_hist,
                   self.thrust_hist, self.target_dist_hist):
             s.clear()
+        self.reset_pinger()
         self.robot.travelled_m = 0.0
         self.mission.started_t = None
         self.mission.stopped_t = None

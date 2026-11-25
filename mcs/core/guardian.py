@@ -14,6 +14,13 @@ trail in reverse, and hands control back by itself on the first laptop
 heartbeat, so the run goes on: Take back control is only a fallback (an older
 script, or a hand-back that failed).
 
+Safety way back (2026-11-25): during a run of a GPS-anchored path that carries
+one, the station sends it with ``safety_load`` at START RUN (``safety_clear`` at
+STOP RUN); the companion uploads it to the autopilot and reports it in the
+status ``safety`` block (``{state: none|loading|ready|failed, n, run, detail}``).
+While it is ``ready`` a takeover follows it instead of the trail. The run is
+never held back for it (owner): a failure is shown, the trail is the fallback.
+
 Qt-free and rclpy-free, so the smoke test can pin every rule.
 """
 
@@ -47,6 +54,7 @@ class GuardianReadout:
     messages: list = field(default_factory=list)   # [{t, severity, text}]
     busy: str | None = None
     ack: dict | None = None                  # {seq, cmd, ok, detail, t}
+    safety: dict | None = None               # {state, n, run, detail} (2026-11-25)
 
     @classmethod
     def from_json(cls, payload: dict, received_mono: float | None = None
@@ -71,6 +79,8 @@ class GuardianReadout:
             messages=[m for m in msgs if isinstance(m, dict)] if isinstance(msgs, list) else [],
             busy=payload.get("busy") or None,
             ack=ack if isinstance(ack, dict) else None,
+            safety=(payload.get("safety") if isinstance(payload.get("safety"), dict)
+                    else None),
         )
 
     def fresh(self, now: float | None = None, max_age_s: float = STATUS_FRESH_S) -> bool:
@@ -84,6 +94,11 @@ class GuardianReadout:
     @property
     def ready(self) -> bool | None:
         return None if self.check is None else bool(self.check.get("ready"))
+
+    @property
+    def safety_state(self) -> str:
+        """'none' | 'loading' | 'ready' | 'failed' ('none' from an older companion)."""
+        return str((self.safety or {}).get("state") or "none")
 
     def check_items(self) -> list[dict]:
         items = (self.check or {}).get("items") or []
@@ -116,6 +131,7 @@ class GuardianView:
     toggle_on: bool                # the toggle would turn the guardian ON
     rearm: Action
     reclaim: Action
+    way_back: tuple[str, str] = ("—", "off")     # (2026-11-25) trail or safety way back
 
 
 def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found: bool,
@@ -170,13 +186,28 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
     else:
         home = ("not set yet (set when the autopilot arms)", "warn")
     messages = [str(m.get("text", "")) for m in (r.messages if reporting else [])][-3:]
+    safety = r.safety_state if r is not None else "none"
+    sinfo = (r.safety or {}) if r is not None else {}
+    # What a link loss makes the boat do (the state line's wording).
+    way = "follows the safety way back" if safety == "ready" else "retraces its path"
+    if not reporting:
+        way_back = ("—", "off")
+    elif safety == "ready":
+        way_back = (f"safety way back ({sinfo.get('n', '?')} pts) until STOP RUN", "ok")
+    elif safety == "loading":
+        way_back = ("loading the safety way back…", "info")
+    elif safety == "failed":
+        way_back = ((f"safety way back NOT loaded: {sinfo.get('detail') or '?'} "
+                     "— trail retrace instead"), "err")
+    else:
+        way_back = ("its own trail", "ok")
 
     # ---- state ------------------------------------------------------------
     if not companion_found:
         state, level = "UNAVAILABLE — guardian.py not found (see the config)", "err"
     elif not fcu_connected:
         if r is not None and r.guardian_on:
-            state, level = "LINK LOST — the boat retraces its path on its own", "err"
+            state, level = f"LINK LOST — the boat {way} on its own", "err"
         else:
             state, level = "Waiting for the boat to connect…", "info"
     elif not reporting:
@@ -194,10 +225,12 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
     elif armed and autonomous:
         state = f"TAKEN OVER — boat in {mode}; handing back… (else Take back control)"
         level = "err"
+    elif armed and safety == "failed":
+        state, level = ("ON — safety way back NOT loaded: retraces its trail instead",
+                        "warn")
     elif armed:
         timeout = (r.check or {}).get("timeout") or DEFAULT_TIMEOUT_S
-        state, level = (f"ON — retraces its path after {timeout:g} s without this laptop",
-                        "ok")
+        state, level = f"ON — {way} after {timeout:g} s without this laptop", "ok"
     else:
         state, level = "ON — autopilot disarmed: arms itself on link loss", "warn"
 
@@ -228,7 +261,8 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
     return GuardianView(state=state, level=level, link=link, autopilot=autopilot,
                         flag=flag, setup=setup, home=home, messages=messages,
                         check=check, setup_action=setup_action, toggle=toggle,
-                        toggle_on=toggle_on, rearm=rearm, reclaim=reclaim)
+                        toggle_on=toggle_on, rearm=rearm, reclaim=reclaim,
+                        way_back=way_back)
 
 
 def needs_turn_off_choice(r: GuardianReadout | None, *, real_session: bool,

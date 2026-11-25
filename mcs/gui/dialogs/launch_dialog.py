@@ -7,11 +7,19 @@ Two mission types, matching the two launch files of the stack:
   and runs are started and stopped from the station. The dialog chooses what
   the FIRST run executes — a designer path (built-in shapes are a simulation
   and CLI affair: a session places or deploys each run's path into one watched
-  file, which only designer files can feed) or the USBL pinger — plus
+  file, which only designer files can feed) — plus
   ``controller_type`` (PID / LoS / MPC: manual target and arrow keys go
   through ``master_control``, so a session always has one; MPC cannot follow
   the pinger), ``enable_motors`` and the log note. Update Mission changes all
   of that between runs (``mission_update_dialog.py``).
+  **Pinger** (2026-11-24, :class:`~mcs.gui.dialogs.pinger_filter_dialog.
+  PingerForm`, shared with Update Mission): *Off*, *Follow pinger (no path)*
+  (the path list is disabled, MPC greyed out) or *Log pinger only* (the path
+  list gains "(no path)"; any controller); the **Pinger source** (filtered /
+  legacy), the filter **preset** and **Advanced…** (every parameter). The
+  selected path's end is shown read-only from its file (repeats forever /
+  holds the final pose, and whether it returns to its start) — the designer
+  stays the place to change it. Hidden in simulation (no pinger in Gazebo).
 * **Gazebo simulation** — ``Sim_launch.py`` with ``robot_file``,
   ``trajectory``, ``controller_type``, ``note`` (and ``spawn_yaw`` for
   GPS-anchored missions). The simulation launch always starts
@@ -33,7 +41,10 @@ Two mission types, matching the two launch files of the stack:
   the operator picks a run folder (or its ``*-bag`` directory) and an initial
   playback rate, and the boat moves exactly as it did in the water — no
   controller, trajectory, robot file or note apply, and no sea state is asked
-  for (the recording already holds the real sea).
+  for (the recording already holds the real sea). **Re-estimate the pinger
+  with the current filter** (2026-11-24) adds ``pinger_estimator:=true`` and
+  shows the pinger source / filter rows; unchecked, the map shows the pinger
+  as the bag recorded it.
   **Session** (Gazebo + Controller only): *Normal session* or *Dataset
   creation* -- the mode BlueBoat-Perception runs in for a personalized-world
   run (``LaunchParameters.perception_mode``; the world is chosen after this
@@ -80,10 +91,12 @@ from PySide6.QtWidgets import (
 )
 
 from mcs.config.settings import AppConfig
+from mcs.core import pinger_filter as pf
 from mcs.core import replay as replay_core
 from mcs.core.sonar_variants import default_variant_dirs, list_variants
 from mcs.designer import io_yaml
 from mcs.gui import theme
+from mcs.gui.dialogs.pinger_filter_dialog import PingerForm
 from mcs.ros.launch_manager import (
     PERCEPTION_DATASET,
     PERCEPTION_NORMAL,
@@ -103,6 +116,11 @@ _SONAR_GEOMETRIC = "Geometric"
 _SONAR_RAYCAST = "Ray-cast"
 #: Item data of a ray-cast variant: "raycast|<profile path>" (2026-11-09).
 _VARIANT_SEP = "|"
+#: Item data of the path list's "(no path)" entry (pinger mode Off or Log).
+NO_PATH = "__no_path__"
+NO_PATH_LABEL = "(no path) — Manual Target / arrow keys only"
+NO_PATH_TIP = ("The run follows no path (has_path:=false): the boat holds Manual "
+               "Target / the arrow keys; in Log mode the pinger is logged too.")
 
 
 def slowdown_hint(rtf: float) -> str:
@@ -175,6 +193,21 @@ def custom_badge(cfg: AppConfig, path: Path, session: bool = False
                  "otherwise use Edit \u25b8 Align to Start in the Survey "
                  "Pattern Designer."))
     return ("", "")
+
+
+def path_end_text(cfg: AppConfig, path: Path) -> str:
+    """Read-only description of how a designer path ends, from its runtime
+    file: its ``loop`` flag (repeats forever / ends and holds the final pose)
+    and whether its last point returns to its first. Qt-free; "—" when the
+    file cannot be read."""
+    info = io_yaml.read_path_ending(Path(path), cfg.designer.start_align_tol_m)
+    if info is None:
+        return "—"
+    loop, returns = info
+    text = "repeats forever (loop: true)" if loop else "ends — holds the final pose"
+    if returns:
+        text += " · returns to start"
+    return text
 
 
 class LaunchDialog(QDialog):
@@ -257,19 +290,38 @@ class LaunchDialog(QDialog):
         self._controller = QComboBox()
         form.addRow("Controller type", self._controller)
 
+        # ---- Pinger (real robot; filter rows also for a re-estimated replay)
+        self._pinger = PingerForm(cfg, self)
+        self._pinger.add_mode_row(form)
+
         # Filled per mission type by _fill_trajectories: in simulation the
         # built-in shapes, then designer-generated missions under a 'custom
         # paths' section; on the real robot (a run session) designer missions
-        # only. Each custom entry carries the runtime YAML path as item data.
+        # only, plus "(no path)" unless following the pinger. Each custom entry carries
+        # the runtime YAML path as item data.
         self._trajectory = QComboBox()
         self._customs = list_custom_paths(cfg)
         form.addRow("Trajectory", self._trajectory)
+        # How the selected path ends, read from its file (read-only).
+        self._path_end = QLabel("—")
+        self._path_end.setToolTip(
+            "From the path's runtime file: loop: true repeats it forever, false "
+            "ends it and the boat holds the final pose. Change it in the Survey "
+            "Pattern Designer ('Repeat forever', 'Return to start').")
+        form.addRow("Path end", self._path_end)
+        self._trajectory.currentIndexChanged.connect(lambda _i: self._refresh_path_end())
 
-        # ---- Real-robot-only fields ----------------------------------------------
-        self._use_pinger = QCheckBox("Steer towards the USBL pinger (no path)")
-        self._use_pinger.toggled.connect(self._on_pinger_toggled)
-        self._use_pinger_label = QLabel("Use pinger")
-        form.addRow(self._use_pinger_label, self._use_pinger)
+        self._pinger.add_filter_rows(form)
+        self._pinger.mode_changed.connect(self._on_pinger_mode_changed)
+        self._replay_estimator = QCheckBox("Re-estimate the pinger with the current filter")
+        self._replay_estimator.setToolTip(
+            "Replay_launch.py pinger_estimator:=true — the pinger is estimated again "
+            "from the recorded USBL fixes with the filter chosen below (the bag's own "
+            "pinger outputs move to /replay/*). Unchecked: the map shows the pinger "
+            "exactly as the bag recorded it.")
+        self._replay_estimator.toggled.connect(
+            lambda _on: self._on_mode_changed(self._mode.currentText()))
+        form.addRow("Pinger replay", self._replay_estimator)
 
         self._enable_motors = QCheckBox("ENABLE MOTORS — real thrust will be applied")
         self._enable_motors.setStyleSheet(f"color: {theme.WARN}; font-weight: bold;")
@@ -385,11 +437,22 @@ class LaunchDialog(QDialog):
         # ---- Restore last parameters ------------------------------------------------
         self._fill_trajectories(sim=False)
         if last is not None:
+            # The pinger first: the real-robot path list depends on its mode.
+            self._pinger.mode.blockSignals(True)
+            self._pinger.set_mode(pf.MODE_OFF if last.simulation and not last.replay_bag
+                                  else last.effective_pinger_mode())
+            self._pinger.mode.blockSignals(False)
+            self._pinger.set_source(last.pinger_source)
+            self._pinger.restore(last.pinger_preset, last.pinger_filter)
+            self._replay_estimator.setChecked(last.replay_pinger_estimator)
             self._mode.setCurrentText(_SIM if last.simulation else _REAL)
             self._fill_trajectories(sim=last.simulation)
             if last.session:
                 restore = last.gps_anchored_source or last.session_source
                 idx = self._trajectory.findData(restore) if restore else -1
+                if (idx < 0 and last.effective_pinger_mode() != pf.MODE_FOLLOW
+                        and not last.has_path):
+                    idx = self._trajectory.findData(NO_PATH)
                 if idx >= 0:
                     self._trajectory.setCurrentIndex(idx)
             elif last.trajectory.startswith("from_yaml:"):
@@ -399,7 +462,6 @@ class LaunchDialog(QDialog):
                     self._trajectory.setCurrentIndex(idx)
             else:
                 self._trajectory.setCurrentText(last.trajectory)
-            self._use_pinger.setChecked(last.use_pinger)
             self._enable_motors.setChecked(False)  # always re-confirm motors
             self._note.setText(last.note)
             self._robot_file.setCurrentText(last.robot_file)
@@ -437,6 +499,10 @@ class LaunchDialog(QDialog):
         keep_data, keep_text = combo.currentData(), combo.currentText()
         combo.blockSignals(True)
         combo.clear()
+        if not sim and self._pinger.mode_value() != pf.MODE_FOLLOW:
+            # Pinger Off or Log: a run may also follow no path at all.
+            combo.addItem(NO_PATH_LABEL, NO_PATH)
+            combo.setItemData(0, NO_PATH_TIP, Qt.ItemDataRole.ToolTipRole)
         if sim:
             combo.addItems(self._cfg.launch.trajectories)
             if self._customs:
@@ -453,11 +519,24 @@ class LaunchDialog(QDialog):
         if not sim and not self._customs:
             combo.addItem("(no designer path yet — create one, or follow "
                           "the pinger)")
-            combo.model().item(0).setEnabled(False)
+            combo.model().item(combo.count() - 1).setEnabled(False)
         idx = combo.findData(keep_data) if keep_data else combo.findText(keep_text)
+        if idx < 0 and combo.itemData(0) == NO_PATH and combo.count() > 1 \
+                and combo.model().item(1).isEnabled():
+            idx = 1                 # nothing kept: the first designer path, not "(no path)"
         if idx >= 0:
             combo.setCurrentIndex(idx)
         combo.blockSignals(False)
+        self._refresh_path_end()
+
+    def _refresh_path_end(self) -> None:
+        data = self._trajectory.currentData()
+        if data == NO_PATH:
+            self._path_end.setText("no path")
+        elif data:
+            self._path_end.setText(path_end_text(self._cfg, Path(str(data))))
+        else:
+            self._path_end.setText("—")
 
     def _replaying(self) -> bool:
         return (self._mode.currentText() == _SIM
@@ -488,14 +567,15 @@ class LaunchDialog(QDialog):
                 "it between runs. MPC cannot follow the pinger.")
         self._gate_mpc()
         # Field gating
-        for w in (self._use_pinger, self._use_pinger_label,
-                  self._enable_motors, self._motors_label):
+        for w in (self._enable_motors, self._motors_label):
             w.setVisible(not sim)
         for w in (self._robot_file, self._robot_file_label):
             w.setVisible(sim)
-        self._trajectory.setEnabled(sim or not self._use_pinger.isChecked())
+        self._trajectory.setEnabled(sim or self._pinger.mode_value() != pf.MODE_FOLLOW)
         # Gazebo source: a replay takes no controller, path, robot or note.
         replay = self._replaying()
+        self._gate_pinger_rows()
+        self._set_row_visible(self._replay_estimator, replay)
         for w in (self._source, self._source_label):
             w.setVisible(sim)
         for w in (self._bag_row, self._bag_label, self._bag_info,
@@ -504,6 +584,7 @@ class LaunchDialog(QDialog):
             w.setVisible(replay)
         for w in (self._controller, self._trajectory, self._note):
             self._set_row_visible(w, not replay)
+        self._set_row_visible(self._path_end, not replay)
         self._set_row_visible(self._robot_file, sim and not replay)
         self._set_row_visible(self._session, sim and not replay)
         self._set_row_visible(self._sonar_model, sim and not replay)
@@ -512,9 +593,13 @@ class LaunchDialog(QDialog):
                        else self._cfg.launch.launch_file)
         if replay:
             launch_file = self._cfg.launch.replay_launch_file
+        pinger_note = ("the pinger is re-estimated with the filter below"
+                       if self._replay_estimator.isChecked() else "pinger")
         extra = ("Replay: the boat follows the recording exactly (pose, "
-                 "attitude, GPS, speed); targets, thrust and pinger are shown "
-                 "as recorded. No controller and no sea state — wind, current "
+                 "attitude, GPS, speed); targets, thrust and "
+                 + ("pinger are shown as recorded" if pinger_note == "pinger"
+                    else f"are shown as recorded, {pinger_note}")
+                 + ". No controller and no sea state — wind, current "
                  "and waves cannot move it." if replay else
                  "Simulation graph: Gazebo world + simulation_interface — no "
                  "MAVROS, no pinger, no param_set (shutdown acknowledgement "
@@ -547,17 +632,33 @@ class LaunchDialog(QDialog):
         self._hint.setText(hint)
         self.adjustSize()
 
-    def _on_pinger_toggled(self, on: bool) -> None:
-        # Following the pinger, the path list means nothing.
+    def _on_pinger_mode_changed(self, mode: str) -> None:
+        """Following the pinger, the path list means nothing; otherwise it
+        offers "(no path)" too. Source and filter only with the pinger on."""
         if self._mode.currentText() == _REAL:
-            self._trajectory.setEnabled(not on)
+            self._fill_trajectories(sim=False)
+            self._trajectory.setEnabled(mode != pf.MODE_FOLLOW)
         self._gate_mpc()
+        self._gate_pinger_rows()
+        self.adjustSize()
+
+    def _gate_pinger_rows(self) -> None:
+        """No pinger exists in a Gazebo graph. On the real robot the source
+        and filter rows show only when the pinger is not Off; a replay may
+        re-estimate the recorded pinger with the filter chosen here."""
+        sim = self._mode.currentText() == _SIM
+        replay = self._replaying()
+        self._pinger.set_rows_visible(
+            self._form, mode=not sim,
+            filt=((not sim and self._pinger.mode_value() != pf.MODE_OFF)
+                  or (replay and self._replay_estimator.isChecked())))
 
     def _gate_mpc(self) -> None:
         """MPC cannot follow the pinger (master_control's pinger branch is
-        PID / LoS only): grey it out, and leave it if it was selected."""
+        PID / LoS only): grey it out in Follow mode only, and leave it if it
+        was selected. Off and Log run any controller."""
         pinger = (self._mode.currentText() == _REAL
-                  and self._use_pinger.isChecked())
+                  and self._pinger.mode_value() == pf.MODE_FOLLOW)
         idx = self._controller.findText("MPC")
         if idx >= 0:
             self._controller.model().item(idx).setEnabled(not pinger)
@@ -648,14 +749,19 @@ class LaunchDialog(QDialog):
                 replay_rate=float(self._rate.currentData() or 1.0),
                 replay_placement="origin" if self._replay_origin.isChecked() else "gps",
                 extra_args=extra,
+                replay_pinger_estimator=self._replay_estimator.isChecked(),
+                pinger_source=self._pinger.source_value(),
+                pinger_preset=self._pinger.preset_value(),
+                pinger_filter=self._pinger.filter_block(),
             )
         custom = self._trajectory.currentData()
         gps_src = gps_dst = ""
         if not sim:
             # Real robot = run session: path_generation always watches the
             # session file; the station writes each run's path into it.
-            pinger = self._use_pinger.isChecked()
-            source = "" if (pinger or not custom) else str(custom)
+            mode = self._pinger.mode_value()
+            source = ("" if (mode == pf.MODE_FOLLOW or not custom or custom == NO_PATH)
+                      else str(custom))
             session_file = self._cfg.launch.session_trajectory_file
             if source and io_yaml.read_geo_anchor(Path(source)) is not None:
                 gps_src, gps_dst = source, session_file
@@ -664,7 +770,7 @@ class LaunchDialog(QDialog):
                 note=self._note.text().strip(),
                 controller_type=self._controller.currentText() or "PID",
                 trajectory=f"from_yaml:{session_file}",
-                use_pinger=pinger,
+                use_pinger=mode == pf.MODE_FOLLOW,
                 simulation=False,
                 robot_file=self._robot_file.currentText().strip() or "thrusters_ur",
                 gps_anchored_source=gps_src,
@@ -672,6 +778,11 @@ class LaunchDialog(QDialog):
                 session=True,
                 session_source=source,
                 extra_args=extra,
+                pinger_mode=mode,
+                has_path=mode == pf.MODE_FOLLOW or bool(source),
+                pinger_source=self._pinger.source_value(),
+                pinger_preset=self._pinger.preset_value(),
+                pinger_filter=self._pinger.filter_block(),
             )
         # Gazebo simulation.
         gps_simulated = False

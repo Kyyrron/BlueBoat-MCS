@@ -56,7 +56,7 @@ def default_variant_dirs(extra: list[str] | tuple[str, ...] = ()) -> list[Path]:
     try:
         from ament_index_python.packages import get_package_share_directory
         dirs.append(Path(get_package_share_directory(SIM_PACKAGE)) / "config")
-    except Exception:  # noqa: BLE001 -- no sourced workspace: the checkout only
+    except Exception:  # noqa: BLE001, S110 -- no sourced workspace: the checkout only
         pass
     # <superproject>/BlueBoat-MCS/mcs/core/sonar_variants.py
     dirs.append(Path(__file__).resolve().parents[3] / "BlueBoat-SSS-Sim"

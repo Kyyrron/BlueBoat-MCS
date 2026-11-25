@@ -27,12 +27,16 @@ One scene regime, GPS-frame-only (`gui/map/map_view.py`); the authoritative desc
 
 Full guidance in **`mcs/designer/CLAUDE.md`**. Files in `~/.config/blueboat_mcs/trajectories/`:
 `<name>.yaml` (runtime `blueboat_trajectory/1`, read by `path_generation`, the World Builder
-and the GCS), `<name>.meta.yaml` (editor only), `.deployed/<name>.yaml` (regenerated each
+and the GCS; its `loop` comes from the designer's **Repeat forever** only, the closing leg
+from **Return to start** is in the samples — split 2026-11-24, `mcs/designer/CLAUDE.md`),
+`<name>.meta.yaml` (editor only; `close_path`, `repeat`; an old single `loop` migrates to
+both), `.deployed/<name>.yaml` (regenerated each
 launch of a GPS-anchored mission), `.session/run.yaml` (the run session's watched file) —
 never hand-edit the last two. Format contract: `docs/05_trajectory_format.md`. **The designer
 reads no live telemetry.** Other state: `~/.config/blueboat_mcs/config.json`,
 `tile_cache/` (disposable), `launch_cwd/` (the launch tree's working directory, so tools that
-write relative paths never write into this repository).
+write relative paths never write into this repository), `pinger_filter/` ((2026-11-24) the
+Advanced panel's saved parameter sets, and `last_launch.yaml`, a launch's custom set).
 
 ---
 
@@ -45,15 +49,20 @@ Trajectory selection needs no launch-file change: `trajectory:=from_yaml:/abs/pa
 |---|---|
 | `src/_custom_libraries/path_generation.py` | The `from_yaml` branch + a file **watcher** that reloads on change, holding a station-keeping pose until the file appears (deferred GPS deployment, run sessions). |
 | `src/_custom_libraries/yaml_trajectory.py` | Loads `blueboat_trajectory/1` and evaluates at `t` (PyYAML + numpy). |
-| `src/master_control.py` | World-frame `/monitoring_data` target in every branch (N3); 20 Hz loop (`control_dt`); run session (`session_mode`: idle until `start`, `configure` between runs, one `.npy` per run, `/blueboat/run_state`); arrow keys (highest-priority branch, `arrow_timeout`). |
-| `src/robot_interaction/robot_interface.py` | Producer of odom / pinger / `controller_ready`; CSV logging (one CSV per run in a session, reported on `/blueboat/run_log`). |
+| `src/master_control.py` | World-frame `/monitoring_data` target in every branch (N3); 20 Hz loop (`control_dt`); run session (`session_mode`: idle until `start`, `configure` between runs, one `.npy` per run, `/blueboat/run_state`); arrow keys (highest-priority branch, `arrow_timeout`). (2026-11-24) `configure`'s `pinger_mode` / `has_path` / `path_source`, and `run_state`'s `pinger_mode`, `has_path`, `path_complete`. |
+| `src/robot_interaction/robot_interface.py` | Producer of odom / `controller_ready`; CSV logging (one CSV per run in a session, reported on `/blueboat/run_log`; layout `pinger_log` in log mode since 2026-11-24). |
+| `src/robot_interaction/pinger_estimator.py` | (2026-11-24) The one publisher of `/blueboat/pinger_coordinates` and `/blueboat/pinger/*` (legacy body, estimate, fix, filter_config); answers a `configure`'s pinger block on `filter_config` with its `seq`. |
+| `config/pinger_filter.yaml` | (2026-11-24) The filter's parameter schema and presets: DATA the station reads (`core/pinger_filter.py`) to build the Advanced panel and validate it. |
 | `src/_custom_libraries/robot_log_schema.py` | The position-CSV layouts written by `robot_interface` (real) and `simulation_interface` (Gazebo), `columns_for(use_UWgps)`; `target_*` only in the no-pinger layout. Read this, not the nodes, to learn the CSV format. |
 
 **Behaviours the station does not compensate for.** Point-LoS arrival checking is the pinger
 branch's alone: `safety_distance` is `-1.0` (off) on the real boat, `+1.0` in simulation; when
 positive, `stopping_sequence` latches on arrival and the boat brakes with nothing on screen
-saying why. A manual target has its own arrival state (`manual_keep_location`). Pinger-marker
-lag is inherent to the source (§2); N4 only keeps it from also dragging.
+saying why. A manual target has its own arrival state (`manual_keep_location`). The legacy
+pinger marker's lag is inherent to the legacy algorithm (dead-reckoned by the boat between
+fixes); N4 only keeps it from also dragging. The filtered marker is drawn where
+`/blueboat/pinger/estimate` puts it. A path with `loop: false` ends and holds its final pose
+(`path_complete`); the station only reports it.
 
 **⚠ What runs is `~/ros2_ws/install/`, refreshed only by `colcon build`.** A stale install can
 publish the pre-2026-08-31 hybrid odom frame (launch-relative yaw) and silently break the map
