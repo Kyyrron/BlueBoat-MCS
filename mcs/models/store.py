@@ -330,6 +330,10 @@ class SessionState:
     # link guardian at START RUN ([] = none: a link loss retraces the trail). Drawn on
     # the map while the guardian reports it loaded.
     safety_way_back: list = field(default_factory=list)
+    # (2026-11-26) The way back of the path the map shows before its run starts (the next
+    # run's GPS-anchored path, or a Gazebo launch's): drawn like the designer, so a path's
+    # way back is visible whenever the path is. [] = none.
+    planned_safety_way_back: list = field(default_factory=list)
 
     @property
     def run_in_progress(self) -> bool:

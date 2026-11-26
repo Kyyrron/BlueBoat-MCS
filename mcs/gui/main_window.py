@@ -358,6 +358,12 @@ class MainWindow(QMainWindow):
         if params.session:
             # Real robot = run session: connect, idle, runs by hand.
             self.run_session.begin(params)
+        else:
+            # (2026-11-26) A Gazebo launch of a GPS-anchored path: its safety way back
+            # is drawn too (no guardian in a simulation: display only).
+            self.run_session.plan_safety_way_back(
+                params.gps_anchored_source if params.has_path else "",
+                bool(params.gps_anchored_source))
             self._status.showMessage(
                 "Run session: the boat connects and goes into override but does "
                 "not move or log until START RUN. Drive it with Manual Target "

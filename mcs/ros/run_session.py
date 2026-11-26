@@ -174,6 +174,7 @@ class RunSession(QObject):
         self._deployed_from = ""
         self._store.reset_pinger_filter()
         self._store.mission.following = False
+        self.plan_safety_way_back(source if ss.next.uses_path else "", ss.next.anchored)
         # Never let a previous session's path be served (or drawn by the GCS)
         # before this session decides what its first run executes. The GPS
         # deployment watcher unlinks it too for an anchored first mission.
@@ -184,6 +185,7 @@ class RunSession(QObject):
         ss = self._store.session
         ss.active = False
         self._reset_run_state()
+        ss.planned_safety_way_back = []
         self._store.mission.following = True
         for timer in (self._ack_timer, self._configure_timer, self._log_timer,
                       self._filter_timer):
@@ -256,6 +258,7 @@ class RunSession(QObject):
         ss.next = nxt
         self._configure_tries = 0
         self._send_configure()
+        self.plan_safety_way_back(nxt.source if nxt.uses_path else "", nxt.anchored)
 
         # The map preview must describe the next run, never the last one.
         self.preview_cleared.emit()
@@ -453,6 +456,16 @@ class RunSession(QObject):
             _LOG.info("Safety way back sent to the guardian: %d points", len(points))
         else:
             self._clear_safety_way_back()
+
+    def plan_safety_way_back(self, source: str, anchored: bool) -> None:
+        """(2026-11-26) The way back of the path the map shows next, drawn before its
+        run starts (a GPS-anchored designer file only; "" clears it). Display only:
+        the guardian gets it at START RUN (``_send_safety_way_back``)."""
+        points: list = []
+        if source and anchored:
+            from mcs.designer import io_yaml  # lazy: PyYAML machinery
+            points = io_yaml.read_safety_way_back(Path(source)) or []
+        self._store.session.planned_safety_way_back = list(points)
 
     def _clear_safety_way_back(self) -> None:
         ss = self._store.session

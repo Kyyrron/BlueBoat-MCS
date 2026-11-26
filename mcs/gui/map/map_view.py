@@ -26,7 +26,8 @@ Provides:
   (2026-11-24: FILTERED estimate position + track + 95 % ellipse, straight
   from ``/blueboat/pinger/estimate``; LEGACY position + track; raw fixes
   coloured by the filter's decision) with a small pinger legend,
-  robot↔target line, metric grid;
+  robot↔target line, metric grid, the path's safety way back and the link
+  guardian's Guardian Home (2026-11-26, each its own layer);
 * a click inspector (world + GPS coordinates + live distance to robot);
 * the Distance Tool (two-click measurement, ported from the SSS viewer);
 * the Manual Target tool (publishes ``/blueboat/manual_target``, highlights
@@ -55,6 +56,7 @@ from PySide6.QtWidgets import (
 
 from mcs.config.settings import AppConfig
 from mcs.core.geo import latlon_to_local_en
+from mcs.core.guardian import guardian_home_point
 from mcs.core.los_predictor import predict_los_path
 from mcs.gui import theme
 from mcs.gui.map.legend import PingerLegend
@@ -68,6 +70,7 @@ from mcs.gui.map.map_items import (
     RobotItem,
     StartMarkerItem,
     TargetLineItem,
+    VertexDotsItem,
     draw_grid,
     draw_north_indicator,
     draw_scale_bar,
@@ -141,15 +144,20 @@ class MapView(QGraphicsView):
         self.pinger_fixes = FixPointsItem(z=17)
         self.manual_marker = CrosshairItem(theme.C_MANUAL_TARGET)
         self.click_marker = MarkerItem(QColor(theme.C_MEASURE), 4.0, "", z=41)
-        # (2026-11-25) The run's safety way back (sent to the link guardian at
-        # START RUN), dashed orange, its last point marked LOITER. Shown with the
-        # mission-path layer; placed from lat/lon in the scene's east/north.
+        # (2026-11-25) The safety way back, dashed orange with its points, its last
+        # point marked LOITER, as in the designer; placed from lat/lon in the scene's
+        # east/north. (2026-11-26) Its own layer, and drawn whenever its path is the
+        # mission shown: the running run's (sent to the guardian at START RUN), else
+        # the next run's / a Gazebo launch's (SessionState.planned_safety_way_back).
         self.safety_path = PolylineItem(theme.C_SAFETY, 2.0, Qt.PenStyle.DashLine, z=21)
+        self.safety_points = VertexDotsItem(theme.C_SAFETY, z=21.5)
         self.safety_end = MarkerItem(theme.C_SAFETY, 5.0, "LOITER", z=41)
-        self._scene.addItem(self.safety_path)
-        self._scene.addItem(self.safety_end)
-        self.safety_path.setVisible(False)
-        self.safety_end.setVisible(False)
+        # (2026-11-26) The link guardian's Home: where a trail retrace ends (LOITER).
+        self.guardian_home = MarkerItem(theme.C_GUARDIAN_HOME, 5.0, "Guardian Home", z=44)
+        for item in (self.safety_path, self.safety_points, self.safety_end,
+                     self.guardian_home):
+            self._scene.addItem(item)
+            item.setVisible(False)
         # Change keys of the overlays rebuilt only when their input changes.
         self._safety_drawn = None
         self._filtered_track_key = None
@@ -177,6 +185,8 @@ class MapView(QGraphicsView):
         self._pinger_fixes_enabled = False
         self._pinger_legend_enabled = True
         self._mission_path_enabled = True
+        self._safety_enabled = True                # (2026-11-26) own layer
+        self._guardian_home_enabled = True
         self._target_line_enabled = True
         self.manual_marker.setVisible(False)
         self.click_marker.setVisible(False)
@@ -276,6 +286,9 @@ class MapView(QGraphicsView):
             "satellite": self.tiles.set_enabled,
             "robot_track": _intent("_robot_track_enabled", self.robot_track),
             "mission_path": _intent("_mission_path_enabled", self.mission_path),
+            "safety_way_back": self._set_safety_enabled,
+            "guardian_home": self._data_gated("_guardian_home_enabled",
+                                              self.guardian_home),
             "pinger": self._set_pinger_layer_enabled,
             "pinger_track": _intent("_pinger_track_enabled", self.pinger_track),
             "pinger_filtered": self._data_gated("_pinger_filtered_enabled",
@@ -310,6 +323,13 @@ class MapView(QGraphicsView):
             if not v:
                 item.setVisible(False)
         return apply
+
+    def _set_safety_enabled(self, enabled: bool) -> None:
+        """Checkbox intent; refresh() shows the way back only when one exists."""
+        self._safety_enabled = enabled
+        if not enabled:
+            for item in (self.safety_path, self.safety_points, self.safety_end):
+                item.setVisible(False)
 
     def _set_legend_enabled(self, enabled: bool) -> None:
         self._pinger_legend_enabled = enabled
@@ -354,24 +374,40 @@ class MapView(QGraphicsView):
         return sx, sy
 
     def _refresh_safety_path(self, store) -> None:
-        pts = store.session.safety_way_back
+        ss = store.session
+        # The running run's way back first (what the guardian holds), else the one
+        # of the path shown before its run (2026-11-26).
+        pts = ss.safety_way_back or ss.planned_safety_way_back
         fit = store.geo.fit
-        show = bool(self._mission_path_enabled and fit is not None and len(pts) >= 2)
-        self.safety_path.setVisible(show)
-        self.safety_end.setVisible(show)
+        show = bool(self._safety_enabled and fit is not None and len(pts) >= 2)
+        for item in (self.safety_path, self.safety_points, self.safety_end):
+            item.setVisible(show)
         if not show:
             return
-        # The route changes only at START / STOP RUN (a new list each time)
-        # and lat0 / lon0 are latched: project it once, not every tick.
-        key = (fit.lat0, fit.lon0)
+        # The route changes only at START / STOP RUN / Update Mission (a new list
+        # each time) and lat0 / lon0 are latched: project it once, not every tick
+        # (again only when the zoom changes the points' padding).
+        pad_m = 6.0 / max(self._px_per_m(), 1e-6)
+        key = (fit.lat0, fit.lon0, pad_m)
         if self._safety_drawn is not None and self._safety_drawn[0] is pts \
                 and self._safety_drawn[1] == key:
             return
         en = np.array([latlon_to_local_en(lat, lon, fit.lat0, fit.lon0)
                        for lat, lon in pts])
         self.safety_path.set_points(en)
+        self.safety_points.set_points(en, pad_m)
         self.safety_end.set_world_pos(float(en[-1, 0]), float(en[-1, 1]))
         self._safety_drawn = (pts, key)
+
+    def _refresh_guardian_home(self, store) -> None:
+        """(2026-11-26) The Guardian Home, from the companion's report (lat/lon)."""
+        point = guardian_home_point(store.guardian)
+        fit = store.geo.fit
+        show = bool(self._guardian_home_enabled and fit is not None and point is not None)
+        self.guardian_home.setVisible(show)
+        if show:
+            e, n = latlon_to_local_en(point[0], point[1], fit.lat0, fit.lon0)
+            self.guardian_home.set_world_pos(float(e), float(n))
 
     def _scene_points(self, xy) -> np.ndarray:
         fit = self._store.geo.fit
@@ -415,7 +451,8 @@ class MapView(QGraphicsView):
                          self.pinger_filtered_marker, self.pinger_filtered_track,
                          self.pinger_ellipse, self.pinger_fixes,
                          self.manual_marker, self.click_marker,
-                         self.safety_path, self.safety_end):
+                         self.safety_path, self.safety_points, self.safety_end,
+                         self.guardian_home):
                 item.setVisible(False)
             self.legend.hide()
             self.tiles.update_view(
@@ -506,6 +543,7 @@ class MapView(QGraphicsView):
         self.start_marker.setVisible(self._mission_path_enabled
                                      and store.mission_path is not None)
         self._refresh_safety_path(store)
+        self._refresh_guardian_home(store)
 
         target = store.active_target_world()
         if target is not None and robot.has_odom:

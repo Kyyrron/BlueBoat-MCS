@@ -355,6 +355,43 @@ class FixPointsItem(QGraphicsItem):
             painter.drawPoints(poly)
 
 
+class VertexDotsItem(QGraphicsItem):
+    """(2026-11-26) The points of a polyline as constant-pixel squares of one colour
+    (the safety way back's points, like the designer's handles; not interactive).
+    ``pad_m`` keeps the bounding rect around the squares, as in FixPointsItem."""
+
+    def __init__(self, color: QColor, z: float = 21.5, half_px: float = 3.0) -> None:
+        super().__init__()
+        self.setZValue(z)
+        self._pen = QPen(color, 2.0 * half_px, Qt.PenStyle.SolidLine,
+                         Qt.PenCapStyle.SquareCap)
+        self._pen.setCosmetic(True)
+        self._poly = QPolygonF()
+        self._rect = QRectF()
+
+    def set_points(self, xy: np.ndarray, pad_m: float) -> None:
+        self.prepareGeometryChange()
+        xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        self._poly = QPolygonF([QPointF(float(x), float(y)) for x, y in xy])
+        if len(xy):
+            lo, hi = xy.min(axis=0), xy.max(axis=0)
+            self._rect = QRectF(lo[0] - pad_m, lo[1] - pad_m,
+                                hi[0] - lo[0] + 2 * pad_m, hi[1] - lo[1] + 2 * pad_m)
+        else:
+            self._rect = QRectF()
+        self.update()
+
+    def point_count(self) -> int:
+        return self._poly.count()
+
+    def boundingRect(self) -> QRectF:
+        return self._rect
+
+    def paint(self, painter, _option, _widget=None) -> None:
+        painter.setPen(self._pen)
+        painter.drawPoints(self._poly)
+
+
 class EllipseItem(QGraphicsEllipseItem):
     """The filtered pinger's 95 % uncertainty ellipse, in METRES (it scales
     with the map), placed and rotated from the estimate's own ``ellipse``

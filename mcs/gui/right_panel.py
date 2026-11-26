@@ -46,6 +46,9 @@ _LAYERS: list[tuple[str, str, bool]] = [
     ("satellite", "Satellite map layer", False),
     ("robot_track", "Robot trajectory", True),
     ("mission_path", "Published mission path", True),
+    # (2026-11-26) The path's safety way back and the link guardian's Home.
+    ("safety_way_back", "Safety way back (guardian)", True),
+    ("guardian_home", "Guardian Home", True),
     # The pinger (2026-11-24): filtered estimate (purple) and legacy (orange)
     # on by default; the uncertainty ellipse and the raw fixes off.
     ("pinger_filtered", "Pinger position — filtered", True),

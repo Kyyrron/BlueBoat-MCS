@@ -2726,13 +2726,13 @@ assert _gcmd(_gc_cfg, _LP(session=True)) is None
 
 # The companion's report, decoded.
 _now = time.monotonic()
-_ready = {"ready": True, "script": True, "items": [
+_ready = {"ready": True, "script": True, "set_home": True, "items": [
     {"name": "Script", "level": "ok", "text": "installed"},
     {"name": "FS_THR_ENABLE", "level": "warn", "text": "1 (recommended 0)"}]}
 _rd = _g.GuardianReadout.from_json(
     {"connected": True, "armed": True, "mode": "MANUAL", "want_on": True,
      "guardian_on": True, "check": _ready,
-     "home": {"lat": 33.93, "lon": 130.73, "source": "run start"},
+     "home": {"lat": 33.93, "lon": 130.73, "source": "Set Home"},
      "messages": [{"text": "LinkGuard: ON - return HOME after 5 s without laptop"}],
      "busy": None, "ack": {"seq": 3, "cmd": "check", "ok": True, "detail": "READY"}},
     received_mono=_now)
@@ -2754,7 +2754,23 @@ assert _v.state.startswith("OFF") and not any(
 _v = _sum(_rd)
 assert _v.state.startswith("ON — retraces its path after 15 s"), _v.state
 assert _v.level == "ok" and _v.setup[0].startswith("READY (1 advice)")
-assert _v.home[0].endswith("(run start)")
+# (2026-11-26) HOME = the Guardian Home (only Set Home moves it), with its source.
+assert _v.home[0] == "Set Home · 33.930000, 130.730000", _v.home
+assert _v.home_point == (33.93, 130.73)
+assert _v.set_home.enabled
+assert not _sum(_rd, real_session=False).set_home.enabled
+assert not _sum(_rd, mode="GUIDED").set_home.enabled          # guardian in control
+assert _sum(_rd, run_active=True).set_home.enabled            # no run gate
+_old = _g.GuardianReadout.from_json(
+    {"connected": True, "guardian_on": True, "check": dict(_ready, set_home=False),
+     "home": {"lat": 1.0, "lon": 2.0, "source": "autopilot HOME"}}, received_mono=_now)
+assert not _sum(_old).set_home.enabled and "no Set Home" in _sum(_old).set_home.reason
+assert _g.guardian_home_point(_old) is None          # an older script's HOME is not it
+_offh = _g.GuardianReadout.from_json(
+    {"connected": True, "guardian_on": False, "check": _ready,
+     "home": {"lat": 1.0, "lon": 2.0, "source": "guardian ON"}}, received_mono=_now)
+assert _g.guardian_home_point(_offh) is None and not _sum(_offh).set_home.enabled
+assert _g.guardian_home_point(_rd) == (33.93, 130.73)
 assert _v.check.enabled and _v.toggle.enabled and not _v.toggle_on
 assert not _v.rearm.enabled and "already armed" in _v.rearm.reason
 assert not _v.reclaim.enabled                        # nothing to take back
@@ -2821,7 +2837,9 @@ try:
     w.commands.rearm = lambda: _sent.append("rearm")
     w.guardian_box.action_requested.emit("check")
     w.guardian_box.action_requested.emit("rearm")
-    assert _sent == ["check", "rearm"], _sent
+    w.guardian_box.action_requested.emit("set_home")
+    assert _sent == ["check", "rearm", "set_home"], _sent
+    assert not w.guardian_box.set_home_button.isEnabled()   # RTL: guardian in control
     w.commands.send_guardian_command = _orig_send
     w.commands.rearm = _orig_rearm
 
@@ -4078,9 +4096,54 @@ try:
     _pos = w.map_view.safety_end.scene_pos()
     assert abs(_pos[0] - _end[0]) < 0.01 and abs(_pos[1] - _end[1]) < 0.01, (_pos, _end)
     assert w.map_view.safety_path.path().elementCount() == 3
+    assert w.map_view.safety_points.point_count() == 3     # its points, as in the designer
     w.store.session.safety_way_back = []
     w.map_view._refresh_safety_path(w.store)
     assert not w.map_view.safety_path.isVisible()
+
+    # (2026-11-26) The path's way back is drawn before its run too (planned), on its
+    # own layer (ON by default), independent of the mission-path layer.
+    _sw_rs.plan_safety_way_back(str(_sw_src), True)
+    assert _sw_store.session.planned_safety_way_back == _sw_pts
+    _sw_rs.plan_safety_way_back(str(_sw_plain), False)
+    assert _sw_store.session.planned_safety_way_back == []
+    _sw_rs.plan_safety_way_back("", True)
+    assert _sw_store.session.planned_safety_way_back == []
+    assert w.right_panel._layer_boxes["safety_way_back"].isChecked()
+    assert w.right_panel._layer_boxes["guardian_home"].isChecked()
+    w.store.session.planned_safety_way_back = list(_sw_pts)
+    w.map_view._refresh_safety_path(w.store)
+    assert w.map_view.safety_path.isVisible() and w.map_view.safety_end.isVisible()
+    w.map_view.set_layer_visible("mission_path", False)
+    w.map_view._refresh_safety_path(w.store)
+    assert w.map_view.safety_path.isVisible()              # not the mission-path layer
+    w.map_view.set_layer_visible("mission_path", True)
+    w.map_view.set_layer_visible("safety_way_back", False)
+    assert not w.map_view.safety_path.isVisible()
+    w.map_view._refresh_safety_path(w.store)
+    assert not w.map_view.safety_path.isVisible() and not w.map_view.safety_points.isVisible()
+    w.map_view.set_layer_visible("safety_way_back", True)
+    w.store.session.planned_safety_way_back = []
+    w.map_view._refresh_safety_path(w.store)
+    assert not w.map_view.safety_path.isVisible()
+
+    # (2026-11-26) The Guardian Home marker, placed from the companion's lat/lon.
+    _gh = local_en_to_latlon(12.0, -7.0, _fit.lat0, _fit.lon0)
+    w.store.guardian = _g.GuardianReadout.from_json(
+        {"connected": True, "guardian_on": True, "check": _ready,
+         "home": {"lat": _gh[0], "lon": _gh[1], "source": "Set Home"}},
+        received_mono=_now)
+    w.map_view._refresh_guardian_home(w.store)
+    assert w.map_view.guardian_home.isVisible()
+    _pos = w.map_view.guardian_home.scene_pos()
+    assert abs(_pos[0] - 12.0) < 0.01 and abs(_pos[1] + 7.0) < 0.01, _pos
+    w.map_view.set_layer_visible("guardian_home", False)
+    w.map_view._refresh_guardian_home(w.store)
+    assert not w.map_view.guardian_home.isVisible()
+    w.map_view.set_layer_visible("guardian_home", True)
+    w.store.guardian = None
+    w.map_view._refresh_guardian_home(w.store)
+    assert not w.map_view.guardian_home.isVisible()
 
     # Designer window: the tool needs an anchor; add / undo / delete.
     _swd = DesignerWindow(cfg, w.store)

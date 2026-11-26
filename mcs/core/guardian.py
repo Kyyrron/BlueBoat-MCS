@@ -21,6 +21,13 @@ status ``safety`` block (``{state: none|loading|ready|failed, n, run, detail}``)
 While it is ``ready`` a takeover follows it instead of the trail. The run is
 never held back for it (owner): a failure is shown, the trail is the fallback.
 
+Guardian Home (2026-11-26, owner order): where a trail retrace ends and the boat
+holds (LOITER) — where the guardian came ON, until the operator presses **Set
+Home** (``{cmd: set_home}``): the script restarts its trail at the boat's position.
+The companion reports it as the status ``home`` (``{lat, lon, source: "guardian ON"
+| "Set Home"}``; ``"autopilot HOME"`` from an older script, which has no Set Home);
+the map draws it as "Guardian Home" (:func:`guardian_home_point`).
+
 Qt-free and rclpy-free, so the smoke test can pin every rule.
 """
 
@@ -36,6 +43,8 @@ AUTONOMOUS_MODES = frozenset({"RTL", "SMART_RTL", "GUIDED", "LOITER", "HOLD"})
 DEFAULT_TIMEOUT_S = 15
 #: A companion silent for longer than this is "not reporting".
 STATUS_FRESH_S = 4.0
+#: ``home.source`` values that are the script's own Guardian Home (2026-11-26).
+GUARDIAN_HOME_SOURCES = frozenset({"guardian ON", "Set Home"})
 
 
 @dataclass
@@ -49,7 +58,7 @@ class GuardianReadout:
     want_on: bool = True
     guardian_on: bool | None = None          # what the autopilot confirmed
     check: dict | None = None                # last readiness report
-    home: dict | None = None                 # {lat, lon, source}
+    home: dict | None = None                 # {lat, lon, source} (the Guardian Home)
     run_running: bool = False
     messages: list = field(default_factory=list)   # [{t, severity, text}]
     busy: str | None = None
@@ -132,6 +141,24 @@ class GuardianView:
     rearm: Action
     reclaim: Action
     way_back: tuple[str, str] = ("—", "off")     # (2026-11-25) trail or safety way back
+    set_home: Action = field(default_factory=lambda: Action(False, "real-robot sessions only"))
+    home_point: tuple[float, float] | None = None    # (2026-11-26) Guardian Home (lat, lon)
+
+
+def guardian_home_point(r: GuardianReadout | None) -> tuple[float, float] | None:
+    """(lat, lon) of the Guardian Home to draw on the map, or None.
+
+    Only while the guardian is ON and the home is the script's own (an older
+    script's ArduPilot HOME is not where it returns). The last report is kept
+    while the companion lags: the point does not move by itself."""
+    if r is None or r.guardian_on is not True or not isinstance(r.home, dict):
+        return None
+    if r.home.get("source") not in GUARDIAN_HOME_SOURCES:
+        return None
+    try:
+        return float(r.home["lat"]), float(r.home["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found: bool,
@@ -181,10 +208,13 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
         fails = [i["name"] for i in r.check_items() if i.get("level") == "fail"]
         setup = ("NOT READY: " + ", ".join(fails), "err")
     if reporting and r.home and r.home.get("lat") is not None:
-        home = (f"{r.home['lat']:.6f}, {r.home['lon']:.6f}"
-                + (f" ({r.home['source']})" if r.home.get("source") else ""), "ok")
+        src = r.home.get("source")
+        home = ((f"{src} · " if src else "") + f"{r.home['lat']:.6f}, {r.home['lon']:.6f}",
+                "ok")
+    elif reporting and r.guardian_on:
+        home = ("not known yet (the script announces it)", "warn")
     else:
-        home = ("not set yet (set when the autopilot arms)", "warn")
+        home = ("not set yet (where the guardian comes ON)", "warn")
     messages = [str(m.get("text", "")) for m in (r.messages if reporting else [])][-3:]
     safety = r.safety_state if r is not None else "none"
     sinfo = (r.safety or {}) if r is not None else {}
@@ -257,12 +287,20 @@ def summarize(r: GuardianReadout | None, *, real_session: bool, companion_found:
     # script's own does.
     reclaim = gate(*base, (autonomous, ("nothing to take back: the boat is not "
                                         "under guardian / failsafe control")))
+    # (2026-11-26) Set Home: the script restarts its trail at the boat. No run gate:
+    # moving the Guardian Home during a run is the point of it.
+    set_home = gate(*base,
+                    (bool(reporting and r.guardian_on), "the guardian is not ON"),
+                    (bool(reporting and (r.check or {}).get("set_home")),
+                     "the script on the autopilot has no Set Home (upload the current one)"),
+                    (not autonomous, "the guardian / a failsafe is in control"))
 
     return GuardianView(state=state, level=level, link=link, autopilot=autopilot,
                         flag=flag, setup=setup, home=home, messages=messages,
                         check=check, setup_action=setup_action, toggle=toggle,
                         toggle_on=toggle_on, rearm=rearm, reclaim=reclaim,
-                        way_back=way_back)
+                        way_back=way_back, set_home=set_home,
+                        home_point=guardian_home_point(r))
 
 
 def needs_turn_off_choice(r: GuardianReadout | None, *, real_session: bool,
@@ -278,7 +316,7 @@ def needs_turn_off_choice(r: GuardianReadout | None, *, real_session: bool,
 
 
 def command_json(cmd: str, seq: int, **extra) -> dict:
-    """One ``/link_guardian/command`` payload."""
+    """One ``/link_guardian/command`` payload (``set_home`` since 2026-11-26)."""
     payload = {"cmd": cmd, "seq": int(seq)}
     payload.update(extra)
     return payload

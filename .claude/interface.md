@@ -30,7 +30,7 @@ Subscriptions use the default reliable depth-10 profile unless stated.
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set` | `'default'` / `'override'` / `''` (alive, no mode). **Heartbeated 1 Hz**, so shutdown requires a *transition* (N1). |
 | `/blueboat/run_state` | String JSON | `master_control` (session) | `{seq, ok, detail, state: idle\|loading\|running\|error, controller_type, use_pinger, note, mission, run, npy}` + (2026-11-24) `pinger_mode, pinger_source, has_path, tau, path_complete`, answers each command's `seq`, heartbeated 1 Hz. **The truth about whether a run is active.** `_config_applied` also requires `pinger_mode` (absent = an older stack: off / follow only) and, when present, `has_path` and `path_source == "mission"`; `path_complete` during a run → RUN box "Path complete — holding final pose". |
 | `/blueboat/run_log` | String JSON | `robot_interface` (session) | `{run, logging, csv, layout, bag_enabled, bag_recording, bag}` (`layout` `no_pinger` / `pinger` / since 2026-11-24 `pinger_log`), 1 Hz. A run whose CSV is not confirmed within 3 s is flagged; same for its ros2bag. No `bag_*` keys from an older control stack → "—". |
-| `/link_guardian/status` | String JSON | `guardian.py watch` (real sessions) | 1 Hz: `{connected, armed, mode, want_on, guardian_on, check, home, run_running, messages, busy, ack}` + (2026-11-25) `safety: {state: none\|loading\|ready\|failed, n, run, detail}` → `GuardianReadout`; stale after 4 s. |
+| `/link_guardian/status` | String JSON | `guardian.py watch` (real sessions) | 1 Hz: `{connected, armed, mode, want_on, guardian_on, check, home, run_running, messages, busy, ack}` (`home` = the Guardian Home since 2026-11-26) + (2026-11-25) `safety: {state: none\|loading\|ready\|failed, n, run, detail}` → `GuardianReadout`; stale after 4 s. |
 | `/sim/sea_state` | String JSON | `sea_state_node` (sim) | **TRANSIENT_LOCAL depth 1** → `SeaReadout` (SEA STATE box). |
 | `/replay/state` | String JSON | `bag_replay` (replay) | **TRANSIENT_LOCAL depth 1**, 2 Hz → `ReplayReadout` (REPLAY box). |
 
@@ -42,7 +42,7 @@ Subscriptions use the default reliable depth-10 profile unless stated.
 | `/blueboat/manual_target` | `Float32MultiArray` | `master_control` | `[x, y]` **world frame**. `[0, 0]` is the resume sentinel (N2). Turning arrow control off publishes the boat's position (hold where released). |
 | `/blueboat/run_command` | String JSON | `master_control` (session), `pinger_estimator` (its pinger block) | `{"cmd": "configure", controller_type, use_pinger, pinger_mode, has_path, path_source: "mission", pinger_source, pinger_filter: {preset, params}, note, mission, seq}` (2026-11-24: `use_pinger` = follow, kept for an older stack; `has_path` false for a run without a path (off or log); the full parameter set, `preset` `custom` when edited). Re-sent until acknowledged, and — pinger mode not off — until the estimator's `filter_config` echoes its `seq` (`RunSession._filter_timer`, the same 5 tries, between runs, after an MPC build) / `{"cmd": "start"\|"stop", seq}` (sent once). |
 | `/blueboat/arrow_thrust` | `Float32MultiArray` | `master_control` (every mode) | `[right, left]` N at 20 Hz while ARROW CONTROL is on (`[0, 0]` with no key), `[]` releases. Overrides every branch and pauses a run; `master_control`'s dead-man (`arrow_timeout` 0.5 s) zeroes a gap and stays engaged. No `command_sent` per tick. |
-| `/link_guardian/command` | String JSON | `guardian.py watch` | `{"cmd": "on"\|"off"\|"check"\|"setup"\|"reclaim", "seq": n}`, answered in the status `ack`. (2026-11-25) `{"cmd": "safety_load", "points": [[lat, lon], ...], "run": name, "seq"}` at START RUN of a GPS-anchored path with a safety way back, `{"cmd": "safety_clear", "seq"}` at STOP RUN (`RunSession`). |
+| `/link_guardian/command` | String JSON | `guardian.py watch` | `{"cmd": "on"\|"off"\|"check"\|"setup"\|"reclaim"\|"set_home", "seq": n}` (`set_home` 2026-11-26), answered in the status `ack`. (2026-11-25) `{"cmd": "safety_load", "points": [[lat, lon], ...], "run": name, "seq"}` at START RUN of a GPS-anchored path with a safety way back, `{"cmd": "safety_clear", "seq"}` at STOP RUN (`RunSession`). |
 | `/sim/sea_state/command` | String JSON | `sea_state_node` | `SeaChoice.command_json()` from "Change sea state…". |
 | `/replay/command` | String JSON | `bag_replay` | `{"cmd": "pause"\|"resume"}` / `{"cmd": "rate", "rate": x}`. |
 
@@ -130,10 +130,17 @@ yaw-moment blocks. "None" (default) = unchanged. The SEA STATE box's Status row 
 `link_guardian/`): after `LGRD_TIMEOUT` (15 s) of laptop silence it retraces the boat's trail,
 and on the first laptop heartbeat hands control back (HOLD → servo mapping → MANUAL), so the
 run goes on. **ON by default**: `robot_interface` arms the autopilot at connection before
-override, and the station starts `guardian.py watch` (sets `LGRD_ON`, moves HOME to each run
-start, serves the GUARDIAN box, top of the left column; rules in Qt-free
+override, and the station starts `guardian.py watch` (sets `LGRD_ON`, reports the Guardian
+Home, serves the GUARDIAN box, top of the left column; rules in Qt-free
 `core/guardian.py::summarize`). Buttons Check / Apply settings / Turn OFF-ON / Arm again /
-Take back control (a fallback, not gated on the run), each enabled only when it can act. The
+Set Home / Take back control (a fallback, not gated on the run), each enabled only when it can act.
+**Guardian Home** (2026-11-26, owner order): where a trail retrace ends (LOITER) — where the
+guardian came ON, or the boat's position at the last **Set Home** (`set_home`: the script
+restarts its trail there; gated on guardian ON, `check.set_home`, not under guardian control; no
+run gate). Only Set Home moves it (HOME is no longer moved at run start / end). Status `home`
+`{lat, lon, source: "guardian ON"|"Set Home"}` → the HOME row and the map's green *Guardian Home*
+point (`MapView.guardian_home`, layer `guardian_home`, ON by default,
+`core/guardian.guardian_home_point`: guardian ON and the script's own home only). The
 E-STOP does not turn it off. **Turn Off Connection and app exit always ask in a real
 session** (`needs_turn_off_choice`): *Guardian OFF + disarm* (`guardian_off_and_disarm`:
 `off` → ack → `disarm` → `/mavros/state` disarmed; nothing terminated if OFF is unconfirmed),
@@ -142,8 +149,11 @@ session** (`needs_turn_off_choice`): *Guardian OFF + disarm* (`guardian_off_and_
 `RunSession` sends it with `safety_load` right after `start` (never waits for it: owner, "warn,
 start anyway") and `safety_clear` at STOP RUN; `guardian.py` uploads it as the autopilot's
 mission and the script follows it on a takeover during the run. The box's **Way back** row and
-state line say which route a link loss would use; the map draws it (`MapView.safety_path`,
-shown with the mission-path layer) from `SessionState.safety_way_back`.
+state line say which route a link loss would use; the map draws it like the designer
+(`MapView.safety_path` + `safety_points` + LOITER end; (2026-11-26) its own layer
+`safety_way_back`, ON by default) from `SessionState.safety_way_back` during the run, else
+`SessionState.planned_safety_way_back` (`RunSession.plan_safety_way_back`: the next run's
+GPS-anchored path at `begin` / Update Mission, a Gazebo launch's anchored path; cleared at idle).
 
 **BlueBoat-Perception.** Started with every real-robot launch and every personalized-world
 launch, best effort; the station subscribes to none of its topics and imports nothing from it

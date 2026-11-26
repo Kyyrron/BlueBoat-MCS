@@ -45,7 +45,9 @@ going to override, and the station starts its companion, which switches the
 guardian ON. The box shows a one-line state (ON / OFF / NOT READY / TAKEN OVER /
 LINK LOST), the link, the autopilot (armed · ArduPilot mode — the autopilot's
 own arming, not the motor gate), the guardian flag, the setup check (tooltip:
-every item), HOME (session start, or the current run's start) and the boat's
+every item), HOME (the **Guardian Home**, 2026-11-26: where the guardian came
+ON, or the last **Set Home** — *guardian ON · lat, lon* / *Set Home · lat, lon*;
+drawn on the map as the green *Guardian Home* point) and the boat's
 last guardian / pre-arm messages, and (2026-11-25) **Way back**: what a link
 loss would follow — *its own trail*, or the run's *safety way back (N pts)
 until STOP RUN* (red with the reason if it could not be loaded: the run still
@@ -54,6 +56,12 @@ can act (the tooltip says why not):
 
 * **Check** — re-run the readiness check (script, failsafe parameters, laptop
   identity).
+* **Set Home** (2026-11-26; guardian ON, boat connected, not under guardian
+  control; asks first) — the Guardian Home becomes the boat's position now: the
+  trail so far is dropped, so a link loss brings the boat back along its path
+  to exactly this point, where it holds (LOITER). Meant for runs without a
+  safety way back (a loaded way back still wins during its run). Only Set Home
+  moves it: START / STOP RUN do not.
 * **Apply settings** — write the recommended ArduPilot failsafe parameters
   (one-time setup; restart the autopilot afterwards if scripting was off).
 * **Turn OFF / Turn ON** — the guardian for this session (asks before turning

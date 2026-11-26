@@ -40,6 +40,8 @@ C_FIX_SET_ASIDE = QColor(ERR)
 C_FIX_OTHER = QColor(TEXT_DIM)           # invalid, duplicate, initialising, reinit
 # The run's safety way back (designer and station map; 2026-11-25).
 C_SAFETY = QColor("#f0883e")
+# The link guardian's Guardian Home (station map; 2026-11-26).
+C_GUARDIAN_HOME = QColor("#3fb950")
 C_TARGET_LINE = QColor("#e3b341")
 C_PREDICTED = QColor("#bc8cff")
 C_MANUAL_TARGET = QColor("#ff6b9d")

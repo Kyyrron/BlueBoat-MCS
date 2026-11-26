@@ -12,8 +12,9 @@ Read-out (from the companion's ``/link_guardian/status`` and the station's own
 
 * a one-line **state** (ON / OFF / NOT READY / TAKEN OVER / LINK LOST …);
 * **Link**, **Autopilot** (armed · mode), **Guardian** (the flag the autopilot
-  confirmed), **Setup** (the readiness check), **HOME** (and whether it is the
-  session start or the current run's start), the last **boat messages**.
+  confirmed), **Setup** (the readiness check), **HOME** (the Guardian Home: where
+  the guardian came ON, or the last Set Home; drawn on the map too), the last
+  **boat messages**.
 
 Buttons — each enabled only when it can act, its tooltip saying why not:
 
@@ -24,7 +25,11 @@ Buttons — each enabled only when it can act, its tooltip saying why not:
   an E-STOP or a failed arm at connection; the script arms by itself anyway);
 * **Take back control** — fallback, if the boat stays under guardian control
   once the link is back: HOLD, thrusters back to the station, MANUAL (an active
-  run then goes on).
+  run then goes on);
+* **Set Home** (2026-11-26) — the Guardian Home becomes the boat's position now:
+  the trail restarts there, so a link loss brings the boat back along its path to
+  exactly this point, where it holds (LOITER). A loaded safety way back still wins
+  during its run.
 
 Greyed outside a real-robot session (Gazebo runs and bag replays have no
 guardian).
@@ -61,7 +66,7 @@ _WAY_BACK_TIP = (
 class GuardianBox(CollapsibleSection):
     """The link guardian's read-out and controls."""
 
-    #: 'check' | 'setup' | 'on' | 'off' | 'rearm' | 'reclaim'
+    #: 'check' | 'setup' | 'on' | 'off' | 'rearm' | 'reclaim' | 'set_home'
     action_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -95,16 +100,19 @@ class GuardianBox(CollapsibleSection):
         self.toggle_button = QPushButton("Turn OFF")
         self.rearm_button = QPushButton("Arm again")
         self.reclaim_button = QPushButton("Take back control")
+        self.set_home_button = QPushButton("Set Home")
         self.check_button.clicked.connect(lambda: self.action_requested.emit("check"))
         self.setup_button.clicked.connect(self._on_setup)
         self.toggle_button.clicked.connect(self._on_toggle)
         self.rearm_button.clicked.connect(lambda: self.action_requested.emit("rearm"))
         self.reclaim_button.clicked.connect(self._on_reclaim)
+        self.set_home_button.clicked.connect(self._on_set_home)
         buttons.addWidget(self.check_button, 0, 0)
         buttons.addWidget(self.setup_button, 0, 1)
         buttons.addWidget(self.toggle_button, 1, 0)
         buttons.addWidget(self.rearm_button, 1, 1)
-        buttons.addWidget(self.reclaim_button, 2, 0, 1, 2)
+        buttons.addWidget(self.set_home_button, 2, 0)
+        buttons.addWidget(self.reclaim_button, 2, 1)
         wrap = QWidget()
         wrap.setLayout(buttons)
         layout.addWidget(wrap)
@@ -152,6 +160,19 @@ class GuardianBox(CollapsibleSection):
             QMessageBox.StandardButton.Yes)
         if answer == QMessageBox.StandardButton.Yes:
             self.action_requested.emit("reclaim")
+
+    def _on_set_home(self) -> None:
+        answer = QMessageBox.question(
+            self, "Set the Guardian Home here",
+            "Set the Guardian Home at the boat's position now?\n\n"
+            "The path recorded so far is erased: if the link to this laptop is lost, "
+            "the boat comes back along its path from here on to this point and holds "
+            "there (LOITER).\n\n"
+            "During a run with a safety way back, that way back is still the one used.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.action_requested.emit("set_home")
 
     # ---------------------------------------------------------------- refresh
     def _set(self, key: str, value: tuple[str, str], tip: str | None = None) -> None:
@@ -204,6 +225,9 @@ class GuardianBox(CollapsibleSection):
         self._apply(self.rearm_button, view.rearm,
                     "Arm the autopilot again (the boat briefly leaves override). "
                     "Needed after an E-STOP; the guardian also arms by itself.")
+        self._apply(self.set_home_button, view.set_home,
+                    "Guardian Home = the boat's position now: a link loss brings the "
+                    "boat back along its path to this point, where it holds (LOITER).")
         self._apply(self.reclaim_button, view.reclaim,
                     "Fallback if the guardian has not handed control back by itself: "
                     "HOLD, thrusters back to the station, MANUAL (an active run goes on).")
